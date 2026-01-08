@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GateControl</title>
+  <link rel="stylesheet" href="/gatecontrol/static/gc.css">
+</head>
+<body>
+  <header class="gc-header">
+    <h1>GateControl</h1>
+    <div class="gc-actions">
+      <button id="btnDiscover">Discover Devices</button>
+      <button id="btnStatusSel">Get Status (Selection)</button>
+      <button id="btnStatusAll">Get Status (All)</button>
+      <button id="btnForce">Set all Groups</button>
+      <button id="btnSave">Save</button>
+      <button id="btnReload">Reload</button>
+    </div>
+  </header>
+
+  <main class="gc-main">
+    <aside class="gc-sidebar">
+      <div class="gc-side-head">
+        <span>Groups</span>
+        <button id="btnNewGroup" title="Create group">+</button>
+      </div>
+      <ul id="gcGroups" class="gc-groups"></ul>
+    </aside>
+
+    <section class="gc-content">
+      <div class="gc-toolbar">
+        <label>Bulk set Group:</label>
+        <select id="bulkGroup"></select>
+        <button id="btnBulkSetGroup">Apply</button>
+      </div>
+
+      <table class="gc-table" id="gcTable">
+        <thead>
+          <tr>
+            <th data-sort="none"><input type="checkbox" id="selAll"></th>
+            <th data-key="name">Name</th>
+            <th data-key="addr">MAC</th>
+            <th data-key="groupId">Group</th>
+            <th data-key="state">State</th>
+            <th data-key="effect">Effect</th>
+            <th data-key="brightness">Bright</th>
+            <th data-key="voltage_mV">VBat</th>
+            <th data-key="node_rssi">Node RSSI</th>
+            <th data-key="node_snr">Node SNR</th>
+            <th data-key="host_rssi">Host RSSI</th>
+            <th data-key="host_snr">Host SNR</th>
+            <th data-key="version">FW</th>
+            <th data-key="caps">Caps</th>
+            <th data-key="online">Online</th>
+          </tr>
+        </thead>
+        <tbody id="gcBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <!-- Simple modal for discovery -->
+  <dialog id="dlgDiscover">
+    <form method="dialog">
+      <h3>Discover Devices</h3>
+      <p>Only devices with groupId=0 will respond. Choose a target group or create a new one.</p>
+      <div class="row">
+        <label>Target Group:</label>
+        <select id="discoverGroup"></select>
+      </div>
+      <div class="row">
+        <label>New Group (optional):</label>
+        <input id="discoverNewGroup" placeholder="Name for new group">
+      </div>
+      <menu>
+        <button value="cancel">Cancel</button>
+        <button id="btnDiscoverStart" value="default">Start</button>
+      </menu>
+      <p id="discoverResult" class="muted"></p>
+    </form>
+  </dialog>
+
+  <script src="/gatecontrol/static/gc.js"></script>
+</body>
+</html>
