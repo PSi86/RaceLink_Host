@@ -17,30 +17,37 @@ except Exception:
     _HAVE_AUTO = False
 
 class LP:
-    # Defaults (will be overwritten from lora_proto_auto if available)
+    # Defaults (optionally overridden from lora_proto_auto if available)
     DIR_M2N = 0x00
     DIR_N2M = 0x80
-    OPC_DEVICES       = 0x01
-    OPC_SET_GROUP     = 0x02
-    OPC_WLED_CONTROL  = 0x03
-    OPC_STATUS        = 0x04
-    OPC_ACK           = 0x7E
+
+    # Opcodes (7-bit, shared)
+    OPC_DEVICES   = 0x01
+    OPC_SET_GROUP = 0x02
+    OPC_STATUS    = 0x03
+    OPC_CONTROL   = 0x04
+    OPC_CONFIG    = 0x05
+    OPC_SYNC      = 0x06
+    OPC_ACK       = 0x7E
 
     @staticmethod
-    def make_type(direction:int, opcode:int) -> int:
-        return (direction | (opcode & 0x7F))
+    def make_type(direction:int, opcode7:int) -> int:
+        return (direction | (opcode7 & 0x7F))
 
 # If header mirror exists, override
 if _HAVE_AUTO:
     try:
-        LP.DIR_M2N = LPA.DIR_M2N
-        LP.DIR_N2M = LPA.DIR_N2M
-        LP.OPC_DEVICES = LPA.OPC_DEVICES
-        LP.OPC_SET_GROUP = LPA.OPC_SET_GROUP
-        LP.OPC_WLED_CONTROL = LPA.OPC_WLED_CONTROL
-        LP.OPC_STATUS = LPA.OPC_STATUS
-        LP.OPC_ACK = LPA.OPC_ACK
-        # optional helpers exist in lora_proto_auto
+        LP.DIR_M2N = getattr(LPA, "DIR_M2N", LP.DIR_M2N)
+        LP.DIR_N2M = getattr(LPA, "DIR_N2M", LP.DIR_N2M)
+        LP.OPC_DEVICES   = getattr(LPA, "OPC_DEVICES", LP.OPC_DEVICES)
+        LP.OPC_SET_GROUP = getattr(LPA, "OPC_SET_GROUP", LP.OPC_SET_GROUP)
+        LP.OPC_STATUS    = getattr(LPA, "OPC_STATUS", LP.OPC_STATUS)
+        # renamed opcode in proto v1.2: OPC_CONTROL (old: OPC_WLED_CONTROL)
+        LP.OPC_CONTROL   = getattr(LPA, "OPC_CONTROL", getattr(LPA, "OPC_WLED_CONTROL", LP.OPC_CONTROL))
+        LP.OPC_CONFIG    = getattr(LPA, "OPC_CONFIG", LP.OPC_CONFIG)
+        LP.OPC_SYNC      = getattr(LPA, "OPC_SYNC", LP.OPC_SYNC)
+        LP.OPC_ACK       = getattr(LPA, "OPC_ACK", LP.OPC_ACK)
+
         make_type = getattr(LPA, "make_type", LP.make_type)
         def _make_type(direction, opcode): return make_type(direction, opcode)
         LP.make_type = staticmethod(_make_type)
@@ -236,10 +243,33 @@ class LoRaUSB:
     def send_set_group(self, recv3:bytes, group_id:int):
         body = struct.pack("<B", group_id & 0xFF)                 # P_SetGroup
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SET_GROUP), recv3, body)
+        
+    def send_control(self, recv3:bytes, group_id:int, flags:int, preset_id:int, brightness:int):
+        """Send CONTROL (4B): groupId, flags, presetId, brightness."""
+        body = struct.pack(
+            "<BBBB",
+            int(group_id) & 0xFF,
+            int(flags) & 0xFF,
+            int(preset_id) & 0xFF,
+            int(brightness) & 0xFF,
+        )
+        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONTROL), recv3, body)
 
+    def send_config(self, recv3:bytes=b'\xFF\xFF\xFF', option:int=0, flags:int=0):
+        """Send CONFIG (2B): option, flags."""
+        body = struct.pack("<BB", int(option) & 0xFF, int(flags) & 0xFF)
+        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONFIG), recv3, body)
+
+    def send_sync(self, recv3:bytes=b'\xFF\xFF\xFF', ts24:int=0, brightness:int=0):
+        """Send SYNC (4B): ts24(LE24), brightness."""
+        body = struct.pack("<HB", int(ts24) & 0xFFFFFF, int(brightness) & 0xFF)
+        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SYNC), recv3, body)
+
+    # Backwards helper (old opcode name), kept to avoid breaking older host code.
+    # Prefer send_control() to fully control flags.
     def send_wled_control(self, recv3:bytes, group_id:int, state:int, effect:int, brightness:int):
-        body = struct.pack("<BBBB", group_id & 0xFF, state & 0xFF, effect & 0xFF, brightness & 0xFF)  # P_WledControl
-        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_WLED_CONTROL), recv3, body)
+        flags = (0x01 if int(state) else 0x00)  # POWER_ON bit (bit layout defined in host/plugin)
+        self.send_control(recv3, group_id, flags, int(effect), int(brightness))
 
     def send_get_status(self, recv3=b'\xFF\xFF\xFF', group_id=0, flags=0):
         body = struct.pack("<BB", group_id & 0xFF, flags & 0xFF)  # P_GetStatus
@@ -306,10 +336,10 @@ class LoRaUSB:
                 ev.update({"reply": "IDENTIFY_REPLY", "body_raw": body})
 
         elif opc == LP.OPC_STATUS:
-            # STATUS_REPLY = 7B: [state, effect, brightness, vbat_mV(LE16), rssi_node(i8), snr_node(i8)]
+            # STATUS_REPLY = 7B: [flags, presetId, brightness, vbat_mV(LE16), rssi_node(i8), snr_node(i8)]
             if len(body) == 7:
-                state, effect, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBHbb", body)
-                ev.update({"reply": "STATUS_REPLY", "state": state, "effect": effect, "brightness": brightness,
+                flags, presetId, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBHbb", body)
+                ev.update({"reply": "STATUS_REPLY", "flags": flags, "presetId": presetId, "brightness": brightness,
                            "vbat_mV": vbat_mV, "node_rssi": rssi_node, "node_snr": snr_node})
             else:
                 ev.update({"reply": "STATUS_REPLY", "body_raw": body})

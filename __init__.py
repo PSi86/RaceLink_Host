@@ -1,4 +1,4 @@
-'''Created by Peter Simandl "psi" in 2025
+'''Created by Peter Simandl "psi" in 2023
     Works with Rotorhazard 4.0'''
 
 import logging
@@ -32,6 +32,15 @@ except Exception:
     )
 
 logger = logging.getLogger(__name__)
+
+# ---- LoRa/WLED control flags (shared with lora_proto.h / WLED usermod) ----
+# Bit layout must match the firmware.
+GC_FLAG_POWER_ON      = 0x01  # node power state (0=off, 1=on)
+GC_FLAG_ARM_ON_SYNC   = 0x02  # config/control arms node; node starts/restarts on next SYNC
+GC_FLAG_HAS_BRI       = 0x04  # CONTROL brightness field is valid (otherwise keep current / allow SYNC brightness)
+GC_FLAG_FORCE_TT0     = 0x08  # optional: force effect timebase to 0 on apply (client-side)
+GC_FLAG_FORCE_REAPPLY = 0x10  # optional: re-apply preset even if unchanged (client-side)
+
 
 #MAC_ADDR_OPT_NAME = 'comm_gate_mac'
 
@@ -187,15 +196,38 @@ class GateControl_LoRa():
 
         for device in config_list_devices:
             logger.debug(device)
-            gc_devicelist.append(GC_Device(
-                addr=device['addr'].upper(), 
-                type=device['type'], 
-                name=device['name'], 
-                groupId=device['groupId'], 
-                version=device['version'], 
-                state=device['state'], 
-                effect=device['effect'], 
-                brightness=device['brightness']))
+            # New schema (proto v1.2): flags + presetId; migrate legacy fields if present
+            try:
+                flags = device.get('flags', None)
+                presetId = device.get('presetId', None)
+
+                # legacy migration: state/effect -> flags/presetId
+                if flags is None:
+                    legacy_state = int(device.get('state', 1) or 0)
+                    flags = GC_FLAG_POWER_ON if legacy_state else 0
+                    # If a brightness exists in stored config, treat it as explicit
+                    if 'brightness' in device:
+                        flags |= GC_FLAG_HAS_BRI
+
+                if presetId is None:
+                    presetId = int(device.get('effect', 1) or 1)
+
+                brightness = int(device.get('brightness', 70) or 0)
+
+                gc_devicelist.append(GC_Device(
+                    addr=str(device.get('addr','')).upper(),
+                    type=int(device.get('type', 0) or 0),
+                    name=str(device.get('name','')),
+                    groupId=int(device.get('groupId', 0) or 0),
+                    version=int(device.get('version', 0) or 0),
+                    caps=int(device.get('caps', 0) or 0),
+                    flags=int(flags) & 0xFF,
+                    presetId=int(presetId) & 0xFF,
+                    brightness=brightness & 0xFF
+                ))
+            except Exception:
+                logger.exception("GC: failed to load device entry from DB: %r", device)
+                continue
             #logger.debug(gc_devicelist[1].name) #check if devicelist is in the expected state after import - works'''
 
 
@@ -315,12 +347,8 @@ class GateControl_LoRa():
             if targetDevice is None:
                 logger.warning("gateSwitch: device not found: %r", action['gc_action_device']); return
             targetDevice.brightness=int(action['gc_action_brightness'])
-            targetDevice.effect=int(action['gc_action_effect'])
-            
-            if int(action['gc_action_brightness'])==0:
-                targetDevice.state=0
-            else:
-                targetDevice.state=1
+            targetDevice.presetId=int(action['gc_action_effect'])
+            targetDevice.flags = (GC_FLAG_POWER_ON if int(action['gc_action_brightness']) > 0 else 0) | GC_FLAG_HAS_BRI
             
             logger.debug('sendGateControl action call - device')
             self.sendGateControl(targetDevice)
@@ -332,12 +360,8 @@ class GateControl_LoRa():
             if targetDevice is None:
                 logger.warning("gateSwitch(manual): device not found in DB option"); return
             targetDevice.brightness=int(self._rhapi.db.option('gc_quickset_brightness', None))
-            targetDevice.effect=int(self._rhapi.db.option('gc_quickset_effect', None))
-
-            if int(self._rhapi.db.option('gc_quickset_brightness', None))==0:
-                targetDevice.state=0
-            else:
-                targetDevice.state=1
+            targetDevice.presetId=int(self._rhapi.db.option('gc_quickset_effect', None))
+            targetDevice.flags = (GC_FLAG_POWER_ON if int(self._rhapi.db.option('gc_quickset_brightness', None)) > 0 else 0) | GC_FLAG_HAS_BRI
             #text = self._rhapi.db.option('gc_quickset_brightness', None)
             #self._rhapi.ui.message_notify(text)
 
@@ -351,14 +375,10 @@ class GateControl_LoRa():
             targetGroup=int(action['gc_action_group']) #TODO
             targetBrightness=int(action['gc_action_brightness'])
             targetEffect=int(action['gc_action_effect'])
-            
-            if int(action['gc_action_brightness'])==0:
-                targetState=0
-            else:
-                targetState=1
+            targetFlags = (GC_FLAG_POWER_ON if int(action['gc_action_brightness']) > 0 else 0) | GC_FLAG_HAS_BRI
             
             logger.debug('GC: groupSwitch called by Action (event based)')
-            self.sendGroupControl(targetGroup,targetState,targetEffect,targetBrightness)
+            self.sendGroupControl(targetGroup, targetFlags, targetEffect, targetBrightness)
 
         # control triggered by UI button press    
         if 'manual' in action:
@@ -366,16 +386,12 @@ class GateControl_LoRa():
             targetGroup=int(self._rhapi.db.option('gc_quickset_group', None))
             targetBrightness=int(self._rhapi.db.option('gc_quickset_brightness', None))
             targetEffect=int(self._rhapi.db.option('gc_quickset_effect', None))
-
-            if int(self._rhapi.db.option('gc_quickset_brightness', None))==0:
-                targetState=0
-            else:
-                targetState=1
+            targetFlags = (GC_FLAG_POWER_ON if int(self._rhapi.db.option('gc_quickset_brightness', None)) > 0 else 0) | GC_FLAG_HAS_BRI
             #text = self._rhapi.db.option('gc_quickset_brightness', None)
             #self._rhapi.ui.message_notify(text)
 
             logger.debug('GC: groupSwitch called from UI')
-            self.sendGroupControl(targetGroup,targetState,int(targetEffect),targetBrightness)
+            self.sendGroupControl(targetGroup, targetFlags, int(targetEffect), targetBrightness)
 
     
     def discoverPort(self, args):
@@ -601,8 +617,8 @@ class GateControl_LoRa():
                     match = self.getDeviceFromAddress(sender3_hex)
                     if match:
                         match.update_from_status(
-                            ev.get("state", 0),
-                            ev.get("effect", 0),
+                            ev.get("flags", 0),
+                            ev.get("presetId", 0),
                             ev.get("brightness", 0),
                             ev.get("vbat_mV", 0),
                             ev.get("node_rssi", 0),
@@ -697,57 +713,80 @@ class GateControl_LoRa():
     # Called from gateSwitch
     # not used at all currently - effectively replaced by sendGroupControl because we now use broadcasts instead of individual MAC based commands
     # could be used but right now it was more effective to use individual specialty functions like setGateGroupId for MAC-based commands
-    def sendGateControl(self, targetDevice, state, effect, brightness):
-        """Gezielte WLED_CONTROL an einen einzelnen Knoten (last3 aus targetDevice.addr)."""
+
+    # Called from gateSwitch (device-specific control).
+    def sendGateControl(self, targetDevice, flags=None, presetId=None, brightness=None):
+        """Send CONTROL to a single node (receiver = last3 of targetDevice.addr)."""
         if not getattr(self, "lora", None):
             logger.warning("sendGateControl: communicator not ready")
             return
         recv3 = _mac_last3_from_hex(targetDevice.addr)
-        groupId = int(targetDevice.groupId) & 0xFF  # je nach FW-Konzept; sonst 0 lassen
-        self.lora.send_wled_control(
-            recv3,
-            groupId,
-            int(state) & 0xFF,
-            int(effect) & 0xFF,
-            int(brightness) & 0xFF,
-        )
-        # lokalen Cache updaten
-        targetDevice.state = int(state); targetDevice.effect = int(effect); targetDevice.brightness = int(brightness)
-        logger.debug("GC: Updated Device {}: State={}, Effect={}, Brightness={}".format(targetDevice.addr, targetDevice.state, targetDevice.effect, targetDevice.brightness))
+        groupId = int(targetDevice.groupId) & 0xFF
 
-    # Used for UI Quickset, Event based Actions - effectively replaces sendGateControl
-    def sendGroupControl(self, gcGroupId, gcState, gcEffect, gcBrightness):
-        """Broadcast WLED_CONTROL an Gruppe; lokale Cache-States aktualisieren."""
+        f = int(targetDevice.flags if flags is None else flags) & 0xFF
+        p = int(targetDevice.presetId if presetId is None else presetId) & 0xFF
+        b = int(targetDevice.brightness if brightness is None else brightness) & 0xFF
+
+        self.lora.send_control(recv3=recv3, group_id=groupId, flags=f, preset_id=p, brightness=b)
+
+        # local cache
+        targetDevice.flags = f
+        targetDevice.presetId = p
+        targetDevice.brightness = b
+        logger.debug("GC: Updated Device %s: flags=0x%02X presetId=%d brightness=%d",
+                     targetDevice.addr, targetDevice.flags, targetDevice.presetId, targetDevice.brightness)
+
+    # Used for UI Quickset / event based Actions - broadcast to a group
+    def sendGroupControl(self, gcGroupId, gcFlags, gcPresetId, gcBrightness):
+        """Broadcast CONTROL to a group (receiver=FFFFFF); update local cache for group devices."""
         if not getattr(self, "lora", None):
             logger.warning("sendGroupControl: communicator not ready")
             return
 
-        # lokale UI/Caches pflegen (dein bisheriges Verhalten)
-        # TODO: prüfen, was noch gebraucht wird neue devices werden mit device type 24 angelegt und sollte auch bei ESPNOW_GATE (20) angesprochen werden
-        # hierarchie wie früher parent:espnow_gate children: basic_ir_gate, wled_custom
-        # funktioniert nicht, da die nodes diese logik nicht kennen - also nur gleiche device types ansprechen oder groupDeviceType==0 (alle im groupId)
-        # idee: ein flag in der discovery_reply einführen, um verschiedene unterklassen zu definieren, die neue oberklasse ist dann einfach 0 (alle) oder LP.TYPE_WLED_CUSTOM
-        # TODO: am besten erstmal alle device types bis auf wled_custom entfernen und nur noch wled_custom nutzen - dann ist die logik klarer
-        
-        groupDeviceType = int(gc_grouplist[gcGroupId].device_type)
+        groupId = int(gcGroupId) & 0xFF
+        f = int(gcFlags) & 0xFF
+        p = int(gcPresetId) & 0xFF
+        b = int(gcBrightness) & 0xFF
+
+        # update cached values for devices in this group (UI friendliness)
+        groupDeviceType = int(gc_grouplist[groupId].device_type) if groupId < len(gc_grouplist) else 0
         for device in gc_devicelist:
             if groupDeviceType == 0:
-                if device.groupId == gcGroupId:
-                    device.state = int(gcState); device.effect = int(gcEffect); device.brightness = int(gcBrightness)
+                if device.groupId == groupId:
+                    device.flags = f
+                    device.presetId = p
+                    device.brightness = b
             elif groupDeviceType == int(GC_Type.ESPNOW_GATE):
                 if device.type in (int(GC_Type.BASIC_IR_GATE), int(GC_Type.WLED_CUSTOM)):
-                    device.state = int(gcState); device.effect = int(gcEffect); device.brightness = int(gcBrightness)
+                    device.flags = f
+                    device.presetId = p
+                    device.brightness = b
             elif groupDeviceType == int(device.type):
-                device.state = int(gcState); device.effect = int(gcEffect); device.brightness = int(gcBrightness)
+                device.flags = f
+                device.presetId = p
+                device.brightness = b
 
-        # LoRaProto senden (Broadcast an last3=FFFFFF)
-        self.lora.send_wled_control(
-            b'\xFF\xFF\xFF',
-            int(gcGroupId) & 0xFF,
-            int(gcState) & 0xFF,
-            int(gcEffect) & 0xFF,
-            int(gcBrightness) & 0xFF,
+        # LoRaProto send (broadcast receiver3)
+        self.lora.send_control(
+            recv3=b'\xFF\xFF\xFF',
+            group_id=groupId,
+            flags=f,
+            preset_id=p,
+            brightness=b,
         )
+
+    # Optional future helpers (used by WebUI later)
+    def sendConfig(self, option, flags, recv3=b'\xFF\xFF\xFF'):
+        if not getattr(self, "lora", None):
+            logger.warning("sendConfig: communicator not ready")
+            return
+        self.lora.send_config(recv3=recv3, option=int(option) & 0xFF, flags=int(flags) & 0xFF)
+
+    def sendSync(self, ts24, brightness, recv3=b'\xFF\xFF\xFF'):
+        if not getattr(self, "lora", None):
+            logger.warning("sendSync: communicator not ready")
+            return
+        self.lora.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
 
     def _handle_ack_event(self, ev: dict) -> None:
         """ACK vom Transport auf das passende GC_Device abbilden (überschreibt last_ack)."""
@@ -804,43 +843,41 @@ class GateControl_LoRa():
 # --- im GC_Device-ctor (bestehende Felder beibehalten), optional ergänzen:
 class GC_Device():
     def __init__(self, addr:str, type:int, name:str, groupId:int=0, version:int=0, caps:int=0,
-                 voltage_mV:int=0, node_rssi:int=0, node_snr:int=0, state:int=1, effect:int=1, brightness:int=70):
+                 voltage_mV:int=0, node_rssi:int=0, node_snr:int=0,
+                 flags:int=GC_FLAG_POWER_ON, presetId:int=1, brightness:int=70):
         self.addr:str = addr
-        self.type:int = type
+        self.type:int = int(type)
         self.name:str = name
-        self.version:int = version              # GateControl Version -> via IDENTIFY_REPLY
-        self.caps:int = caps                       # capability flags (IDENTIFY_REPLY)
-        self.voltage_mV:int = voltage_mV
-        self.node_rssi:int = node_rssi
-        self.node_snr:int = node_snr
-        self.groupId:int = groupId
-        self.state:int = state
-        self.effect:int = effect
-        self.brightness:int = brightness
+        self.version:int = int(version)              # GateControl FW version -> via IDENTIFY_REPLY
+        self.caps:int = int(caps)                    # capability flags (IDENTIFY_REPLY)
+        self.groupId:int = int(groupId)
 
-        # neu/optional für Protokoll & Link-Metriken:
+        # CONTROL state (proto v1.2)
+        self.flags:int = int(flags) & 0xFF
+        self.presetId:int = int(presetId) & 0xFF
+        self.brightness:int = int(brightness) & 0xFF
 
-        self.host_rssi:int = 0                  # RSSI am Master (aus USB-Forward)
-        self.host_snr:int = 0                   # SNR am Master (aus USB-Forward)
-        self.last_seen_ts = 0               # Unixzeit letzte Antwort
+        # Telemetry (STATUS_REPLY)
+        self.voltage_mV:int = int(voltage_mV)
+        self.node_rssi:int = int(node_rssi)
+        self.node_snr:int = int(node_snr)
 
-        # ACK-Status: letzte ACK-Antwort des Geräts
+        # Link metrics (measured at master / USB forward)
+        self.host_rssi:int = 0
+        self.host_snr:int = 0
+        self.last_seen_ts = 0  # unix time of last reply
+
+        # ACK status: last ACK from this device
         self.last_ack = {"ok": False, "opcode": None, "status": None, "seq": None, "ts": 0.0}
 
     def update_from_identify(self, version, caps, groupId, mac6_bytes, host_rssi=None, host_snr=None):
-        # Firmware-Version
         self.version = int(version) if version is not None else self.version
         self.caps = int(caps) if caps is not None else self.caps
 
-        # Group nur überschreiben, wenn Gerät bisher “unconfigured” war – so bleibt deine lokale Zuweisung stabil
+        # Only overwrite groupId if device was previously unconfigured
         if self.groupId == 0 and groupId:
             self.groupId = int(groupId) & 0xFF
 
-        # MAC wird nicht überschrieben (bleibt immer gleich), wird nur bei Neuanlage gesetzt
-        #if self.addr is None and mac6_bytes is not None:
-        #    self.addr = mac6_bytes
-
-        # Link-Metriken des Master-Empfangs (falls vorhanden)
         if host_rssi is not None:
             self.host_rssi = int(host_rssi)
         if host_snr is not None:
@@ -848,12 +885,13 @@ class GC_Device():
 
         self.last_seen_ts = time.time()
 
-    def update_from_status(self, state, effect, brightness, vbat_mV, node_rssi, node_snr, host_rssi=None, host_snr=None):
-        # Zustand
-        self.state = int(state) if state is not None else self.state
-        self.effect = int(effect) if effect is not None else self.effect
-        self.brightness = int(brightness) if brightness is not None else self.brightness
-        # Telemetrie
+    def update_from_status(self, flags, presetId, brightness, vbat_mV, node_rssi, node_snr, host_rssi=None, host_snr=None):
+        # CONTROL snapshot (as reported by node)
+        self.flags = int(flags) & 0xFF if flags is not None else self.flags
+        self.presetId = int(presetId) & 0xFF if presetId is not None else self.presetId
+        self.brightness = int(brightness) & 0xFF if brightness is not None else self.brightness
+
+        # Telemetry
         self.voltage_mV = int(vbat_mV) if vbat_mV is not None else self.voltage_mV
         self.node_rssi  = int(node_rssi) if node_rssi is not None else self.node_rssi
         self.node_snr   = int(node_snr) if node_snr is not None else self.node_snr
@@ -861,13 +899,14 @@ class GC_Device():
             self.host_rssi = int(host_rssi)
         if host_snr is not None:
             self.host_snr = int(host_snr)
+
         self.last_seen_ts = time.time()
 
-    # --- ACK Helpers (generisch für jeden Opcode) ---
+    # --- ACK Helpers (generic for any opcode) ---
     def ack_clear(self) -> None:
         self.last_ack = {"ok": False, "opcode": None, "status": None, "seq": None, "ts": 0.0}
 
-    def ack_update(self, opcode:int, status:int, seq:int|None=None, host_rssi=None, host_snr=None) -> None:
+    def ack_update(self, opcode:int, status:int, seq=None, host_rssi=None, host_snr=None) -> None:
         self.last_ack = {
             "ok": (int(status) == 0),
             "opcode": int(opcode),
@@ -911,7 +950,7 @@ class GC_Type():
     #    return '<GATE> P{} L{}\n {}\n {}\n {}'.format(self.state, self.effect, self.brightness)
    
 
-# reference                      MAC            Type                        Name                       Group   State   Effect  Brightness
+# reference                      MAC            Type                        Name                       Group   Flags  PresetId  Brightness
 #gc_backup_devicelist=[GC_Device('111111111111', GC_Type.WIZMOTE_GATE,    'Dummy IR Gate Area 1',     0,      1,      '01',   62)]
 gc_backup_devicelist=[]
 
@@ -948,8 +987,8 @@ def gc_config_json_output(rhapi=None):
     payload['help/gc_devices/type'] = ['BASIC_IR_GATE:21, CUSTOM_IR_GATE:22, WIZMOTE_GATE:23, WLED_CUSTOM:24']
     payload['help/gc_devices/name'] = ['UI: shown name of a device']
     payload['help/gc_devices/groupId'] = ['Used to group devices for control. Valid numbers start with 3 (0-2 are reserved for device type based groups)']
-    payload['help/gc_devices/state'] = ['0:off, 1:on, other values are unused currently']
-    payload['help/gc_devices/effect'] = ['1-255: correspond to predefined colors and effects. 1-7: colors, 10-13: effects available on all device types, 20-255: special effects (WLED only)']
+    payload['help/gc_devices/flags'] = ['bitmask: POWER_ON(0x01), ARM_ON_SYNC(0x02), HAS_BRI(0x04), FORCE_TT0(0x08), FORCE_REAPPLY(0x10)']
+    payload['help/gc_devices/presetId'] = ['1-255: WLED preset index / mapping used by the LoRa usermod']
     payload['help/gc_devices/brightness'] = ['0: off, 1-255:dimming, special function with value 1: IR Controllers will spam the \'darker\' signal to set IR devices to absolute minimum brightness.']
     payload['help/gc_groups'] = ['Lookup list for the groupId definitions in the device entries']
     payload['help/gc_groups/name'] = ['UI: shown name of a group']
@@ -958,9 +997,9 @@ def gc_config_json_output(rhapi=None):
     payload['help/backup'] = ['If there is an issue with configuration you can create a clean config based on the example elements. (delete \'_backup\' from element name)']
 
     #add backup / example definitions at the end
-    #payload['gc_devices_backup'] = [{"addr": "111111111111","type": 23,"name": "Dummy IR Gate Area 1","groupId": 0,"state": 1,"effect": "01","brightness": 70}, {"addr": "3030F918123C","type": 21,"name": "IR Controller 3030F918123C","groupId": 4,"state": 1,"effect": 1,"brightness": 1}]
+    #    payload['gc_devices_backup'] = [{"addr": "3C84279EBFE4", "type": 24, "name": "WLED 3C84279EBFE4", "groupId": 0, "flags": 1, "presetId": 1, "brightness": 70}]
     #payload['gc_groups_backup'] = [{'name': 'All WLED and IR Gates', 'static_group': 1, 'device_type': 20}, {'name': 'All WLED Gates', 'static_group': 1, 'device_type': 24}, {'name': 'All IR Gates', 'static_group': 1, 'device_type': 21}]
-    payload['gc_devices_backup'] = [{"addr": "3C84279EBFE4","type": 24,"name": "WLED 3C84279EBFE4","groupId": 0,"state": 1,"effect": 1,"brightness": 70}]
+    payload['gc_devices_backup'] = [{"addr": "3C84279EBFE4", "type": 24, "name": "WLED 3C84279EBFE4", "groupId": 0, "flags": 1, "presetId": 1, "brightness": 70}]
     payload['gc_groups_backup'] = [{'name': 'All WLED Gates', 'static_group': 1, 'device_type': 24}]
     #logger.debug(payload)
     return payload
