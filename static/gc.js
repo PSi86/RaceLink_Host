@@ -51,10 +51,25 @@
     // group creation + bulk
     $("#btnNewGroup").disabled = disable;
     $("#btnBulkSetGroup").disabled = disable;
+    const btnCfg = $("#btnNodeCfgSend");
+    if(btnCfg) btnCfg.disabled = disable;
 
     // allow closing modal even when busy
     $("#btnDiscoverStart").disabled = disable;
+    updateNodeCfgUi();
   }
+
+
+function updateNodeCfgUi(){
+  const btn = $("#btnNodeCfgSend");
+  if(!btn) return;
+  const n = state.selected.size;
+  btn.disabled = state.busy || (n !== 1);
+  const hint = $("#nodeCfgHint");
+  if(hint){
+    hint.textContent = (n === 1) ? "" : "Select exactly one device";
+  }
+}
 
   function flagsLabel(flags){
     const f = Number(flags) & 0xFF;
@@ -123,11 +138,20 @@
   function renderTable(){
     const body = $("#gcBody");
     body.innerHTML = "";
-    let rows = state.devices.slice();
 
+    // Apply current filters first
+    let rows = state.devices.slice();
     if(state.selGroupId!==null){
       rows = rows.filter(r => Number(r.groupId)===Number(state.selGroupId));
     }
+
+    // Prune selection to currently visible devices (within the current filter)
+    const present = new Set(rows.map(d => d.addr));
+    for (const m of Array.from(state.selected)) {
+      if (!present.has(m)) state.selected.delete(m);
+    }
+
+    // Apply sorting
     if(state.sortKey){
       const key = state.sortKey, dir = state.sortDir;
       rows.sort((a,b)=>{
@@ -166,9 +190,21 @@
       cb.addEventListener("change", () => {
         const mac = cb.getAttribute("data-mac");
         if(cb.checked) state.selected.add(mac); else state.selected.delete(mac);
+        updateNodeCfgUi();
       });
     });
-  }
+
+    // Keep the "Select all" checkbox in sync (for current view)
+    const selAll = $("#selAll");
+    if(selAll){
+      const total = rows.length;
+      const selectedNow = Array.from(state.selected).filter(mac => present.has(mac)).length;
+      selAll.indeterminate = total > 0 && selectedNow > 0 && selectedNow < total;
+      selAll.checked = total > 0 && selectedNow === total;
+    }
+
+    updateNodeCfgUi();
+}
 
   // Sorting
   $$("#gcTable thead th").forEach(th => {
@@ -202,6 +238,8 @@
     if(m.last_event) parts.push(`last: ${m.last_event}`);
     if(m.last_error) parts.push(`err: ${m.last_error}`);
     detail.textContent = parts.join(" · ");
+    updateNodeCfgUi();
+
   }
 
   function updateTask(t){
@@ -317,6 +355,31 @@
   });
 
   // Discover modal
+
+// Node CONFIG (unicast only, requires exactly one selection)
+$("#btnNodeCfgSend").addEventListener("click", async ()=>{
+  const macs = Array.from(state.selected);
+  if(macs.length !== 1){
+    alert("Select exactly one device for CONFIG commands.");
+    return;
+  }
+  const sel = ($("#nodeCfgCmd").value || "").trim();
+  const parts = sel.split(":");
+  const option = Number(parts[0] || 0);
+  const flags  = Number(parts[1] || 0);
+
+  if(option === 0x02){
+    if(!confirm("Clear learned Master on the selected node?")) return;
+  } else if(option === 0x05){
+    if(!confirm("Reboot the selected node now?")) return;
+  }
+
+  const r = await apiPost("/gatecontrol/api/config", {mac: macs[0], option, flags});
+  if(r.busy){
+    alert(`Busy: ${r.task?.name || "task"} is running`);
+  }
+});
+
   const dlg = $("#dlgDiscover");
   $("#btnDiscover").addEventListener("click", ()=>{
     $("#discoverResult").textContent = "";
@@ -327,11 +390,32 @@
     e.preventDefault();
     const targetGroupId = Number($("#discoverGroup").value);
     const newGroupName = ($("#discoverNewGroup").value || "").trim() || null;
+
     $("#discoverResult").textContent = "Running…";
     const r = await apiPost("/gatecontrol/api/discover", {targetGroupId, newGroupName});
-    if(r.busy){
-      $("#discoverResult").textContent = `Busy: ${r.task?.name || "task"} is running`;
+
+    // If the API uses "busy" both for "already busy" and "task started",
+    // treat an incoming discover task as success and rely on SSE/task polling for progress.
+    if(r && r.task){
+      try{ updateTask(r.task); }catch{}
     }
+
+    if(r && r.busy){
+      const tn = r.task?.name || "";
+      const ts = r.task?.state || "";
+      if(tn && tn !== "discover"){
+        $("#discoverResult").textContent = `Busy: ${tn} is running`;
+      } else if(ts && ts !== "running"){
+        $("#discoverResult").textContent = `Busy: ${tn || "task"} is ${ts}`;
+      }
+      // else: keep "Running…" (normal discover start)
+    }
+
+    // Best-effort immediate sync in case SSE isn't connected yet
+    apiGet("/gatecontrol/api/master").then(m=>{
+      if(m.master) updateMaster(m.master);
+      if(m.task) updateTask(m.task);
+    }).catch(()=>{});
   });
 
   // Select all
@@ -342,6 +426,7 @@
       cb.checked = c;
       if(c) state.selected.add(cb.getAttribute("data-mac"));
     });
+    updateNodeCfgUi();
   });
 
   // New group
@@ -356,12 +441,22 @@
 
   // Startup
   (async ()=>{
-    await loadAll();
+    // Connect SSE first so we still get feedback even if initial REST loads fail
     connectEvents();
 
-    // One-shot sync of master/task in case SSE is delayed
-    const m = await apiGet("/gatecontrol/api/master");
-    if(m.master) updateMaster(m.master);
-    if(m.task) updateTask(m.task);
+    try{
+      await loadAll();
+    }catch(e){
+      console.error("Initial load failed", e);
+    }
+
+    // One-shot sync of master/task in case SSE is delayed or blocked by proxies
+    try{
+      const m = await apiGet("/gatecontrol/api/master");
+      if(m.master) updateMaster(m.master);
+      if(m.task) updateTask(m.task);
+    }catch(e){
+      console.error("Master sync failed", e);
+    }
   })().catch(console.error);
 })();

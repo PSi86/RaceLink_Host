@@ -1,4 +1,4 @@
-'''Created by Peter Simandl "psi" in 2023
+'''Created by Peter Simandl "psi" in 2025
     Works with Rotorhazard 4.0'''
 
 import logging

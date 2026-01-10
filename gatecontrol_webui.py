@@ -701,6 +701,68 @@ def register_gc_blueprint(
     # -----------------------
     # JSON API: CONTROL (flags/presetId)
     # -----------------------
+
+    @bp.route("/gatecontrol/api/config", methods=["POST"])
+    def api_config():
+        """Send unicast CONFIG packet to exactly one node (no broadcast)."""
+        if _task_is_running():
+            return _task_busy_response()
+
+        body = request.get_json(silent=True) or {}
+        macs = body.get("macs") or []
+        mac = body.get("mac", None)
+        if mac and not macs:
+            macs = [mac]
+
+        if len(macs) != 1:
+            return jsonify({"ok": False, "error": "select exactly one device"}), 400
+
+        def _parse_recv3_from_addr(addr_str) -> Optional[bytes]:
+            """Parse address string (3B or 6B, with/without separators) and return last3 bytes."""
+            if addr_str is None:
+                return None
+            try:
+                s = str(addr_str)
+            except Exception:
+                return None
+            hexchars = "0123456789abcdefABCDEF"
+            s = "".join(ch for ch in s if ch in hexchars)
+            if len(s) < 6:
+                return None
+            s = s[-6:]
+            try:
+                return bytes.fromhex(s)
+            except Exception:
+                return None
+
+        recv3 = _parse_recv3_from_addr(macs[0])
+        if not recv3:
+            return jsonify({"ok": False, "error": "invalid mac/address"}), 400
+        if recv3 == b"\xFF\xFF\xFF":
+            return jsonify({"ok": False, "error": "broadcast not allowed for config"}), 400
+
+        try:
+            option = int(body.get("option", 0)) & 0xFF
+            flags  = int(body.get("flags", 0)) & 0xFF
+        except Exception:
+            return jsonify({"ok": False, "error": "invalid option/flags"}), 400
+
+        if option not in (0x01, 0x02, 0x03, 0x04, 0x05):
+            return jsonify({"ok": False, "error": "unknown config option"}), 400
+
+        try:
+            # Prefer instance helper if present
+            if hasattr(gc_instance, "sendConfig"):
+                gc_instance.sendConfig(option=option, flags=flags, recv3=recv3)
+            else:
+                gc_instance.lora.send_config(recv3=recv3, option=option, flags=flags)
+        except Exception as ex:
+            _log(f"GateControl: config failed: {ex}")
+            return jsonify({"ok": False, "error": str(ex)}), 500
+
+        _set_master(state="TX", tx_pending=True, last_event="CONFIG_SENT")
+        return jsonify({"ok": True, "sent": 1, "recv3": recv3.hex().upper(), "option": option, "flags": flags})
+
     @bp.route("/gatecontrol/api/devices/control", methods=["POST"])
     def api_devices_control():
         """

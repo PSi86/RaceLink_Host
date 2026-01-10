@@ -41,6 +41,23 @@
         <button id="btnBulkSetGroup">Apply</button>
       </div>
 
+<div class="gc-toolbar">
+  <label>Node Config:</label>
+  <select id="nodeCfgCmd">
+    <option value="04:1">WiFi AP ON</option>
+    <option value="04:0">WiFi AP OFF</option>
+    <option value="01:1">MAC filter ON</option>
+    <option value="01:0">MAC filter OFF</option>
+    <option value="03:1">MAC filter persist ON</option>
+    <option value="03:0">MAC filter persist OFF</option>
+    <option value="02:1">Clear learned Master</option>
+    <option value="05:1">Reboot node</option>
+  </select>
+  <button id="btnNodeCfgSend">Send</button>
+  <span id="nodeCfgHint" class="muted">Select exactly one device</span>
+</div>
+
+
       <table class="gc-table" id="gcTable">
         <thead>
           <tr>
