@@ -109,6 +109,11 @@ class GateControl_LoRa():
         self.uiGroupList = None
         self.uiDiscoveryGroupList = None
 
+
+        # Device index for fast & unambiguous mapping (mac12 + last3)
+        self._dev_index_len = -1
+        self._dev_by_mac12 = {}
+        self._dev_by_last3 = {}
         # Basic colors: 1-9; Basic effects: 10-19; Special Effects (WLED only): 20-100
         self.uiEffectList = [
                             UIFieldSelectOption('01', "Red"), #10
@@ -244,6 +249,11 @@ class GateControl_LoRa():
             logger.debug(group)
             gc_grouplist.append(GC_DeviceGroup(group['name'], group['static_group'], group['device_type']))
             #logger.debug(gc_grouplist[1].name) #check if grouplist is in the expected state after import - works'''
+        
+        # Rebuild device index after DB load
+        self._rebuild_device_index()
+
+
         
         self.uiDeviceList = self.createUiDevList() # old, but keep this for now
         self.uiGroupList = self.createUiGroupList()
@@ -402,6 +412,13 @@ class GateControl_LoRa():
             ok = self.lora.discover_and_open()
             if ok:
                 self.lora.start()
+                # Install a lightweight transport event hook so async replies (ACK/STATUS/IDENTIFY)
+                # update the corresponding GC_Device entries immediately.
+                # This keeps gc_devicelist consistent even if no synchronous drain loop is running.
+                try:
+                    self._install_transport_event_hook()
+                except Exception:
+                    logger.exception("Failed to install GateControl transport hook")
                 self.ready = True
                 used = self.lora.port or 'unknown'
                 mac = getattr(self.lora, "ident_mac", None)
@@ -420,6 +437,12 @@ class GateControl_LoRa():
             logger.error("LoRaUSB init failed: %s", ex)
             if 'manual' in args:
                 self._rhapi.ui.message_notify(self._rhapi.__("Failed to initialize communicator: {}").format(str(ex)))
+
+    # ----------------
+    # Transport hook: keep gc_devicelist in sync (ACK + async replies)
+    # ----------------
+
+
 
     def onRaceStart(self, _args):
         #TODO: Schedule start message per race
@@ -542,6 +565,7 @@ class GateControl_LoRa():
                         logger.info("New device discovered: %s", mac_hex)
                         dev = GC_Device(addr=mac_hex, type=GC_Type.WLED_CUSTOM, name=f"WLED {mac_hex}")
                         gc_devicelist.append(dev)
+                        self._rebuild_device_index()
                         if hasattr(self, "createUiDevList"):
                             self.uiDeviceList = self.createUiDevList()
 
@@ -579,6 +603,8 @@ class GateControl_LoRa():
             self._rhapi.ui.message_notify(
                 "Device Discovery finished with {} devices found and added to GroupId: {}".format(found, addToGroup)
             )
+        # Device list may have changed; rebuild index once
+        self._rebuild_device_index()
         return found
     
     def getStatus(self, groupFilter=255, targetDevice=None):
@@ -788,6 +814,161 @@ class GateControl_LoRa():
             return
         self.lora.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
 
+    # ---------------------------------------------------------------------
+    # Transport event hook (async)
+    # ---------------------------------------------------------------------
+    def _install_transport_event_hook(self) -> None:
+        """Attach a callback to LoRaUSB so async replies update gc_devicelist.
+
+        LoRaUSB always also stores events into its internal queue (drain_events()).
+        This hook is therefore "best effort" and idempotent: it updates cached
+        device fields but should not be relied on for strict request/response.
+        """
+        lora = getattr(self, "lora", None)
+        if not lora or not hasattr(lora, "on_event"):
+            return
+
+        # Prevent repeated wrapping
+        if getattr(self, "_gc_transport_hook_installed", False):
+            return
+
+        prev_cb = getattr(lora, "on_event", None)
+
+        def _mux(ev: dict):
+            try:
+                self._on_transport_event(ev)
+            except Exception:
+                logger.exception("GateControl transport hook failed")
+
+            # Chain previous callback (e.g. WebUI SSE hook)
+            try:
+                if prev_cb and prev_cb is not _mux:
+                    prev_cb(ev)
+            except Exception:
+                pass
+
+        lora.on_event = _mux
+        self._gc_transport_hook_installed = True
+
+    def _on_transport_event(self, ev: dict) -> None:
+        """Update cached device state from async transport events."""
+        try:
+            opc = ev.get("opc")
+            reply = ev.get("reply")
+
+            # ACK: map to device.last_ack
+            if opc == LP.OPC_ACK or reply == "ACK":
+                self._handle_ack_event(ev)
+                return
+
+            # STATUS_REPLY: update telemetry + reported control values
+            if opc == LP.OPC_STATUS and reply == "STATUS_REPLY":
+                sender3_hex = self._to_hex_str(ev.get("sender3"))
+                dev = self.getDeviceFromAddress(sender3_hex)
+                if dev:
+                    dev.update_from_status(
+                        ev.get("flags", None),
+                        ev.get("presetId", None),
+                        ev.get("brightness", None),
+                        ev.get("vbat_mV", None),
+                        ev.get("node_rssi", None),
+                        ev.get("node_snr", None),
+                        ev.get("host_rssi", None),
+                        ev.get("host_snr", None),
+                    )
+                return
+
+            # IDENTIFY_REPLY: add/update device entries
+            if opc == LP.OPC_DEVICES and reply == "IDENTIFY_REPLY":
+                mac6 = ev.get("mac6", b"")
+                if not isinstance(mac6, (bytes, bytearray)) or len(mac6) != 6:
+                    return
+                mac_hex = bytes(mac6).hex().upper()
+                dev = self.getDeviceFromAddress(mac_hex)
+                if dev is None:
+                    dev = GC_Device(addr=mac_hex, type=GC_Type.WLED_CUSTOM, name=f"WLED {mac_hex}")
+                    gc_devicelist.append(dev)
+                    self._rebuild_device_index()
+                    if hasattr(self, "createUiDevList"):
+                        self.uiDeviceList = self.createUiDevList()
+                dev.update_from_identify(
+                    ev.get("version", 0),
+                    ev.get("caps", 0),
+                    ev.get("groupId", 0),
+                    mac6,
+                    ev.get("host_rssi", None),
+                    ev.get("host_snr", None),
+                )
+                return
+
+        except Exception:
+            logger.exception("_on_transport_event failed")
+
+    # ---------------------------------------------------------------------
+    # Convenience helpers (keep all device interactions mapped to gc_devicelist)
+    # ---------------------------------------------------------------------
+
+
+
+
+    def _rebuild_device_index(self) -> None:
+        """Rebuild device lookup tables from gc_devicelist.
+
+        Keeps all interactions mapped to canonical GC_Device objects, while
+        allowing O(1) resolution by full MAC (12 hex) or last3 (6 hex).
+        """
+        try:
+            by_mac12 = {}
+            by_last3 = {}
+            for d in gc_devicelist:
+                mac12 = self._to_hex_str(getattr(d, "addr", None))
+                if len(mac12) != 12:
+                    continue
+                by_mac12[mac12] = d
+                last3 = mac12[-6:]
+                by_last3.setdefault(last3, []).append(d)
+            self._dev_by_mac12 = by_mac12
+            self._dev_by_last3 = by_last3
+            self._dev_index_len = len(gc_devicelist)
+        except Exception:
+            logger.exception("GC: rebuild device index failed")
+
+    def _ensure_device_index(self) -> None:
+        """Rebuild index if gc_devicelist length changed."""
+        try:
+            if getattr(self, "_dev_index_len", -1) != len(gc_devicelist):
+                    self._rebuild_device_index()
+        except Exception:
+            pass
+
+    def resolve_device(self, addr_or_device) -> Optional["GC_Device"]:
+        """Resolve a GC_Device from a full MAC (12 hex), last3 (6 hex), or GC_Device."""
+        if addr_or_device is None:
+            return None
+        try:
+            if isinstance(addr_or_device, GC_Device):
+                return addr_or_device
+        except Exception:
+            pass
+        s = self._to_hex_str(addr_or_device)
+        return self.getDeviceFromAddress(s)
+
+    def resolve_devices(self, addrs) -> list:
+        out = []
+        for a in (addrs or []):
+            d = self.resolve_device(a)
+            if d:
+                out.append(d)
+        return out
+
+    def sendConfigToDevice(self, targetDevice: "GC_Device", option: int, flags: int) -> None:
+        recv3 = _mac_last3_from_hex(targetDevice.addr)
+        self.sendConfig(option, flags, recv3=recv3)
+
+    def setWifiAp(self, targetDevice: "GC_Device", enable: bool) -> None:
+        # CONFIG option 0x04 = WiFi/AP control in GateControl usermod
+        self.sendConfigToDevice(targetDevice, option=0x04, flags=(1 if enable else 0))
+
     def _handle_ack_event(self, ev: dict) -> None:
         """ACK vom Transport auf das passende GC_Device abbilden (überschreibt last_ack)."""
         try:
@@ -815,21 +996,41 @@ class GateControl_LoRa():
             logger.exception("ACK handling failed")
 
     def getDeviceFromAddress(self, addr: str) -> Optional["GC_Device"]:
-        """MAC als String ohne Trennzeichen: 12 (voll) oder 6 (last3)."""
+
+        """MAC as string without separators: 12 (full) or 6 (last3).
+
+        Uses an internal index for fast lookups. If last3 is ambiguous, returns
+        the most recently seen device (based on last_seen_ts).
+        """
         if not addr:
             return None
-        s = str(addr).strip().upper()
+        s = str(addr).strip().upper().replace(":", "").replace(" ", "")
+        if len(s) not in (6, 12):
+            return None
+
+        self._ensure_device_index()
+
         if len(s) == 12:
+            dev = getattr(self, "_dev_by_mac12", {}).get(s)
+            if dev:
+                return dev
             for d in gc_devicelist:
-                if (d.addr or "").upper() == s:
+                if (getattr(d, "addr", "") or "").upper() == s:
                     return d
             return None
-        if len(s) == 6:
+
+        lst = getattr(self, "_dev_by_last3", {}).get(s, [])
+        if not lst:
             for d in gc_devicelist:
-                if (d.addr or "").upper().endswith(s):
+                if (getattr(d, "addr", "") or "").upper().endswith(s):
                     return d
             return None
-        return None
+        if len(lst) == 1:
+            return lst[0]
+        try:
+            return sorted(lst, key=lambda d: float(getattr(d, "last_seen_ts", 0) or 0), reverse=True)[0]
+        except Exception:
+            return lst[0]
     
     @staticmethod
     def _to_hex_str(addr: Union[str, bytes, bytearray, None]) -> str:
@@ -914,6 +1115,8 @@ class GC_Device():
             "seq": (int(seq) if seq is not None else None),
             "ts": time.time(),
         }
+        self.last_seen_ts = time.time()
+        
         if host_rssi is not None:
             self.host_rssi = int(host_rssi)
         if host_snr is not None:

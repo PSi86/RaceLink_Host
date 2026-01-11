@@ -95,6 +95,26 @@ def register_gc_blueprint(
         except Exception:
             print(msg)
 
+    def _resolve_device(addr):
+        """Return the GC_Device from gc_devicelist for a full MAC (12 hex) or last3 (6 hex)."""
+        try:
+            if hasattr(gc_instance, "resolve_device"):
+                return gc_instance.resolve_device(addr)
+        except Exception:
+            pass
+        try:
+            return gc_instance.getDeviceFromAddress(addr)
+        except Exception:
+            return None
+
+    def _resolve_devices(addrs):
+        out = []
+        for a in (addrs or []):
+            d = _resolve_device(a)
+            if d:
+                out.append(d)
+        return out
+
     # --- Master state mirrored to UI ---
     _master = {
         "state": "IDLE",              # IDLE | TX | RX | ERROR
@@ -562,7 +582,7 @@ def register_gc_blueprint(
                     updated = int(gc_instance.getStatusSelection(selection) or 0)
                 else:
                     for mac in selection:
-                        dev = gc_instance.getDeviceFromAddress(mac)
+                        dev = _resolve_device(mac)
                         if dev:
                             updated += int(gc_instance.getStatus(targetDevice=dev) or 0)
             elif group_id is not None:
@@ -588,20 +608,36 @@ def register_gc_blueprint(
         new_name = body.get("name", None)
 
         changed = 0
+        to_set_group = []
+
+        # Update local cache first (gc_devicelist), then send LoRa updates outside the lock.
         with _gc_lock:
             for mac in macs:
-                dev = gc_instance.getDeviceFromAddress(mac)
+                dev = _resolve_device(mac)
                 if not dev:
                     continue
-                if new_name and isinstance(new_name, str) and macs and len(macs) == 1:
+
+                if new_name and isinstance(new_name, str) and len(macs) == 1:
                     dev.name = new_name
                     changed += 1
+
                 if new_group is not None:
                     try:
-                        gc_instance.setGateGroupId(dev, int(new_group))
-                        changed += 1
+                        dev.groupId = int(new_group)
+                        to_set_group.append(dev)
                     except Exception as ex:
-                        _log(f"GateControl: setGateGroupId failed for {mac}: {ex}")
+                        _log(f"GateControl: invalid groupId for {mac}: {ex}")
+
+        # Send SET_GROUP (wait for ACK) so the node keeps accepting LoRa after reboot.
+        for dev in to_set_group:
+            try:
+                ok = bool(gc_instance.setGateGroupId(dev, forceSet=True, wait_for_ack=True))
+                if ok:
+                    changed += 1
+                else:
+                    _log(f"GateControl: setGateGroupId: no ACK from {dev.addr}")
+            except Exception as ex:
+                _log(f"GateControl: setGateGroupId failed for {dev.addr}: {ex}")
         try:
             gc_instance.save_to_db({"manual": True})
         except Exception:
@@ -710,9 +746,13 @@ def register_gc_blueprint(
     # JSON API: CONTROL (flags/presetId)
     # -----------------------
 
+    
     @bp.route("/gatecontrol/api/config", methods=["POST"])
     def api_config():
-        """Send unicast CONFIG packet to exactly one node (no broadcast)."""
+        """Send unicast CONFIG packet to exactly one known node.
+
+        Important: all interactions must map to the canonical GC_Device in gc_devicelist.
+        """
         if _task_is_running():
             return _task_busy_response()
 
@@ -725,29 +765,9 @@ def register_gc_blueprint(
         if len(macs) != 1:
             return jsonify({"ok": False, "error": "select exactly one device"}), 400
 
-        def _parse_recv3_from_addr(addr_str) -> Optional[bytes]:
-            """Parse address string (3B or 6B, with/without separators) and return last3 bytes."""
-            if addr_str is None:
-                return None
-            try:
-                s = str(addr_str)
-            except Exception:
-                return None
-            hexchars = "0123456789abcdefABCDEF"
-            s = "".join(ch for ch in s if ch in hexchars)
-            if len(s) < 6:
-                return None
-            s = s[-6:]
-            try:
-                return bytes.fromhex(s)
-            except Exception:
-                return None
-
-        recv3 = _parse_recv3_from_addr(macs[0])
-        if not recv3:
-            return jsonify({"ok": False, "error": "invalid mac/address"}), 400
-        if recv3 == b"\xFF\xFF\xFF":
-            return jsonify({"ok": False, "error": "broadcast not allowed for config"}), 400
+        dev = _resolve_device(macs[0])
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found in gc_devicelist (run Discover Devices first)"}), 404
 
         try:
             option = int(body.get("option", 0)) & 0xFF
@@ -759,17 +779,20 @@ def register_gc_blueprint(
             return jsonify({"ok": False, "error": "unknown config option"}), 400
 
         try:
-            # Prefer instance helper if present
-            if hasattr(gc_instance, "sendConfig"):
-                gc_instance.sendConfig(option=option, flags=flags, recv3=recv3)
+            if option == 0x04 and hasattr(gc_instance, "setWifiAp"):
+                gc_instance.setWifiAp(dev, bool(flags & 0x01))
+            elif hasattr(gc_instance, "sendConfigToDevice"):
+                gc_instance.sendConfigToDevice(dev, option=option, flags=flags)
             else:
-                gc_instance.lora.send_config(recv3=recv3, option=option, flags=flags)
+                recv3 = _recv3_bytes_from_addr(str(dev.addr))
+                gc_instance.sendConfig(option=option, flags=flags, recv3=recv3)
+
         except Exception as ex:
             _log(f"GateControl: config failed: {ex}")
             return jsonify({"ok": False, "error": str(ex)}), 500
 
         _set_master(state="TX", tx_pending=True, last_event="CONFIG_SENT")
-        return jsonify({"ok": True, "sent": 1, "recv3": recv3.hex().upper(), "option": option, "flags": flags})
+        return jsonify({"ok": True, "sent": 1, "addr": dev.addr, "option": option, "flags": flags})
 
     @bp.route("/gatecontrol/api/devices/control", methods=["POST"])
     def api_devices_control():
@@ -814,7 +837,7 @@ def register_gc_blueprint(
                 changed = 1
             elif macs:
                 for mac in macs:
-                    dev = gc_instance.getDeviceFromAddress(mac)
+                    dev = _resolve_device(mac)
                     if dev:
                         try:
                             gc_instance.sendGateControl(dev, flags, presetId, brightness)
@@ -1357,13 +1380,37 @@ def register_gc_blueprint(
                     _host_wifi_wait_iface_ready(wifi_iface, timeout_s=15.0)
                     results["hostWifi"]["enabled"] = True
 
-                total = len(macs)
-                for idx, addr in enumerate(macs, start=1):
-                    expected_mac = _expected_mac_hex(str(addr))
+                # Resolve all targets to GC_Device objects so every interaction maps to gc_devicelist.
+                resolved = []
+                missing = []
+                for a in macs:
+                    d = _resolve_device(a)
+                    if d:
+                        resolved.append(d)
+                    else:
+                        missing.append(str(a))
+
+                for a in missing:
+                    results["devices"].append({
+                        "addr": a,
+                        "expectedMac": _expected_mac_hex(a),
+                        "groupId": None,
+                        "ok": False,
+                        "error": "Device not found in gc_devicelist",
+                        "info_before": None,
+                        "info_after": None,
+                    })
+                    results["errors"].append(f"Device not found in gc_devicelist: {a}")
+                    results["ok"] = False
+
+                total = len(resolved)
+                for idx, dev in enumerate(resolved, start=1):
+                    addr = dev.addr
+                    expected_mac = _expected_mac_hex(addr)
                     dev_res = {
                         "addr": addr,
                         "expectedMac": expected_mac,
-                        "groupId": _lookup_group_id_for_addr(str(addr)),
+                        "groupId": int(getattr(dev, "groupId", 0) or 0),
                         "ok": False,
                         "error": None,
                         "info_before": None,
@@ -1382,8 +1429,12 @@ def register_gc_blueprint(
                         "message": "Enable WLED AP via LoRa",
                     })
                     try:
-                        recv3 = _recv3_bytes_from_addr(str(addr))
-                        gc_instance.sendConfig(0x04, 1, recv3)
+                        # Prefer plugin helper to keep mapping consistent.
+                        if hasattr(gc_instance, "setWifiAp"):
+                            gc_instance.setWifiAp(dev, True)
+                        else:
+                            recv3 = _recv3_bytes_from_addr(str(addr))
+                            gc_instance.sendConfig(0x04, 1, recv3)
                     except Exception as ex:
                         dev_res["error"] = f"LoRa AP enable failed: {ex}"
                         results["errors"].append(dev_res["error"])
@@ -1552,18 +1603,7 @@ def register_gc_blueprint(
                         # IMPORTANT: Setting the group must use setGateGroupId(), not sendConfig(),
                         # because the node will only accept further LoRa commands after SET_GROUP
                         # is ACKed (your firmware behavior).
-                        target_dev = None
-                        want = _expected_mac_hex(str(addr))
-                        with _gc_lock:
-                            for d in gc_devicelist:
-                                have = _expected_mac_hex(str(getattr(d, "addr", "") or ""))
-                                if have and want and have.lower() == want.lower():
-                                    target_dev = d
-                                    break
-                        if not target_dev:
-                            raise RuntimeError(f"Device {addr} not found in gc_devicelist")
-
-                        ok_set = gc_instance.setGateGroupId(target_dev, forceSet=True, wait_for_ack=True)
+                        ok_set = gc_instance.setGateGroupId(dev, forceSet=True, wait_for_ack=True)
                         if not ok_set:
                             raise RuntimeError("No ACK_OK for SET_GROUP")
                     except Exception as ex:
@@ -1572,8 +1612,6 @@ def register_gc_blueprint(
                         if stop_on_error:
                             raise RuntimeError(dev_res["error"])
                         continue
-                    
-                    time.sleep(0.1)
 
                     _task_update(meta={
                         "stage": "POST_OTA_LORA_AP_ON",
@@ -1585,11 +1623,15 @@ def register_gc_blueprint(
                         "message": "Re-enable WLED AP via LoRa after reboot",
                     })
                     try:
-                        recv3 = _recv3_bytes_from_addr(str(addr))
-                        gc_instance.sendConfig(0x04, 1, recv3)
+                        if hasattr(gc_instance, "setWifiAp"):
+                            gc_instance.setWifiAp(dev, True)
+                        else:
+                            recv3 = _recv3_bytes_from_addr(str(addr))
+                            gc_instance.sendConfig(0x04, 1, recv3)
                     except Exception:
                         # best-effort; even if this fails, the HTTP wait below will time out
                         pass
+
                     
                     _task_update(meta={
                         "stage": "POST_OTA_CONNECT_WIFI",
@@ -1663,8 +1705,11 @@ def register_gc_blueprint(
                             "retries": retries,
                             "message": "Disable WLED AP via LoRa (best-effort)",
                         })
-                        recv3 = _recv3_bytes_from_addr(str(addr))
-                        gc_instance.sendConfig(0x04, 0, recv3)
+                        if hasattr(gc_instance, "setWifiAp"):
+                            gc_instance.setWifiAp(dev, False)
+                        else:
+                            recv3 = _recv3_bytes_from_addr(str(addr))
+                            gc_instance.sendConfig(0x04, 0, recv3)
                     except Exception:
                         pass
 
