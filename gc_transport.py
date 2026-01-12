@@ -89,6 +89,8 @@ class LoRaUSB:
         self._rx_thread = None
         self._q = []
         self._qmax = 1000
+        self._listeners = []
+        self._tx_listeners = []
 
     @staticmethod
     def _is_usb_port(portinfo):
@@ -216,6 +218,38 @@ class LoRaUSB:
         except: pass
 
     # ---------------- Host -> Device ----------------
+    # ---------------- Listeners ----------------
+    def add_listener(self, cb):
+        """Add a receive/event listener (non-destructive; multiple listeners supported)."""
+        if cb and cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def remove_listener(self, cb):
+        try:
+            if cb in self._listeners:
+                self._listeners.remove(cb)
+        except Exception:
+            pass
+
+    def add_tx_listener(self, cb):
+        """Add a TX listener called for every Host->Device send."""
+        if cb and cb not in self._tx_listeners:
+            self._tx_listeners.append(cb)
+
+    def remove_tx_listener(self, cb):
+        try:
+            if cb in self._tx_listeners:
+                self._tx_listeners.remove(cb)
+        except Exception:
+            pass
+
+    def _emit_tx(self, ev:dict):
+        for cb in list(self._tx_listeners):
+            try:
+                cb(ev)
+            except Exception:
+                pass
+
     def _send_m2n(self, type_full:int, recv3:bytes, body:bytes=b""):
         if len(recv3) != 3:
             raise ValueError("recv3 must be 3 bytes")
@@ -232,6 +266,7 @@ class LoRaUSB:
                 len(body),
                 (body or b"").hex().upper()
             )
+            self._emit_tx({"type": "TX_M2N", "type_full": type_full, "dir": (type_full & 0x80), "opc": (type_full & 0x7F), "recv3": recv3, "body_len": len(body or b"")})
         except serial.SerialException as e:
             logger.error("TX write failed: %s", e)
             raise
@@ -262,7 +297,8 @@ class LoRaUSB:
 
     def send_sync(self, recv3:bytes=b'\xFF\xFF\xFF', ts24:int=0, brightness:int=0):
         """Send SYNC (4B): ts24(LE24), brightness."""
-        body = struct.pack("<HB", int(ts24) & 0xFFFFFF, int(brightness) & 0xFF)
+        ts = int(ts24) & 0xFFFFFF
+        body = bytes([(ts & 0xFF), ((ts >> 8) & 0xFF), ((ts >> 16) & 0xFF), (int(brightness) & 0xFF)])
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SYNC), recv3, body)
 
     # Backwards helper (old opcode name), kept to avoid breaking older host code.
@@ -295,43 +331,85 @@ class LoRaUSB:
                 self._handle_frame(buf[0], memoryview(buf)[1:].tobytes())
 
     def _emit(self, ev:dict):
-        if len(self._q) < self._qmax: self._q.append(ev)
-        if self.on_event:
-            try: self.on_event(ev)
-            except: pass
+        if len(self._q) < self._qmax:
+            self._q.append(ev)
+
+        # Non-destructive listeners (preferred)
+        for cb in list(self._listeners):
+            try:
+                cb(ev)
+            except Exception:
+                pass
+
+        # Legacy single callback (kept for backwards compatibility)
+        if self.on_event and self.on_event not in self._listeners:
+            try:
+                self.on_event(ev)
+            except Exception:
+                pass
 
     def _handle_frame(self, type_byte:int, data:bytes):
-        # USB-only Events
+        """Parse one framed message from device and emit events.
+
+        Framing v1.1 delivers TYPE + DATA, where TYPE is either:
+        - EV_* (USB-only event codes), or
+        - DIR_N2M|OPC_* (LoRa reply from node to master to host)
+        """
+        now = time.time()
+
+        # USB-only events
         if type_byte in (EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE):
             if type_byte == EV_RX_WINDOW_OPEN and len(data) >= 2:
-                self._emit({"type": type_byte, "window_ms": _u16le(data[:2])})
+                ev = {"type": type_byte, "window_ms": _u16le(data[:2]), "ts": now}
             elif type_byte == EV_RX_WINDOW_CLOSED and len(data) >= 2:
-                self._emit({"type": type_byte, "rx_count_delta": _u16le(data[:2])})
+                ev = {"type": type_byte, "rx_count_delta": _u16le(data[:2]), "ts": now}
             elif type_byte == EV_TX_DONE and len(data) >= 1:
-                self._emit({"type": type_byte, "last_len": data[0]})
+                ev = {"type": type_byte, "last_len": data[0], "ts": now}
             else:
-                self._emit({"type": type_byte, "data": data})
+                ev = {"type": type_byte, "data": data, "ts": now}
+            self._emit(ev)
             return
 
-        # LoRa parsed forward (TYPE = DIR_N2M|OPC_*)
+        # LoRa replies (TYPE = DIR_N2M | opcode7)
         if (type_byte & 0x80) != LP.DIR_N2M:
             return
-        if len(data) < 10:  # 7B header + rssi(2) + snr(1)
+
+        # Expect: Header7(7) + Body + RSSI(LE16) + SNR(i8)
+        if len(data) < 10:
             return
 
-        hdr  = data[:7]; body = data[7:-3]
-        rssi = _u16le(data[-3:-1]);  rssi = rssi - 0x10000 if (rssi & 0x8000) else rssi
-        snr  = struct.unpack("<b", data[-1:])[0]
-        sender3 = bytes(hdr[0:3]); receiver3 = bytes(hdr[3:6])
-        opc = (type_byte & 0x7F)
-        ev = {"type": type_byte, "opc": opc, "sender3": sender3, "receiver3": receiver3, "host_rssi": rssi, "host_snr": snr}
+        hdr = data[:7]
+        body = data[7:-3]
+        rssi_raw = _u16le(data[-3:-1])
+        rssi = rssi_raw - 0x10000 if (rssi_raw & 0x8000) else rssi_raw
+        snr = struct.unpack("<b", data[-1:])[0]
 
+        sender3 = bytes(hdr[0:3])
+        receiver3 = bytes(hdr[3:6])
+        opc = (type_byte & 0x7F)
+
+        ev = {
+            "type": type_byte,   # keep legacy behavior (numeric)
+            "dir": (type_byte & 0x80),
+            "opc": opc,
+            "sender3": sender3,
+            "receiver3": receiver3,
+            "host_rssi": rssi,
+            "host_snr": snr,
+            "ts": now,
+        }
+
+        # Compatibility parsing for common replies
         if opc == LP.OPC_DEVICES:
             # IDENTIFY_REPLY = 9B: [version, caps, groupId, mac6]
             if len(body) == 9:
-                version, caps, groupId = body[0], body[1], body[2]
-                mac6 = bytes(body[3:9])
-                ev.update({"reply": "IDENTIFY_REPLY", "version": version, "caps": caps, "groupId": groupId, "mac6": mac6})
+                ev.update({
+                    "reply": "IDENTIFY_REPLY",
+                    "version": body[0],
+                    "caps": body[1],
+                    "groupId": body[2],
+                    "mac6": bytes(body[3:9]),
+                })
             else:
                 ev.update({"reply": "IDENTIFY_REPLY", "body_raw": body})
 
@@ -339,21 +417,29 @@ class LoRaUSB:
             # STATUS_REPLY = 7B: [flags, presetId, brightness, vbat_mV(LE16), rssi_node(i8), snr_node(i8)]
             if len(body) == 7:
                 flags, presetId, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBHbb", body)
-                ev.update({"reply": "STATUS_REPLY", "flags": flags, "presetId": presetId, "brightness": brightness,
-                           "vbat_mV": vbat_mV, "node_rssi": rssi_node, "node_snr": snr_node})
+                ev.update({
+                    "reply": "STATUS_REPLY",
+                    "flags": flags,
+                    "presetId": presetId,
+                    "brightness": brightness,
+                    "vbat_mV": vbat_mV,
+                    "node_rssi": rssi_node,
+                    "node_snr": snr_node,
+                })
             else:
                 ev.update({"reply": "STATUS_REPLY", "body_raw": body})
 
         elif opc == LP.OPC_ACK:
+            # ACK = min 2B: [ack_of(opc7), status]
             if len(body) >= 2:
-                ack_of     = body[0] & 0x7F
+                ack_of = body[0] & 0x7F
                 ack_status = body[1]
                 ev.update({"reply": "ACK", "ack_of": ack_of, "ack_status": ack_status})
                 if len(body) >= 3:
                     ev.update({"ack_seq": body[2]})
-                #ev.update({"body_raw": body})  # optional, fürs Debug
             else:
                 ev.update({"reply": "ACK", "body_raw": body})
+
         else:
             ev.update({"reply": "OTHER", "body_raw": body})
 

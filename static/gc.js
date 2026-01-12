@@ -193,7 +193,7 @@ function updateNodeCfgUi(){
         <td>${fmt.num(r.host_snr)}</td>
         <td>${r.version ?? ""}</td>
         <td>${r.caps ?? ""}</td>
-        <td>${r.online ? '<span class="tag online">Online</span>' : ''}</td>
+        <td>${(r.online===true) ? '<span class="tag online">Online</span>' : (r.online===false) ? '<span class="tag off">Offline</span>' : ''}</td>
       `;
       body.appendChild(tr);
     });
