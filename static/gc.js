@@ -611,6 +611,26 @@ function updateNodeCfgUi(){
     if(r.busy) return;
   });
 
+  $("#btnPresetsUpload").addEventListener("click", async ()=>{
+    const fileEl = $("#presetsFile");
+    const infoEl = $("#presetsInfo");
+    if(!fileEl || !infoEl) return;
+    const file = fileEl.files && fileEl.files[0];
+    if(!file){
+      alert("Select a presets.json file first.");
+      return;
+    }
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    const r = await apiUpload("/gatecontrol/api/presets/upload", formData);
+    if(r.ok){
+      const count = (r.presets && r.presets.length) ? r.presets.length : 0;
+      infoEl.textContent = `Uploaded ${r.file?.name || file.name} (${count} presets)`;
+    } else {
+      infoEl.textContent = r.error || "Upload failed.";
+    }
+  });
+
   $("#btnStatusSel").addEventListener("click", async ()=>{
     const macs = Array.from(state.selected);
     if(macs.length===0) return;

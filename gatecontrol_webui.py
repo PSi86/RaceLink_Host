@@ -30,7 +30,7 @@ This registers the page at /gatecontrol and JSON endpoints under /gatecontrol/ap
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import json
 import time
@@ -38,6 +38,7 @@ import threading
 
 import os
 import re
+from RHUI import UIFieldSelectOption
 import tempfile
 import hashlib
 import uuid
@@ -885,6 +886,33 @@ def register_gc_blueprint(
                 h.update(chunk)
         return h.hexdigest()
 
+    def _parse_wled_presets_minimal(presets: Union[str, bytes, Dict[str, Any]]) -> List[Tuple[int, str]]:
+        if isinstance(presets, (str, bytes)):
+            data = json.loads(presets)
+        elif isinstance(presets, dict):
+            data = presets
+        else:
+            raise TypeError("presets must be dict, str, or bytes")
+
+        out: List[Tuple[int, str]] = []
+        for key, preset_obj in data.items():
+            try:
+                preset_id = int(key)
+            except (TypeError, ValueError):
+                continue
+
+            if not isinstance(preset_obj, dict):
+                continue
+
+            raw_name = preset_obj.get("n", "")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            if not name:
+                name = f"Preset ID {preset_id}"
+            out.append((preset_id, name))
+
+        out.sort(key=lambda t: t[0])
+        return out
+
     def _store_upload(file_storage, kind: str) -> dict:
         # kind: firmware | presets | cfg
         if not file_storage or not getattr(file_storage, "filename", ""):
@@ -1299,6 +1327,32 @@ def register_gc_blueprint(
             info = _store_upload(f, kind)
             # return only safe fields
             return jsonify({"ok": True, "file": {k: info[k] for k in ("id", "kind", "name", "size", "sha256", "uploaded_ts")}})
+        except Exception as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+
+    @bp.route("/gatecontrol/api/presets/upload", methods=["POST"])
+    def api_presets_upload():
+        if _task_is_running():
+            return _task_busy_response()
+
+        f = request.files.get("file", None)
+        try:
+            info = _store_upload(f, "presets")
+            with open(info["path"], "rb") as fh:
+                payload = fh.read()
+            parsed = _parse_wled_presets_minimal(payload or b"{}")
+            gc_instance.uiEffectList = [UIFieldSelectOption(str(pid), name) for pid, name in parsed]
+            try:
+                gc_instance.register_quickset_ui()
+                gc_instance.registerActions()
+                gc_instance._rhapi.ui.broadcast_ui("run")
+            except Exception:
+                pass
+            return jsonify({
+                "ok": True,
+                "file": {k: info[k] for k in ("id", "kind", "name", "size", "sha256", "uploaded_ts")},
+                "presets": [{"id": pid, "name": name} for pid, name in parsed],
+            })
         except Exception as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
 
