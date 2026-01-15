@@ -144,7 +144,7 @@
       <div class="row">
         <label>Host WiFi (nmcli profile):</label>
         <input id="fwWifiConnName" value="gatecontrol-wled-ap" style="width: 190px;" />
-        <input id="fwWifiIface" value="wlan0" style="width: 110px;" />
+        <select id="fwWifiIface" style="width: 140px;"></select>
         <input id="fwWifiSsid" value="WLED-AP" style="width: 160px;" />
         <span class="muted">Activate a pre-created NetworkManager connection profile</span>
       </div>
@@ -163,7 +163,7 @@
 
 
       <div class="row">
-        <label>Firmware (.bin):</label>
+        <label><input id="fwDoFirmware" type="checkbox" checked /> Firmware (.bin)</label>
         <input id="fwBin" type="file" accept=".bin,application/octet-stream" />
         <button id="btnFwUpload" type="button">Upload to Host</button>
         <span id="fwBinInfo" class="muted"></span>

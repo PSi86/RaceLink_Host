@@ -439,6 +439,27 @@ function updateNodeCfgUi(){
     $("#fwCfg").value = "";
   }
 
+  async function loadWifiIfaces(){
+    const sel = $("#fwWifiIface");
+    if(!sel) return;
+    sel.innerHTML = "";
+    let data = null;
+    try{
+      data = await apiGet("/gatecontrol/api/wifi/interfaces");
+    }catch{
+      data = null;
+    }
+    const ifaces = (data && data.ifaces && data.ifaces.length) ? data.ifaces : ["wlan0"];
+    ifaces.forEach((name)=>{
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    });
+    const preferred = ifaces.includes("wlan0") ? "wlan0" : (ifaces[0] || "");
+    if(preferred) sel.value = preferred;
+  }
+
   async function fwUpload(kind, fileInputEl, infoEl){
     const f = fileInputEl.files && fileInputEl.files[0];
     if(!f){
@@ -462,8 +483,11 @@ function updateNodeCfgUi(){
     try{
     fwDialogCounts();
     fwResetUploadsUi();
+    loadWifiIfaces();
 
     // Enable/disable optional controls based on checkboxes
+    $("#fwBin").disabled = !$("#fwDoFirmware").checked;
+    $("#btnFwUpload").disabled = !$("#fwDoFirmware").checked;
     $("#fwPresets").disabled = !$("#fwDoPresets").checked;
     $("#btnFwUploadPresets").disabled = !$("#fwDoPresets").checked;
     $("#fwCfg").disabled = !$("#fwDoCfg").checked;
@@ -473,6 +497,17 @@ function updateNodeCfgUi(){
     } catch(e){
       console.error(e);
       alert("Firmware dialog failed to open. Check console for details.");
+    }
+  });
+
+  $("#fwDoFirmware").addEventListener("change", ()=>{
+    const on = $("#fwDoFirmware").checked;
+    $("#fwBin").disabled = !on;
+    $("#btnFwUpload").disabled = !on;
+    if(!on){
+      state.fwUploads.fwId = null;
+      $("#fwBinInfo").textContent = "";
+      $("#fwBin").value = "";
     }
   });
 
@@ -519,8 +554,11 @@ function updateNodeCfgUi(){
       alert("No target devices (selection/filter empty).");
       return;
     }
-    if(!state.fwUploads.fwId){
-      alert("Please upload the firmware file to the host first.");
+    const doFirmware = $("#fwDoFirmware").checked;
+    const doPresets = $("#fwDoPresets").checked;
+    const doCfg = $("#fwDoCfg").checked;
+    if(!doFirmware && !doPresets && !doCfg){
+      alert("Select at least one operation (firmware, presets, or cfg).");
       return;
     }
 
@@ -528,25 +566,41 @@ function updateNodeCfgUi(){
     const retries = Number($("#fwRetries").value || 3) || 3;
 
     const wifiSsid = ($("#fwWifiSsid")?.value || "WLED-AP").trim();
-        const wifiIface = ($("#fwWifiIface")?.value || "wlan0").trim();
+    const wifiIface = ($("#fwWifiIface")?.value || "wlan0").trim();
     const wifiConnName = ($("#fwWifiConnName")?.value || "gatecontrol-wled-ap").trim();
-        const wifiTimeoutS = Number($("#fwWifiTimeoutS")?.value || 35) || 35;
+    const wifiTimeoutS = Number($("#fwWifiTimeoutS")?.value || 35) || 35;
 
     const hostWifiEnable = !!($("#fwHostWifiEnable")?.checked);
     const hostWifiRestore = !!($("#fwHostWifiRestore")?.checked);
 
-    const body = { macs, fwId: state.fwUploads.fwId, baseUrl, retries, hostWifiEnable, hostWifiRestore,
+    const body = {
+      macs,
+      baseUrl,
+      retries,
+      hostWifiEnable,
+      hostWifiRestore,
+      doFirmware,
+      doPresets,
+      doCfg,
       wifi: { connName: wifiConnName, ssid: wifiSsid, iface: wifiIface, timeoutS: wifiTimeoutS }
     };
 
-    if($("#fwDoPresets").checked){
+    if(doFirmware){
+      if(!state.fwUploads.fwId){
+        alert("Firmware enabled but firmware is not uploaded yet.");
+        return;
+      }
+      body.fwId = state.fwUploads.fwId;
+    }
+
+    if(doPresets){
       if(!state.fwUploads.presetsId){
         alert("Presets enabled but presets.json is not uploaded yet.");
         return;
       }
       body.presetsId = state.fwUploads.presetsId;
     }
-    if($("#fwDoCfg").checked){
+    if(doCfg){
       if(!state.fwUploads.cfgId){
         alert("cfg enabled but cfg.json is not uploaded yet.");
         return;

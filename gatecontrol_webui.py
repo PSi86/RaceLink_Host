@@ -879,6 +879,24 @@ def register_gc_blueprint(
         os.makedirs(d, exist_ok=True)
         return d
 
+    def _wifi_interfaces() -> List[str]:
+        base = "/sys/class/net"
+        ifaces: List[str] = []
+        try:
+            for name in os.listdir(base):
+                if name.startswith("."):
+                    continue
+                if os.path.isdir(os.path.join(base, name, "wireless")):
+                    ifaces.append(name)
+        except Exception:
+            ifaces = []
+        if not ifaces:
+            try:
+                ifaces = [name for name in os.listdir(base) if not name.startswith(".")]
+            except Exception:
+                ifaces = []
+        return sorted(set(ifaces))
+
     def _sha256_file(path: str) -> str:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -1367,6 +1385,11 @@ def register_gc_blueprint(
         rows.sort(key=lambda r: r.get("uploaded_ts", 0), reverse=True)
         return jsonify({"ok": True, "files": rows})
 
+    @bp.route("/gatecontrol/api/wifi/interfaces", methods=["GET"])
+    def api_wifi_interfaces():
+        ifaces = _wifi_interfaces()
+        return jsonify({"ok": True, "ifaces": ifaces})
+
     @bp.route("/gatecontrol/api/fw/start", methods=["POST"])
     def api_fw_start():
         _ensure_transport_hooked()
@@ -1378,15 +1401,32 @@ def register_gc_blueprint(
         if not isinstance(macs, list) or not macs:
             return jsonify({"ok": False, "error": "missing macs"}), 400
 
-        fw_id = str(body.get("fwId") or "").strip()
-        fw_info = _get_upload(fw_id, expect_kind="firmware")
-        if not fw_info:
-            return jsonify({"ok": False, "error": "firmware file not uploaded (fwId)"}), 400
+        do_firmware = bool(body.get("doFirmware", True))
+        do_presets = bool(body.get("doPresets", False))
+        do_cfg = bool(body.get("doCfg", False))
 
-        presets_id = str(body.get("presetsId") or "").strip()
-        cfg_id = str(body.get("cfgId") or "").strip()
-        presets_info = _get_upload(presets_id, expect_kind="presets") if presets_id else None
-        cfg_info = _get_upload(cfg_id, expect_kind="cfg") if cfg_id else None
+        if not (do_firmware or do_presets or do_cfg):
+            return jsonify({"ok": False, "error": "no operations selected"}), 400
+
+        fw_info = None
+        if do_firmware:
+            fw_id = str(body.get("fwId") or "").strip()
+            fw_info = _get_upload(fw_id, expect_kind="firmware")
+            if not fw_info:
+                return jsonify({"ok": False, "error": "firmware file not uploaded (fwId)"}), 400
+
+        presets_info = None
+        cfg_info = None
+        if do_presets:
+            presets_id = str(body.get("presetsId") or "").strip()
+            presets_info = _get_upload(presets_id, expect_kind="presets") if presets_id else None
+            if not presets_info:
+                return jsonify({"ok": False, "error": "presets file not uploaded (presetsId)"}), 400
+        if do_cfg:
+            cfg_id = str(body.get("cfgId") or "").strip()
+            cfg_info = _get_upload(cfg_id, expect_kind="cfg") if cfg_id else None
+            if not cfg_info:
+                return jsonify({"ok": False, "error": "cfg file not uploaded (cfgId)"}), 400
 
         try:
             retries = int(body.get("retries") or 3)
@@ -1415,7 +1455,7 @@ def register_gc_blueprint(
             results = {
                 "ok": True,
                 "baseUrl": base_url,
-                "fw": {k: fw_info[k] for k in ("id", "name", "size", "sha256")},
+                "fw": ({k: fw_info[k] for k in ("id", "name", "size", "sha256")} if fw_info else None),
                 "presets": ({k: presets_info[k] for k in ("id", "name", "size", "sha256")} if presets_info else None),
                 "cfg": ({k: cfg_info[k] for k in ("id", "name", "size", "sha256")} if cfg_info else None),
                 "devices": [],
@@ -1554,7 +1594,7 @@ def register_gc_blueprint(
                         continue
                     dev_res["info_before"] = {k: info.get(k) for k in ("mac", "ver", "arch", "name")}
 
-                    # 4) Optional: upload presets/cfg files to filesystem BEFORE firmware (firmware update will reboot the device).
+                    # 4) Optional: upload presets/cfg files to filesystem.
                     try:
                         if presets_info:
                             _task_update(meta={
@@ -1584,6 +1624,10 @@ def register_gc_blueprint(
                         if stop_on_error:
                             raise RuntimeError(dev_res["error"])
                         # keep going to firmware update even if optional config failed
+
+                    if not fw_info:
+                        dev_res["ok"] = True
+                        continue
 
                     # 5) Firmware upload with retries (WLED reboots automatically after successful OTA)
                     ok = False
