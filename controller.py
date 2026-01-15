@@ -63,6 +63,7 @@ class GateControl_LoRa(GateControlUIMixin):
         self._pending_expect = None  # dict with keys: dev, rule, opcode7, sender_last3, ts
 
         self._transport_hooks_installed = False
+        self._pending_config = {}
         # Basic colors: 1-9; Basic effects: 10-19; Special Effects (WLED only): 20-100
         self.uiEffectList = [
             UIFieldSelectOption("01", "Red"),
@@ -410,6 +411,12 @@ class GateControl_LoRa(GateControlUIMixin):
         if not getattr(self, "lora", None):
             logger.warning("sendConfig: communicator not ready")
             return
+        recv3_hex = recv3.hex().upper() if isinstance(recv3, (bytes, bytearray)) else ""
+        if recv3_hex and recv3_hex != "FFFFFF":
+            self._pending_config[recv3_hex] = {
+                "option": int(option) & 0xFF,
+                "data0": int(data0) & 0xFF,
+            }
         self.lora.send_config(
             recv3=recv3,
             option=int(option) & 0xFF,
@@ -418,6 +425,21 @@ class GateControl_LoRa(GateControlUIMixin):
             data2=int(data2) & 0xFF,
             data3=int(data3) & 0xFF,
         )
+
+    def _apply_config_update(self, dev: GC_Device, option: int, data0: int) -> None:
+        bit_map = {
+            0x01: 0,
+            0x03: 1,
+            0x04: 2,
+        }
+        bit = bit_map.get(int(option))
+        if bit is None:
+            return
+        mask = 1 << bit
+        if int(data0):
+            dev.configByte = int(dev.configByte) | mask
+        else:
+            dev.configByte = int(dev.configByte) & (~mask & 0xFF)
 
     def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
         if not getattr(self, "lora", None):
@@ -604,6 +626,11 @@ class GateControl_LoRa(GateControlUIMixin):
             )
 
             dev.ack_update(int(ack_of), int(ack_status), ack_seq, host_rssi, host_snr)
+
+            if int(ack_of) == int(LP.OPC_CONFIG) and int(ack_status) == 0:
+                pending = self._pending_config.pop(sender3_hex, None)
+                if pending:
+                    self._apply_config_update(dev, pending.get("option", 0), pending.get("data0", 0))
 
         except Exception:
             logger.exception("ACK handling failed")

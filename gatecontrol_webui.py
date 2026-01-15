@@ -226,15 +226,16 @@ def register_gc_blueprint(
 
     # Event type constants from gc_transport (optional)
     try:
-        from .gc_transport import EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE  # type: ignore
+        from .gc_transport import EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE, LP  # type: ignore
     except Exception:
         try:
-            from gc_transport import EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE  # type: ignore
+            from gc_transport import EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE, LP  # type: ignore
         except Exception:
             EV_ERROR = 0xF0
             EV_RX_WINDOW_OPEN = 0xF1
             EV_RX_WINDOW_CLOSED = 0xF2
             EV_TX_DONE = 0xF3
+            LP = None
 
     def _on_transport_event(ev: dict):
         """
@@ -305,6 +306,14 @@ def register_gc_blueprint(
         reply = ev.get("reply")
         if not reply:
             return
+
+        if reply == "ACK":
+            try:
+                ack_of = int(ev.get("ack_of", -1))
+            except Exception:
+                ack_of = -1
+            if LP is not None and ack_of == int(LP.OPC_CONFIG):
+                _broadcast("refresh", {"what": ["devices"]})
 
         # Track replies for running tasks
         if _task_is_running():
@@ -1627,6 +1636,20 @@ def register_gc_blueprint(
 
                     if not fw_info:
                         dev_res["ok"] = True
+                        _task_update(meta={
+                            "stage": "LORA_AP_OFF",
+                            "index": idx,
+                            "total": total,
+                            "addr": addr,
+                            "attempt": 0,
+                            "retries": retries,
+                            "message": "Disable WLED AP via LoRa after upload",
+                        })
+                        try:
+                            recv3 = _recv3_bytes_from_addr(str(addr))
+                            gc_instance.sendConfig(0x04, data0=0, recv3=recv3)
+                        except Exception:
+                            pass
                         continue
 
                     # 5) Firmware upload with retries (WLED reboots automatically after successful OTA)
