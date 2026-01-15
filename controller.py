@@ -275,6 +275,7 @@ class GateControl_LoRa(GateControlUIMixin):
             sender_filter = recv3.hex().upper()
 
         updated = 0
+        responders = set()
 
         def _collect(ev: dict) -> bool:
             nonlocal updated
@@ -285,6 +286,16 @@ class GateControl_LoRa(GateControlUIMixin):
                         if isinstance(sender3, (bytes, bytearray)) and bytes(sender3).hex().upper() != sender_filter:
                             return False
                     updated += 1
+                    try:
+                        mac6 = ev.get("mac6")
+                        if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
+                            responders.add(bytes(mac6).hex().upper())
+                        else:
+                            sender3 = ev.get("sender3")
+                            if isinstance(sender3, (bytes, bytearray)) and len(sender3) == 3:
+                                responders.add(bytes(sender3).hex().upper())
+                    except Exception:
+                        pass
                     return True
             except Exception:
                 pass
@@ -301,11 +312,27 @@ class GateControl_LoRa(GateControlUIMixin):
             fail_safe_s=8.0,
         )
 
-        if targetDevice is not None and updated == 0 and got_closed:
-            try:
-                targetDevice.mark_offline("Missing reply (STATUS)")
-            except Exception:
-                pass
+        if got_closed:
+            if targetDevice is not None:
+                if updated == 0:
+                    try:
+                        targetDevice.mark_offline("Missing reply (STATUS)")
+                    except Exception:
+                        pass
+            else:
+                if groupFilter == 255:
+                    targets = list(gc_devicelist)
+                else:
+                    targets = [dev for dev in gc_devicelist if int(getattr(dev, "groupId", 0)) == int(groupFilter)]
+                for dev in targets:
+                    try:
+                        mac = (dev.addr or "").upper()
+                        if not mac:
+                            continue
+                        if mac not in responders and mac[-6:] not in responders:
+                            dev.mark_offline("Missing reply (STATUS)")
+                    except Exception:
+                        pass
 
         return updated
 
