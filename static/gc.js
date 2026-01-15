@@ -436,6 +436,12 @@ function updatePresetsDownloadUi(){
         (async ()=>{
           try{
             await loadPresetsList($("#presetsSelect"));
+            if(fname){
+              const selectEl = $("#presetsSelect");
+              if(selectEl && Array.from(selectEl.options).some(opt => opt.value === fname)){
+                selectEl.value = fname;
+              }
+            }
             const currentLabel = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
             $("#presetsCurrentInfo").textContent = currentLabel;
           }catch(e){

@@ -295,11 +295,17 @@ class GateControl_LoRa(GateControlUIMixin):
         except Exception:
             pass
 
-        self._wait_rx_window(
+        collected, got_closed = self._wait_rx_window(
             lambda: self.lora.send_get_status(recv3=recv3, group_id=groupId, flags=0),
             collect_pred=_collect,
             fail_safe_s=8.0,
         )
+
+        if targetDevice is not None and updated == 0 and got_closed:
+            try:
+                targetDevice.mark_offline("Missing reply (STATUS)")
+            except Exception:
+                pass
 
         return updated
 
