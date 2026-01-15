@@ -55,8 +55,9 @@
     busy: false,
     lastTask: null,
     lastMaster: null,
-    fwUploads: { fwId: null, presetsId: null, cfgId: null },
+    fwUploads: { fwId: null, cfgId: null },
     configDisplay: loadConfigDisplay(),
+    presets: { files: [], current: "" },
   };
 
   async function apiGet(url){
@@ -429,13 +430,11 @@ function updateNodeCfgUi(){
   }
 
   function fwResetUploadsUi(){
-    state.fwUploads = { fwId: null, presetsId: null, cfgId: null };
+    state.fwUploads = { fwId: null, cfgId: null };
     $("#fwBinInfo").textContent = "";
-    $("#fwPresetsInfo").textContent = "";
     $("#fwCfgInfo").textContent = "";
     $("#fwHint").textContent = "";
     $("#fwBin").value = "";
-    $("#fwPresets").value = "";
     $("#fwCfg").value = "";
   }
 
@@ -479,17 +478,53 @@ function updateNodeCfgUi(){
     return r.file.id;
   }
 
-  $("#btnFwUpdate").addEventListener("click", ()=>{
+  function formatPresetOption(preset){
+    const ts = preset.saved_ts ? new Date(preset.saved_ts * 1000) : null;
+    const tsLabel = ts ? ts.toLocaleString() : "";
+    return tsLabel ? `${preset.name} (${tsLabel})` : preset.name;
+  }
+
+  function populatePresetsSelect(selectEl, files, current){
+    selectEl.innerHTML = "";
+    if(!files || !files.length){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No presets.json found";
+      selectEl.appendChild(opt);
+      return "";
+    }
+    files.forEach(preset => {
+      const opt = document.createElement("option");
+      opt.value = preset.name;
+      opt.textContent = formatPresetOption(preset);
+      selectEl.appendChild(opt);
+    });
+    const available = new Set(files.map(p => p.name));
+    const desired = (current && available.has(current)) ? current : files[0].name;
+    selectEl.value = desired;
+    return desired;
+  }
+
+  async function loadPresetsList(selectEl){
+    const data = await apiGet("/gatecontrol/api/presets/list");
+    const files = data.files || [];
+    state.presets.files = files;
+    state.presets.current = data.current || "";
+    return populatePresetsSelect(selectEl, files, state.presets.current);
+  }
+
+  $("#btnFwUpdate").addEventListener("click", async ()=>{
     try{
     fwDialogCounts();
     fwResetUploadsUi();
     loadWifiIfaces();
+    await loadPresetsList($("#fwPresetsSelect"));
+    $("#fwPresetsHint").textContent = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
 
     // Enable/disable optional controls based on checkboxes
     $("#fwBin").disabled = !$("#fwDoFirmware").checked;
     $("#btnFwUpload").disabled = !$("#fwDoFirmware").checked;
-    $("#fwPresets").disabled = !$("#fwDoPresets").checked;
-    $("#btnFwUploadPresets").disabled = !$("#fwDoPresets").checked;
+    $("#fwPresetsSelect").disabled = !$("#fwDoPresets").checked;
     $("#fwCfg").disabled = !$("#fwDoCfg").checked;
     $("#btnFwUploadCfg").disabled = !$("#fwDoCfg").checked;
 
@@ -513,13 +548,7 @@ function updateNodeCfgUi(){
 
   $("#fwDoPresets").addEventListener("change", ()=>{
     const on = $("#fwDoPresets").checked;
-    $("#fwPresets").disabled = !on;
-    $("#btnFwUploadPresets").disabled = !on;
-    if(!on){
-      state.fwUploads.presetsId = null;
-      $("#fwPresetsInfo").textContent = "";
-      $("#fwPresets").value = "";
-    }
+    $("#fwPresetsSelect").disabled = !on;
   });
 
   $("#fwDoCfg").addEventListener("change", ()=>{
@@ -536,11 +565,6 @@ function updateNodeCfgUi(){
   $("#btnFwUpload").addEventListener("click", async ()=>{
     const id = await fwUpload("firmware", $("#fwBin"), $("#fwBinInfo"));
     if(id) state.fwUploads.fwId = id;
-  });
-
-  $("#btnFwUploadPresets").addEventListener("click", async ()=>{
-    const id = await fwUpload("presets", $("#fwPresets"), $("#fwPresetsInfo"));
-    if(id) state.fwUploads.presetsId = id;
   });
 
   $("#btnFwUploadCfg").addEventListener("click", async ()=>{
@@ -594,11 +618,12 @@ function updateNodeCfgUi(){
     }
 
     if(doPresets){
-      if(!state.fwUploads.presetsId){
-        alert("Presets enabled but presets.json is not uploaded yet.");
+      const presetsName = ($("#fwPresetsSelect").value || "").trim();
+      if(!presetsName){
+        alert("Presets enabled but no presets.json is available.");
         return;
       }
-      body.presetsId = state.fwUploads.presetsId;
+      body.presetsName = presetsName;
     }
     if(doCfg){
       if(!state.fwUploads.cfgId){
@@ -665,9 +690,40 @@ function updateNodeCfgUi(){
     if(r.busy) return;
   });
 
+  const dlgPresets = $("#dlgPresets");
+  $("#btnWledPresets").addEventListener("click", async ()=>{
+    $("#presetsHint").textContent = "";
+    $("#presetsUploadInfo").textContent = "";
+    const selected = await loadPresetsList($("#presetsSelect"));
+    const currentLabel = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
+    $("#presetsCurrentInfo").textContent = currentLabel;
+    dlgPresets.showModal();
+  });
+
+  $("#btnPresetsSave").addEventListener("click", async ()=>{
+    const selected = ($("#presetsSelect").value || "").trim();
+    if(!selected){
+      $("#presetsHint").textContent = "No presets.json available to select.";
+      return;
+    }
+    if(selected === state.presets.current){
+      dlgPresets.close();
+      return;
+    }
+    const r = await apiPost("/gatecontrol/api/presets/select", {name: selected});
+    if(!r.ok){
+      $("#presetsHint").textContent = r.error || "Failed to apply presets.";
+      return;
+    }
+    state.presets.current = r.current || selected;
+    $("#presetsCurrentInfo").textContent = `Current: ${state.presets.current}`;
+    $("#presetsHint").textContent = `Applied ${state.presets.current}`;
+    dlgPresets.close();
+  });
+
   $("#btnPresetsUpload").addEventListener("click", async ()=>{
-    const fileEl = $("#presetsFile");
-    const infoEl = $("#presetsInfo");
+    const fileEl = $("#presetsUploadFile");
+    const infoEl = $("#presetsUploadInfo");
     if(!fileEl || !infoEl) return;
     const file = fileEl.files && fileEl.files[0];
     if(!file){
@@ -678,8 +734,12 @@ function updateNodeCfgUi(){
     formData.append("file", file, file.name);
     const r = await apiUpload("/gatecontrol/api/presets/upload", formData);
     if(r.ok){
-      const count = (r.presets && r.presets.length) ? r.presets.length : 0;
-      infoEl.textContent = `Uploaded ${r.file?.name || file.name} (${count} presets)`;
+      infoEl.textContent = `Uploaded ${r.file?.name || file.name}`;
+      if(r.files){
+        state.presets.files = r.files;
+        const selected = populatePresetsSelect($("#presetsSelect"), r.files, r.file?.name || "");
+        $("#presetsCurrentInfo").textContent = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
+      }
     } else {
       infoEl.textContent = r.error || "Upload failed.";
     }

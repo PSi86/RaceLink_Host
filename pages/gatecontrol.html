@@ -14,6 +14,7 @@
       <button id="btnStatusSel">Get Status (Selection)</button>
       <button id="btnStatusAll">Get Status (All)</button>
       <button id="btnFwUpdate">Firmware Update</button>
+      <button id="btnWledPresets">WLED Presets</button>
       <button id="btnForce">Set all Groups</button>
       <button id="btnSave">Save</button>
       <button id="btnReload">Reload</button>
@@ -61,13 +62,6 @@
 <div class="gc-toolbar">
   <label>Config Anzeige:</label>
   <div id="configDisplayOptions" class="gc-config-options"></div>
-</div>
-
-<div class="gc-toolbar">
-  <label>Presets.json:</label>
-  <input id="presetsFile" type="file" accept=".json,application/json" />
-  <button id="btnPresetsUpload">Upload</button>
-  <span id="presetsInfo" class="muted"></span>
 </div>
 
 
@@ -177,9 +171,8 @@
 
       <div class="row">
         <label><input id="fwDoPresets" type="checkbox" /> Upload presets.json</label>
-        <input id="fwPresets" type="file" accept=".json,application/json" disabled />
-        <button id="btnFwUploadPresets" type="button" disabled>Upload</button>
-        <span id="fwPresetsInfo" class="muted"></span>
+        <select id="fwPresetsSelect" disabled></select>
+        <span id="fwPresetsHint" class="muted"></span>
       </div>
 
       <div class="row">
@@ -195,6 +188,33 @@
       </div>
 
       <p id="fwHint" class="muted"></p>
+    </form>
+  </dialog>
+
+  <dialog id="dlgPresets">
+    <form method="dialog" class="gc-form">
+      <h3>WLED Presets</h3>
+      <p class="muted">Upload and select the presets.json file used for RotorHazard UI synchronization.</p>
+
+      <div class="row">
+        <label>Upload presets.json:</label>
+        <input id="presetsUploadFile" type="file" accept=".json,application/json" />
+        <button id="btnPresetsUpload" type="button">Upload</button>
+        <span id="presetsUploadInfo" class="muted"></span>
+      </div>
+
+      <div class="row">
+        <label>Available presets:</label>
+        <select id="presetsSelect"></select>
+        <span id="presetsCurrentInfo" class="muted"></span>
+      </div>
+
+      <div class="gc-dialog-actions">
+        <button id="btnPresetsSave" type="button">Save</button>
+        <button value="cancel">Close</button>
+      </div>
+
+      <p id="presetsHint" class="muted"></p>
     </form>
   </dialog>
 

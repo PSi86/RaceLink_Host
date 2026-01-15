@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 import time
 import threading
+from datetime import datetime
 
 import os
 import re
@@ -879,6 +880,69 @@ def register_gc_blueprint(
 
     _upload_lock = _DefaultLock()
     _uploads = {}  # id -> {id, kind, path, name, size, sha256, uploaded_ts}
+    _presets_option_key = "esp_gc_wled_presets_file"
+
+    def _presets_dir() -> str:
+        d = os.path.join(os.path.expanduser("~"), ".gatecontrol_lora", "presets")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _preset_filename(ts: Optional[float] = None) -> str:
+        dt = datetime.fromtimestamp(ts or time.time())
+        return dt.strftime("presets_%Y%m%d_%H%M%S.json")
+
+    def _preset_path_for_name(name: str) -> Optional[str]:
+        base = os.path.basename(name or "")
+        if not base:
+            return None
+        path = os.path.join(_presets_dir(), base)
+        if not os.path.isfile(path):
+            return None
+        return path
+
+    def _preset_file_info(path: str, name: Optional[str] = None) -> dict:
+        if not name:
+            name = os.path.basename(path)
+        st = os.stat(path)
+        return {
+            "name": name,
+            "size": int(st.st_size),
+            "sha256": _sha256_file(path),
+            "saved_ts": float(st.st_mtime),
+            "path": path,
+        }
+
+    def _list_preset_files() -> List[dict]:
+        rows: List[dict] = []
+        try:
+            for name in os.listdir(_presets_dir()):
+                if name.startswith(".") or not name.endswith(".json"):
+                    continue
+                path = os.path.join(_presets_dir(), name)
+                if not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                rows.append({
+                    "name": name,
+                    "size": int(st.st_size),
+                    "saved_ts": float(st.st_mtime),
+                })
+        except Exception:
+            return []
+        rows.sort(key=lambda r: r.get("saved_ts", 0), reverse=True)
+        return rows
+
+    def _get_current_preset_name() -> str:
+        try:
+            return str(rhapi.db.option(_presets_option_key, "") or "")
+        except Exception:
+            return ""
+
+    def _set_current_preset_name(name: str) -> None:
+        try:
+            rhapi.db.option_set(_presets_option_key, name or "")
+        except Exception:
+            pass
 
     def _uploads_dir() -> str:
         d = os.path.join(tempfile.gettempdir(), "gatecontrol_lora_uploads")
@@ -936,6 +1000,46 @@ def register_gc_blueprint(
 
         out.sort(key=lambda t: t[0])
         return out
+
+    def _apply_presets_options(parsed: List[Tuple[int, str]]) -> None:
+        if not parsed:
+            gc_instance.uiEffectList = [UIFieldSelectOption("0", "No presets.json found")]
+        else:
+            gc_instance.uiEffectList = [UIFieldSelectOption(str(pid), name) for pid, name in parsed]
+        try:
+            gc_instance.register_quickset_ui()
+            gc_instance.registerActions()
+            gc_instance._rhapi.ui.broadcast_ui("run")
+        except Exception:
+            pass
+
+    def _apply_presets_from_path(path: str) -> bool:
+        try:
+            with open(path, "rb") as fh:
+                payload = fh.read()
+            parsed = _parse_wled_presets_minimal(payload or b"{}")
+            _apply_presets_options(parsed)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_presets_loaded() -> None:
+        files = _list_preset_files()
+        if not files:
+            _apply_presets_options([])
+            _set_current_preset_name("")
+            return
+        current = _get_current_preset_name()
+        if current:
+            current_path = _preset_path_for_name(current)
+            if current_path and _apply_presets_from_path(current_path):
+                return
+        current = files[0]["name"]
+        path = _preset_path_for_name(current)
+        if path and _apply_presets_from_path(path):
+            _set_current_preset_name(current)
+            return
+        _apply_presets_options([])
 
     def _store_upload(file_storage, kind: str) -> dict:
         # kind: firmware | presets | cfg
@@ -1373,24 +1477,55 @@ def register_gc_blueprint(
 
         f = request.files.get("file", None)
         try:
-            info = _store_upload(f, "presets")
-            with open(info["path"], "rb") as fh:
-                payload = fh.read()
-            parsed = _parse_wled_presets_minimal(payload or b"{}")
-            gc_instance.uiEffectList = [UIFieldSelectOption(str(pid), name) for pid, name in parsed]
-            try:
-                gc_instance.register_quickset_ui()
-                gc_instance.registerActions()
-                gc_instance._rhapi.ui.broadcast_ui("run")
-            except Exception:
-                pass
+            if not f or not getattr(f, "filename", ""):
+                raise ValueError("missing file")
+            ts = time.time()
+            name = _preset_filename(ts)
+            dst = os.path.join(_presets_dir(), name)
+            if os.path.exists(dst):
+                for i in range(1, 100):
+                    alt = name.replace(".json", f"_{i}.json")
+                    dst = os.path.join(_presets_dir(), alt)
+                    if not os.path.exists(dst):
+                        name = alt
+                        break
+            f.save(dst)
+            info = {
+                "name": name,
+                "size": int(os.path.getsize(dst)),
+                "saved_ts": ts,
+            }
             return jsonify({
                 "ok": True,
-                "file": {k: info[k] for k in ("id", "kind", "name", "size", "sha256", "uploaded_ts")},
-                "presets": [{"id": pid, "name": name} for pid, name in parsed],
+                "file": info,
+                "files": _list_preset_files(),
             })
         except Exception as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
+
+    @bp.route("/gatecontrol/api/presets/list", methods=["GET"])
+    def api_presets_list():
+        files = _list_preset_files()
+        current = _get_current_preset_name()
+        if current and not _preset_path_for_name(current):
+            current = ""
+        if not current and files:
+            current = files[0]["name"]
+        return jsonify({"ok": True, "files": files, "current": current})
+
+    @bp.route("/gatecontrol/api/presets/select", methods=["POST"])
+    def api_presets_select():
+        if _task_is_running():
+            return _task_busy_response()
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        path = _preset_path_for_name(name)
+        if not path:
+            return jsonify({"ok": False, "error": "presets file not found"}), 404
+        if not _apply_presets_from_path(path):
+            return jsonify({"ok": False, "error": "failed to parse presets.json"}), 400
+        _set_current_preset_name(name)
+        return jsonify({"ok": True, "current": name})
 
     @bp.route("/gatecontrol/api/fw/uploads", methods=["GET"])
     def api_fw_uploads():
@@ -1436,10 +1571,11 @@ def register_gc_blueprint(
         presets_info = None
         cfg_info = None
         if do_presets:
-            presets_id = str(body.get("presetsId") or "").strip()
-            presets_info = _get_upload(presets_id, expect_kind="presets") if presets_id else None
-            if not presets_info:
-                return jsonify({"ok": False, "error": "presets file not uploaded (presetsId)"}), 400
+            presets_name = str(body.get("presetsName") or "").strip()
+            presets_path = _preset_path_for_name(presets_name) if presets_name else None
+            if not presets_path:
+                return jsonify({"ok": False, "error": "presets file not found"}), 400
+            presets_info = _preset_file_info(presets_path, name=presets_name)
         if do_cfg:
             cfg_id = str(body.get("cfgId") or "").strip()
             cfg_info = _get_upload(cfg_id, expect_kind="cfg") if cfg_id else None
@@ -1474,7 +1610,7 @@ def register_gc_blueprint(
                 "ok": True,
                 "baseUrl": base_url,
                 "fw": ({k: fw_info[k] for k in ("id", "name", "size", "sha256")} if fw_info else None),
-                "presets": ({k: presets_info[k] for k in ("id", "name", "size", "sha256")} if presets_info else None),
+                "presets": ({k: presets_info[k] for k in ("name", "size", "sha256")} if presets_info else None),
                 "cfg": ({k: cfg_info[k] for k in ("id", "name", "size", "sha256")} if cfg_info else None),
                 "devices": [],
                 "errors": [],
@@ -1875,5 +2011,6 @@ def register_gc_blueprint(
 
 
 # Finally register blueprint
+    _ensure_presets_loaded()
     rhapi.ui.blueprint_add(bp)
     _log("GateControl UI blueprint registered at /gatecontrol")

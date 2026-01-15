@@ -95,13 +95,14 @@ class GateControlUIMixin:
         return temp_ui_grouplist
 
     def register_quickset_ui(self):
+        default_effect = self.uiEffectList[0].value if self.uiEffectList else "01"
         self._rhapi.ui.register_panel("esp_gc_quickset", "GateControl Quickset", "run")
         self._rhapi.fields.register_option(
             UIField("gc_quickset_group", "Gate Group", UIFieldType.SELECT, options=self.uiGroupList, value=self.uiGroupList[0].value),
             "esp_gc_quickset",
         )
         self._rhapi.fields.register_option(
-            UIField("gc_quickset_effect", "Color", UIFieldType.SELECT, options=self.uiEffectList, value="01"),
+            UIField("gc_quickset_effect", "Color", UIFieldType.SELECT, options=self.uiEffectList, value=default_effect),
             "esp_gc_quickset",
         )
         self._rhapi.fields.register_option(
@@ -125,6 +126,7 @@ class GateControlUIMixin:
                 logger.debug("Saved Actions Register Function in GateControl Instance")
 
         if not args and self.action_reg_fn:
+            default_effect = self.uiEffectList[0].value if self.uiEffectList else "01"
             for effect in [
                 ActionEffect(
                     "GateControl Action",
@@ -137,7 +139,7 @@ class GateControlUIMixin:
                             options=self.uiGroupList,
                             value=self.uiGroupList[0].value,
                         ),
-                        UIField("gc_action_effect", "Color", UIFieldType.SELECT, options=self.uiEffectList, value="01"),
+                        UIField("gc_action_effect", "Color", UIFieldType.SELECT, options=self.uiEffectList, value=default_effect),
                         UIField("gc_action_brightness", "Brightness", UIFieldType.BASIC_INT, value=70),
                     ],
                     name="gcaction",
