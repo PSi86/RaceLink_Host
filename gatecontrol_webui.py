@@ -1254,12 +1254,18 @@ def register_gc_blueprint(
         except Exception:
             return {}
 
-    def _http_post_multipart_file(url: str, field_name: str, file_path: str, timeout_s: float = 90.0) -> int:
+    def _http_post_multipart_file(
+        url: str,
+        field_name: str,
+        file_path: str,
+        timeout_s: float = 90.0,
+        filename_override: Optional[str] = None,
+    ) -> int:
         import urllib.request
         import urllib.error
 
         boundary = "----gc" + uuid.uuid4().hex
-        filename = os.path.basename(file_path)
+        filename = filename_override or os.path.basename(file_path)
         with open(file_path, "rb") as f:
             content = f.read()
 
@@ -1328,9 +1334,15 @@ def register_gc_blueprint(
                 raise RuntimeError("HTTP 401 from /update (Unauthorized). Likely WLED OTA lock is enabled. Disable OTA lock in WLED: Settings → Security & Updates → OTA locked (enter passphrase, Save, Reboot).")
             raise RuntimeError(f"HTTP {status} from /update")
 
-    def _wled_upload_file(base_url: str, file_path: str, timeout_s: float = 45.0) -> None:
+    def _wled_upload_file(base_url: str, file_path: str, timeout_s: float = 45.0, dest_name: Optional[str] = None) -> None:
         # WLED exposes filesystem upload endpoint: POST /upload with multipart field name "data"
-        status = _http_post_multipart_file(f"{base_url}/upload", "data", file_path, timeout_s=timeout_s)
+        status = _http_post_multipart_file(
+            f"{base_url}/upload",
+            "data",
+            file_path,
+            timeout_s=timeout_s,
+            filename_override=dest_name,
+        )
         if status >= 400:
             if status == 401:
                 raise RuntimeError("HTTP 401 from /upload (Unauthorized). Likely WLED OTA lock is enabled. Disable OTA lock in WLED: Settings → Security & Updates → OTA locked (enter passphrase, Save, Reboot).")
@@ -1612,7 +1624,7 @@ def register_gc_blueprint(
                                 "retries": retries,
                                 "message": "Uploading presets.json",
                             })
-                            _wled_upload_file(base_url, presets_info["path"], timeout_s=45.0)
+                            _wled_upload_file(base_url, presets_info["path"], timeout_s=45.0, dest_name="presets.json")
                         if cfg_info:
                             _task_update(meta={
                                 "stage": "UPLOAD_CFG",
@@ -1623,7 +1635,7 @@ def register_gc_blueprint(
                                 "retries": retries,
                                 "message": "Uploading cfg.json",
                             })
-                            _wled_upload_file(base_url, cfg_info["path"], timeout_s=45.0)
+                            _wled_upload_file(base_url, cfg_info["path"], timeout_s=45.0, dest_name="cfg.json")
                     except Exception as ex:
                         dev_res["error"] = f"Config upload failed: {ex}"
                         results["errors"].append(dev_res["error"])
