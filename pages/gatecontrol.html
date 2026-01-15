@@ -204,6 +204,37 @@
       </div>
 
       <div class="row">
+        <label>WLED base URL:</label>
+        <input id="presetsBaseUrl" value="http://4.3.2.1" style="width: 240px;" />
+        <span class="muted">Default AP-IP: 4.3.2.1</span>
+      </div>
+
+      <div class="row">
+        <label>Host WiFi (nmcli profile):</label>
+        <input id="presetsWifiConnName" value="gatecontrol-wled-ap" style="width: 190px;" />
+        <select id="presetsWifiIface" style="width: 140px;"></select>
+        <input id="presetsWifiSsid" value="WLED-AP" style="width: 160px;" />
+      </div>
+
+      <div class="row">
+        <label></label>
+        <label class="inline"><input id="presetsHostWifiEnable" type="checkbox" checked /> Enable host WiFi during download</label>
+        <label class="inline"><input id="presetsHostWifiRestore" type="checkbox" checked /> Restore previous host WiFi state after download</label>
+      </div>
+
+      <div class="row">
+        <label>WiFi timeout (s):</label>
+        <input id="presetsWifiTimeoutS" type="number" min="5" max="120" value="35" style="width: 90px;" />
+        <span class="muted">How long the host scans/connects to the node AP</span>
+      </div>
+
+      <div class="row">
+        <label>Download presets.json:</label>
+        <button id="btnPresetsDownload" type="button">Download from device</button>
+        <span id="presetsDownloadHint" class="muted">Select exactly one device</span>
+      </div>
+
+      <div class="row">
         <label>Available presets:</label>
         <select id="presetsSelect"></select>
         <span id="presetsCurrentInfo" class="muted"></span>

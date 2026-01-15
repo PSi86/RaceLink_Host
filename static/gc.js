@@ -105,6 +105,7 @@
     // allow closing modal even when busy
     $("#btnDiscoverStart").disabled = disable;
     updateNodeCfgUi();
+    updatePresetsDownloadUi();
   }
 
 
@@ -114,6 +115,17 @@ function updateNodeCfgUi(){
   const n = state.selected.size;
   btn.disabled = state.busy || (n !== 1);
   const hint = $("#nodeCfgHint");
+  if(hint){
+    hint.textContent = (n === 1) ? "" : "Select exactly one device";
+  }
+}
+
+function updatePresetsDownloadUi(){
+  const btn = $("#btnPresetsDownload");
+  if(!btn) return;
+  const n = state.selected.size;
+  btn.disabled = state.busy || (n !== 1);
+  const hint = $("#presetsDownloadHint");
   if(hint){
     hint.textContent = (n === 1) ? "" : "Select exactly one device";
   }
@@ -281,6 +293,7 @@ function updateNodeCfgUi(){
         const mac = cb.getAttribute("data-mac");
         if(cb.checked) state.selected.add(mac); else state.selected.delete(mac);
         updateNodeCfgUi();
+        updatePresetsDownloadUi();
       });
     });
 
@@ -294,6 +307,7 @@ function updateNodeCfgUi(){
     }
 
     updateNodeCfgUi();
+    updatePresetsDownloadUi();
 }
 
   // Sorting
@@ -329,6 +343,7 @@ function updateNodeCfgUi(){
     if(m.last_error) parts.push(`err: ${m.last_error}`);
     detail.textContent = parts.join(" · ");
     updateNodeCfgUi();
+    updatePresetsDownloadUi();
 
   }
 
@@ -355,6 +370,20 @@ function updateNodeCfgUi(){
         if(meta.stage) mparts.push(String(meta.stage));
         if(meta.attempt && meta.retries) mparts.push(`try ${meta.attempt}/${meta.retries}`);
         if(meta.message) mparts.push(String(meta.message));
+      }
+
+      if(name==="presets_download"){
+        if(meta.step !== undefined && meta.steps !== undefined) mparts.push(`Step ${meta.step} of ${meta.steps}`);
+        if(meta.message) mparts.push(String(meta.message));
+        const hintEl = $("#presetsHint");
+        if(hintEl){
+          const msg = [];
+          if(meta.step !== undefined && meta.steps !== undefined){
+            msg.push(`Step ${meta.step} of ${meta.steps}`);
+          }
+          if(meta.message) msg.push(String(meta.message));
+          hintEl.textContent = msg.join(": ");
+        }
       }
 
       const p = [
@@ -394,6 +423,29 @@ function updateNodeCfgUi(){
         hintEl.textContent = `Done. ${total ? `devices ${total}, ` : ""}errors ${errs}`;
       } else if(st==="error"){
         hintEl.textContent = `Error: ${t.last_error || "unknown"}`;
+      }
+    }
+  }
+
+  if(name==="presets_download"){
+    const hintEl = $("#presetsHint");
+    if(hintEl){
+      if(st==="done"){
+        const fname = t.result?.file?.name || "";
+        hintEl.textContent = fname ? `Downloaded ${fname}` : "Preset download completed.";
+        (async ()=>{
+          try{
+            await loadPresetsList($("#presetsSelect"));
+            const currentLabel = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
+            $("#presetsCurrentInfo").textContent = currentLabel;
+          }catch(e){
+            console.error("Failed to refresh presets list", e);
+          }
+        })();
+      } else if(st==="error"){
+        hintEl.textContent = `Error: ${t.last_error || "unknown"}`;
+      } else if(st==="running"){
+        // running updates handled above
       }
     }
   }
@@ -438,8 +490,8 @@ function updateNodeCfgUi(){
     $("#fwCfg").value = "";
   }
 
-  async function loadWifiIfaces(){
-    const sel = $("#fwWifiIface");
+  async function loadWifiIfaces(selectEl){
+    const sel = selectEl;
     if(!sel) return;
     sel.innerHTML = "";
     let data = null;
@@ -517,7 +569,7 @@ function updateNodeCfgUi(){
     try{
     fwDialogCounts();
     fwResetUploadsUi();
-    loadWifiIfaces();
+    loadWifiIfaces($("#fwWifiIface"));
     await loadPresetsList($("#fwPresetsSelect"));
     $("#fwPresetsHint").textContent = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
 
@@ -694,6 +746,8 @@ function updateNodeCfgUi(){
   $("#btnWledPresets").addEventListener("click", async ()=>{
     $("#presetsHint").textContent = "";
     $("#presetsUploadInfo").textContent = "";
+    $("#presetsDownloadHint").textContent = state.selected.size === 1 ? "" : "Select exactly one device";
+    loadWifiIfaces($("#presetsWifiIface"));
     const selected = await loadPresetsList($("#presetsSelect"));
     const currentLabel = state.presets.current ? `Current: ${state.presets.current}` : "Current: none";
     $("#presetsCurrentInfo").textContent = currentLabel;
@@ -742,6 +796,38 @@ function updateNodeCfgUi(){
       }
     } else {
       infoEl.textContent = r.error || "Upload failed.";
+    }
+  });
+
+  $("#btnPresetsDownload").addEventListener("click", async ()=>{
+    const macs = Array.from(state.selected);
+    if(macs.length !== 1){
+      alert("Select exactly one device to download presets.");
+      return;
+    }
+    const baseUrl = ($("#presetsBaseUrl").value || "").trim() || "http://4.3.2.1";
+    const wifiSsid = ($("#presetsWifiSsid")?.value || "WLED-AP").trim();
+    const wifiIface = ($("#presetsWifiIface")?.value || "wlan0").trim();
+    const wifiConnName = ($("#presetsWifiConnName")?.value || "gatecontrol-wled-ap").trim();
+    const wifiTimeoutS = Number($("#presetsWifiTimeoutS")?.value || 35) || 35;
+    const hostWifiEnable = !!($("#presetsHostWifiEnable")?.checked);
+    const hostWifiRestore = !!($("#presetsHostWifiRestore")?.checked);
+
+    $("#presetsHint").textContent = "Starting presets download…";
+    const r = await apiPost("/gatecontrol/api/presets/download", {
+      mac: macs[0],
+      baseUrl,
+      hostWifiEnable,
+      hostWifiRestore,
+      wifi: { connName: wifiConnName, ssid: wifiSsid, iface: wifiIface, timeoutS: wifiTimeoutS }
+    });
+    if(r.busy){
+      alert(`Busy: ${r.task?.name || "task"} is running`);
+      return;
+    }
+    if(!r.ok){
+      $("#presetsHint").textContent = r.error || "Failed to start presets download.";
+      return;
     }
   });
 
@@ -845,6 +931,7 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
       if(c) state.selected.add(cb.getAttribute("data-mac"));
     });
     updateNodeCfgUi();
+    updatePresetsDownloadUi();
   });
 
   // New group

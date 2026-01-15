@@ -316,31 +316,27 @@ class GateControl_LoRa(GateControlUIMixin):
 
         if not is_broadcast:
             targetDevice.ack_clear()
-        send_t0 = time.time()
 
-        try:
-            self.lora.drain_events(0.0)
-        except Exception:
-            pass
-
-        self._wait_rx_window(lambda: self.lora.send_set_group(recv3, group_id), collect_pred=None, fail_safe_s=8.0)
+        def _send():
+            self.lora.send_set_group(recv3, group_id)
 
         if not wait_for_ack or is_broadcast:
+            _send()
             return True
 
-        ok = (
-            targetDevice.ack_ok()
-            and targetDevice.last_ack.get("opcode") == LP.OPC_SET_GROUP
-            and targetDevice.last_ack.get("ts", 0) > send_t0
-        )
+        events, _ = self._send_and_wait_for_reply(recv3, LP.OPC_SET_GROUP, _send, timeout_s=8.0)
+        if not events:
+            logger.warning("No ACK_OK for SET_GROUP to %s (timeout)", targetDevice.addr)
+            return False
 
+        ev = events[-1]
+        ok = int(ev.get("ack_status", 1)) == 0
         if not ok:
             logger.warning(
-                "No ACK_OK for SET_GROUP to %s (status=%s, opcode=%s, ts_ok=%s)",
+                "No ACK_OK for SET_GROUP to %s (status=%s, opcode=%s)",
                 targetDevice.addr,
-                targetDevice.last_ack.get("status"),
-                targetDevice.last_ack.get("opcode"),
-                targetDevice.last_ack.get("ts", 0) > send_t0,
+                ev.get("ack_status"),
+                ev.get("ack_of"),
             )
         return ok
 
@@ -407,24 +403,111 @@ class GateControl_LoRa(GateControlUIMixin):
             brightness=b,
         )
 
-    def sendConfig(self, option, data0=0, data1=0, data2=0, data3=0, recv3=b"\xFF\xFF\xFF"):
+    def _send_and_wait_for_reply(
+        self,
+        recv3: bytes,
+        opcode7: int,
+        send_fn,
+        timeout_s: float = 8.0,
+    ) -> tuple[list[dict], bool]:
+        """Send a packet and block until a matching reply/ACK arrives or RX window closes."""
+        if not getattr(self, "lora", None):
+            return [], False
+
+        self._install_transport_hooks()
+
+        opcode7 = int(opcode7) & 0x7F
+        recv3_b = bytes(recv3 or b"")
+        sender_filter = recv3_b if recv3_b and recv3_b != b"\xFF\xFF\xFF" else None
+
+        try:
+            rule = LPA.find_rule(opcode7)
+        except Exception:
+            rule = None
+
+        policy = int(getattr(rule, "policy", getattr(LPA, "RESP_NONE", 0))) if rule else int(getattr(LPA, "RESP_NONE", 0))
+        if policy == int(getattr(LPA, "RESP_NONE", 0)):
+            send_fn()
+            return [], False
+
+        rsp_opc = int(getattr(rule, "rsp_opcode7", -1)) & 0x7F if rule else -1
+
+        def _collect(ev: dict) -> bool:
+            try:
+                sender3 = ev.get("sender3")
+                if sender_filter is not None:
+                    if not isinstance(sender3, (bytes, bytearray)):
+                        return False
+                    if bytes(sender3) != sender_filter:
+                        return False
+
+                opc = int(ev.get("opc", -1))
+                if policy == int(getattr(LPA, "RESP_ACK", 1)):
+                    if opc == int(LP.OPC_ACK) and int(ev.get("ack_of", -1)) == opcode7:
+                        self._handle_ack_event(ev)
+                        dev = self.getDeviceFromAddress(sender_filter.hex().upper()) if sender_filter else None
+                        if dev:
+                            dev.mark_online()
+                        return True
+                elif policy == int(getattr(LPA, "RESP_SPECIFIC", 2)):
+                    if opc == rsp_opc:
+                        dev = self.getDeviceFromAddress(sender_filter.hex().upper()) if sender_filter else None
+                        if dev:
+                            dev.mark_online()
+                        return True
+            except Exception:
+                return False
+            return False
+
+        collected, got_closed = self._wait_rx_window(send_fn, collect_pred=_collect, fail_safe_s=timeout_s)
+        return collected, got_closed
+
+    def sendConfig(
+        self,
+        option,
+        data0=0,
+        data1=0,
+        data2=0,
+        data3=0,
+        recv3=b"\xFF\xFF\xFF",
+        wait_for_ack: bool = False,
+        timeout_s: float = 6.0,
+    ):
         if not getattr(self, "lora", None):
             logger.warning("sendConfig: communicator not ready")
-            return
+            return False if wait_for_ack else None
         recv3_hex = recv3.hex().upper() if isinstance(recv3, (bytes, bytearray)) else ""
+        dev = None
         if recv3_hex and recv3_hex != "FFFFFF":
             self._pending_config[recv3_hex] = {
                 "option": int(option) & 0xFF,
                 "data0": int(data0) & 0xFF,
             }
-        self.lora.send_config(
-            recv3=recv3,
-            option=int(option) & 0xFF,
-            data0=int(data0) & 0xFF,
-            data1=int(data1) & 0xFF,
-            data2=int(data2) & 0xFF,
-            data3=int(data3) & 0xFF,
-        )
+            dev = self.getDeviceFromAddress(recv3_hex)
+            if dev and wait_for_ack:
+                dev.ack_clear()
+
+        def _send():
+            self.lora.send_config(
+                recv3=recv3,
+                option=int(option) & 0xFF,
+                data0=int(data0) & 0xFF,
+                data1=int(data1) & 0xFF,
+                data2=int(data2) & 0xFF,
+                data3=int(data3) & 0xFF,
+            )
+
+        if wait_for_ack:
+            if not dev:
+                _send()
+                return False
+            events, _ = self._send_and_wait_for_reply(recv3, LP.OPC_CONFIG, _send, timeout_s=timeout_s)
+            if not events:
+                return False
+            ev = events[-1]
+            return bool(int(ev.get("ack_status", 1)) == 0)
+        _send()
+        return True
 
     def _apply_config_update(self, dev: GC_Device, option: int, data0: int) -> None:
         bit_map = {

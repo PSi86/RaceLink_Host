@@ -1339,6 +1339,14 @@ def register_gc_blueprint(
             raw = r.read()
         return json.loads(raw.decode("utf-8", errors="replace") or "{}")
 
+    def _http_get_bytes(url: str, timeout_s: float = 10.0) -> bytes:
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            return r.read()
+
     def _http_post_json(url: str, payload: dict, timeout_s: float = 6.0) -> dict:
         import urllib.request
         import urllib.error
@@ -1458,6 +1466,37 @@ def register_gc_blueprint(
         # JSON API supports immediate reboot via {"rb":true} on /json/state 
         _http_post_json(f"{base_url}/json/state", {"rb": True}, timeout_s=timeout_s)
 
+    def _wled_download_presets(base_url: str, timeout_s: float = 10.0) -> bytes:
+        payload = _http_get_bytes(f"{base_url}/presets.json", timeout_s=timeout_s)
+        if not payload:
+            raise RuntimeError("Empty presets.json response")
+        try:
+            json.loads(payload.decode("utf-8", errors="replace") or "{}")
+        except Exception as ex:
+            raise RuntimeError(f"Invalid presets.json payload: {ex}")
+        return payload
+
+    def _save_presets_payload(payload: bytes) -> dict:
+        ts = time.time()
+        name = _preset_filename(ts)
+        dst = os.path.join(_presets_dir(), name)
+        if os.path.exists(dst):
+            for i in range(1, 100):
+                alt = name.replace(".json", f"_{i}.json")
+                dst = os.path.join(_presets_dir(), alt)
+                if not os.path.exists(dst):
+                    name = alt
+                    break
+        with open(dst, "wb") as f:
+            f.write(payload)
+        os.utime(dst, (ts, ts))
+        return {
+            "name": name,
+            "size": int(os.path.getsize(dst)),
+            "saved_ts": ts,
+            "path": dst,
+        }
+
     @bp.route("/gatecontrol/api/fw/upload", methods=["POST"])
     def api_fw_upload():
         if _task_is_running():
@@ -1504,6 +1543,158 @@ def register_gc_blueprint(
             })
         except Exception as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
+
+    @bp.route("/gatecontrol/api/presets/download", methods=["POST"])
+    def api_presets_download():
+        _ensure_transport_hooked()
+        if _task_is_running():
+            return _task_busy_response()
+
+        body = request.get_json(silent=True) or {}
+        mac = str(body.get("mac") or "").strip()
+        if not mac:
+            return jsonify({"ok": False, "error": "missing mac"}), 400
+
+        base_url = _wled_base_url(body.get("baseUrl") or "")
+
+        wifi = body.get("wifi") or {}
+        wifi_ssid = str(wifi.get("ssid") or body.get("wifiSsid") or "WLED-AP")
+        wifi_iface = str(wifi.get("iface") or body.get("wifiIface") or "wlan0")
+        wifi_conn_name = str(wifi.get("connName") or body.get("wifiConnName") or "gatecontrol-wled-ap")
+        wifi_bssid = str(wifi.get("bssid") or body.get("wifiBssid") or "")
+        wifi_timeout_s = float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 35.0)
+
+        host_wifi_enable = bool(wifi.get("hostWifiEnable") if "hostWifiEnable" in wifi else body.get("hostWifiEnable", True))
+        host_wifi_restore = bool(wifi.get("hostWifiRestore") if "hostWifiRestore" in wifi else body.get("hostWifiRestore", True))
+
+        expected_mac = _expected_mac_hex(mac)
+        if not expected_mac:
+            return jsonify({"ok": False, "error": "invalid mac"}), 400
+
+        def do_presets_download():
+            results = {
+                "ok": True,
+                "baseUrl": base_url,
+                "addr": mac,
+                "file": None,
+                "errors": [],
+            }
+
+            host_wifi_initial = _host_wifi_radio_enabled()
+            host_wifi_changed = False
+            results["hostWifi"] = {"wasEnabled": host_wifi_initial, "enabled": host_wifi_initial, "restored": False}
+
+            steps = []
+            if host_wifi_enable and not host_wifi_initial:
+                steps.append("HOST_WIFI_ON")
+            steps += ["LORA_AP_ON", "CONNECT_WIFI", "WAIT_HTTP", "DOWNLOAD_PRESETS", "LORA_AP_OFF"]
+            if host_wifi_restore and (host_wifi_initial is False):
+                steps.append("HOST_WIFI_RESTORE")
+            total_steps = len(steps)
+            step_order = {stage: idx for idx, stage in enumerate(steps, start=1)}
+
+            def _step(stage: str, message: str) -> None:
+                step_num = step_order.get(stage)
+                if not step_num:
+                    return
+                _task_update(meta={
+                    "stage": stage,
+                    "step": step_num,
+                    "steps": total_steps,
+                    "addr": mac,
+                    "message": message,
+                })
+
+            try:
+                if host_wifi_enable and not host_wifi_initial:
+                    _step("HOST_WIFI_ON", "Enabling host WiFi radio…")
+                    _host_wifi_set_radio(True)
+                    host_wifi_changed = True
+                    _host_wifi_wait_iface_ready(wifi_iface, timeout_s=15.0)
+                    results["hostWifi"]["enabled"] = True
+
+                _step("LORA_AP_ON", "Enable WLED AP via LoRa (waiting for ACK)")
+                recv3 = _recv3_bytes_from_addr(mac)
+                ok_ap = gc_instance.sendConfig(0x04, data0=1, recv3=recv3, wait_for_ack=True, timeout_s=8.0)
+                if not ok_ap:
+                    raise RuntimeError(f"Timeout waiting for CONFIG ACK from {mac}")
+
+                _step("CONNECT_WIFI", f'Connecting host WiFi via profile "{wifi_conn_name}" (iface {wifi_iface}) to SSID "{wifi_ssid}"')
+                try:
+                    _wifi_connect_host_profile(
+                        wifi_conn_name,
+                        wifi_ssid,
+                        iface=wifi_iface,
+                        bssid=wifi_bssid,
+                        timeout_s=wifi_timeout_s
+                    )
+                except Exception as ex1:
+                    msg1 = str(ex1)
+                    if host_wifi_enable and (not host_wifi_changed) and ("Wi-Fi is disabled" in msg1 or "wireless is disabled" in msg1.lower()):
+                        _step("HOST_WIFI_ON", f"Host WiFi appears disabled; enabling on {wifi_iface}…")
+                        _host_wifi_set_radio(True)
+                        host_wifi_changed = True
+                        results["hostWifi"]["enabled"] = True
+                        _host_wifi_wait_iface_ready(wifi_iface, timeout_s=15.0)
+                        _wifi_connect_host_profile(
+                            wifi_conn_name,
+                            wifi_ssid,
+                            iface=wifi_iface,
+                            bssid=wifi_bssid,
+                            timeout_s=wifi_timeout_s
+                        )
+                    else:
+                        raise
+
+                _step("WAIT_HTTP", f"Waiting for WLED /json/info mac to match {expected_mac}")
+                info = _wait_for_expected_node(base_url, expected_mac, timeout_s=90.0, poll_s=1.0)
+                if not info:
+                    raise RuntimeError(f"Timeout waiting for node (baseUrl={base_url}) to report expected mac {expected_mac}")
+
+                _step("DOWNLOAD_PRESETS", "Downloading presets.json")
+                payload = _wled_download_presets(base_url, timeout_s=15.0)
+                saved = _save_presets_payload(payload)
+                results["file"] = {k: saved[k] for k in ("name", "size", "saved_ts")}
+
+                _step("LORA_AP_OFF", "Disable WLED AP via LoRa")
+                try:
+                    recv3 = _recv3_bytes_from_addr(mac)
+                    gc_instance.sendConfig(0x04, data0=0, recv3=recv3, wait_for_ack=True, timeout_s=6.0)
+                except Exception:
+                    pass
+
+                results["files"] = _list_preset_files()
+            except Exception as ex:
+                results["ok"] = False
+                results["errors"].append(str(ex))
+            finally:
+                if host_wifi_restore and (host_wifi_initial is False) and _host_wifi_radio_enabled():
+                    try:
+                        _step("HOST_WIFI_RESTORE", "Restoring host WiFi radio (off)…")
+                        try:
+                            _wifi_profile_down(wifi_conn_name, timeout_s=10.0)
+                        except Exception:
+                            pass
+                        _host_wifi_set_radio(False)
+                        results["hostWifi"]["enabled"] = False
+                        results["hostWifi"]["restored"] = True
+                    except Exception as ex2:
+                        results["errors"].append(f"Host WiFi restore failed: {ex2}")
+                        results["ok"] = False
+
+            return results
+
+        t = _start_task("presets_download", do_presets_download, meta={
+            "stage": "INIT",
+            "step": 0,
+            "steps": 1,
+            "addr": mac,
+            "message": "Preset download started",
+            "baseUrl": base_url,
+        })
+        if not t:
+            return _task_busy_response()
+        return jsonify({"ok": True, "task": t})
 
     @bp.route("/gatecontrol/api/presets/list", methods=["GET"])
     def api_presets_list():
