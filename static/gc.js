@@ -390,7 +390,7 @@ function updatePresetsDownloadUi(){
         `${name}…`,
         mparts.length ? `(${mparts.join(", ")})` : "",
         `replies ${t.rx_replies||0}`,
-        `windows ${t.rx_windows||0}`,
+        `windows ${t.rx_window_events||0}`,
         `Δ ${t.rx_count_delta_total||0}`,
       ].filter(Boolean).join(" ");
       el.textContent = p;

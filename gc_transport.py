@@ -93,6 +93,7 @@ class LoRaUSB:
         self._qmax = 1000
         self._listeners = []
         self._tx_listeners = []
+        self._rx_window_state = 0
 
     @staticmethod
     def _is_usb_port(portinfo):
@@ -366,6 +367,25 @@ class LoRaUSB:
             except Exception:
                 pass
 
+    def _update_rx_window_state(self, event_type:int) -> int:
+        """Track RX window state transitions (valid states: 0 or 1)."""
+        delta = 1 if event_type == EV_RX_WINDOW_OPEN else -1
+        new_state = int(self._rx_window_state) + delta
+        if new_state not in (0, 1):
+            logger.error(
+                "RX window state invalid after %s: %s -> %s",
+                "OPEN" if event_type == EV_RX_WINDOW_OPEN else "CLOSED",
+                self._rx_window_state,
+                new_state,
+            )
+            new_state = 1 if event_type == EV_RX_WINDOW_OPEN else 0
+        self._rx_window_state = new_state
+        return self._rx_window_state
+
+    @property
+    def rx_window_state(self) -> int:
+        return int(self._rx_window_state)
+
     def _handle_frame(self, type_byte:int, data:bytes):
         """Parse one framed message from device and emit events.
 
@@ -378,13 +398,15 @@ class LoRaUSB:
         # USB-only events
         if type_byte in (EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE):
             if type_byte == EV_RX_WINDOW_OPEN and len(data) >= 2:
-                ev = {"type": type_byte, "window_ms": _u16le(data[:2]), "ts": now}
+                rx_state = self._update_rx_window_state(type_byte)
+                ev = {"type": type_byte, "window_ms": _u16le(data[:2]), "ts": now, "rx_windows": rx_state}
             elif type_byte == EV_RX_WINDOW_CLOSED and len(data) >= 2:
-                ev = {"type": type_byte, "rx_count_delta": _u16le(data[:2]), "ts": now}
+                rx_state = self._update_rx_window_state(type_byte)
+                ev = {"type": type_byte, "rx_count_delta": _u16le(data[:2]), "ts": now, "rx_windows": rx_state}
             elif type_byte == EV_TX_DONE and len(data) >= 1:
-                ev = {"type": type_byte, "last_len": data[0], "ts": now}
+                ev = {"type": type_byte, "last_len": data[0], "ts": now, "rx_windows": self.rx_window_state}
             else:
-                ev = {"type": type_byte, "data": data, "ts": now}
+                ev = {"type": type_byte, "data": data, "ts": now, "rx_windows": self.rx_window_state}
             self._emit(ev)
             return
 
@@ -415,6 +437,7 @@ class LoRaUSB:
             "host_rssi": rssi,
             "host_snr": snr,
             "ts": now,
+            "rx_windows": self.rx_window_state,
         }
 
         # Compatibility parsing for common replies

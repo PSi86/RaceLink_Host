@@ -102,6 +102,7 @@ def register_gc_blueprint(
         "state": "IDLE",              # IDLE | TX | RX | ERROR
         "tx_pending": False,
         "rx_window_open": False,
+        "rx_windows": 0,
         "rx_window_ms": 0,
         "last_event": None,
         "last_event_ts": 0.0,
@@ -245,23 +246,29 @@ def register_gc_blueprint(
 
         # USB-only events
         if t == EV_RX_WINDOW_OPEN:
+            rx_state = int(ev.get("rx_windows", 1) or 0)
+            rx_open = rx_state == 1
             _set_master(
-                state="RX",
-                rx_window_open=True,
+                state="RX" if rx_open else ("TX" if _master.get("tx_pending") else "IDLE"),
+                rx_windows=rx_state,
+                rx_window_open=rx_open,
                 rx_window_ms=int(ev.get("window_ms", 0) or 0),
                 last_event="RX_WINDOW_OPEN",
                 last_error=None,
             )
             if _task_is_running():
-                _task_update(rx_windows=int((_task_snapshot() or {}).get("rx_windows", 0)) + 1)
+                snap = _task_snapshot() or {}
+                _task_update(rx_window_events=int(snap.get("rx_window_events", 0)) + 1)
             return
 
         if t == EV_RX_WINDOW_CLOSED:
             delta = int(ev.get("rx_count_delta", 0) or 0)
-            # If no TX pending, fall back to IDLE. (TX_DONE will override if needed.)
+            rx_state = int(ev.get("rx_windows", 0) or 0)
+            rx_open = rx_state == 1
             _set_master(
-                state="TX" if _master.get("tx_pending") else "IDLE",
-                rx_window_open=False,
+                state="RX" if rx_open else ("TX" if _master.get("tx_pending") else "IDLE"),
+                rx_windows=rx_state,
+                rx_window_open=rx_open,
                 rx_window_ms=0,
                 last_event="RX_WINDOW_CLOSED",
                 last_rx_count_delta=delta,
@@ -271,7 +278,7 @@ def register_gc_blueprint(
                 snap = _task_snapshot() or {}
                 _task_update(
                     rx_count_delta_total=int(snap.get("rx_count_delta_total", 0)) + delta,
-                    rx_windows=int(snap.get("rx_windows", 0)) + 1,
+                    rx_window_events=int(snap.get("rx_window_events", 0)) + 1,
                 )
             return
 
@@ -509,7 +516,7 @@ def register_gc_blueprint(
                 "ended_ts": None,
                 "meta": meta or {},
                 "rx_replies": 0,
-                "rx_windows": 0,
+                "rx_window_events": 0,
                 "rx_count_delta_total": 0,
                 "last_error": None,
                 "result": None,

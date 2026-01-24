@@ -29,6 +29,7 @@ try:
     from .gc_transport import (
         LP,
         EV_RX_WINDOW_CLOSED,
+        EV_RX_WINDOW_OPEN,
         LoRaUSB,
         _mac_last3_from_hex,
     )
@@ -36,6 +37,7 @@ except Exception:
     from gc_transport import (
         LP,
         EV_RX_WINDOW_CLOSED,
+        EV_RX_WINDOW_OPEN,
         LoRaUSB,
         _mac_last3_from_hex,
     )
@@ -477,7 +479,6 @@ class GateControl_LoRa(GateControlUIMixin):
                 opc = int(ev.get("opc", -1))
                 if policy == int(getattr(LPA, "RESP_ACK", 1)):
                     if opc == int(LP.OPC_ACK) and int(ev.get("ack_of", -1)) == opcode7:
-                        self._handle_ack_event(ev)
                         dev = self.getDeviceFromAddress(sender_filter.hex().upper()) if sender_filter else None
                         if dev:
                             dev.mark_online()
@@ -717,6 +718,85 @@ class GateControl_LoRa(GateControlUIMixin):
                     collected.append(ev)
         return collected, got_closed
 
+    def _opcode_name(self, opcode7: int) -> str:
+        try:
+            rule = LPA.find_rule(int(opcode7) & 0x7F)
+        except Exception:
+            rule = None
+        if rule and getattr(rule, "name", None):
+            return str(rule.name)
+        return f"0x{int(opcode7) & 0x7F:02X}"
+
+    def _log_lora_reply(self, ev: dict) -> None:
+        try:
+            opc = int(ev.get("opc", -1)) & 0x7F
+        except Exception:
+            return
+
+        sender3_hex = self._to_hex_str(ev.get("sender3")) or "??????"
+
+        if opc == int(LP.OPC_ACK):
+            ack_of = ev.get("ack_of")
+            ack_status = ev.get("ack_status")
+            ack_seq = ev.get("ack_seq")
+            if ack_of is None or ack_status is None:
+                return
+            ack_name = self._opcode_name(int(ack_of))
+            logger.debug(
+                "ACK from %s: ack_of=%s (%s) status=%s seq=%s",
+                sender3_hex,
+                int(ack_of),
+                ack_name,
+                int(ack_status),
+                ack_seq,
+            )
+            return
+
+        if opc == int(LP.OPC_STATUS) and ev.get("reply") == "STATUS_REPLY":
+            logger.debug(
+                "STATUS from %s: flags=0x%02X cfg=0x%02X preset=%s bri=%s vbat=%s rssi=%s snr=%s host_rssi=%s host_snr=%s",
+                sender3_hex,
+                int(ev.get("flags", 0) or 0) & 0xFF,
+                int(ev.get("configByte", 0) or 0) & 0xFF,
+                ev.get("presetId"),
+                ev.get("brightness"),
+                ev.get("vbat_mV"),
+                ev.get("node_rssi"),
+                ev.get("node_snr"),
+                ev.get("host_rssi"),
+                ev.get("host_snr"),
+            )
+            return
+
+        if opc == int(LP.OPC_DEVICES) and ev.get("reply") == "IDENTIFY_REPLY":
+            mac6 = ev.get("mac6")
+            mac12 = bytes(mac6).hex().upper() if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6 else None
+            logger.debug(
+                "IDENTIFY from %s: mac=%s group=%s ver=%s caps=%s host_rssi=%s host_snr=%s",
+                sender3_hex,
+                mac12 or sender3_hex,
+                ev.get("groupId"),
+                ev.get("version"),
+                ev.get("caps"),
+                ev.get("host_rssi"),
+                ev.get("host_snr"),
+            )
+            return
+
+        if ev.get("reply"):
+            logger.debug("RX %s from %s (opc=0x%02X)", ev.get("reply"), sender3_hex, opc)
+
+    def _log_rx_window_event(self, ev: dict) -> None:
+        t = ev.get("type")
+        if getattr(self, "lora", None):
+            state = int(ev.get("rx_windows", getattr(self.lora, "rx_window_state", 0)) or 0)
+        else:
+            state = int(ev.get("rx_windows", 0) or 0)
+        if t == EV_RX_WINDOW_OPEN:
+            logger.debug("RX window OPEN: state=%s min_ms=%s", state, ev.get("window_ms"))
+        elif t == EV_RX_WINDOW_CLOSED:
+            logger.debug("RX window CLOSED: state=%s delta=%s", state, ev.get("rx_count_delta"))
+
     def _handle_ack_event(self, ev: dict) -> None:
         try:
             sender3_hex = self._to_hex_str(ev.get("sender3"))
@@ -732,14 +812,6 @@ class GateControl_LoRa(GateControlUIMixin):
 
             if ack_of is None or ack_status is None:
                 return
-
-            logger.debug(
-                "ACK from %s: ack_of=%s status=%s seq=%s",
-                sender3_hex,
-                ev.get("ack_of"),
-                ev.get("ack_status"),
-                ev.get("ack_seq"),
-            )
 
             dev.ack_update(int(ack_of), int(ack_status), ack_seq, host_rssi, host_snr)
 
@@ -835,13 +907,17 @@ class GateControl_LoRa(GateControlUIMixin):
 
             t = ev.get("type")
 
-            if t == EV_RX_WINDOW_CLOSED:
-                self._pending_window_closed(ev)
+            if t in (EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED):
+                self._log_rx_window_event(ev)
+                if t == EV_RX_WINDOW_CLOSED:
+                    self._pending_window_closed(ev)
                 return
 
             opc = ev.get("opc")
             if opc is None:
                 return
+
+            self._log_lora_reply(ev)
 
             if int(opc) == int(LP.OPC_ACK):
                 self._handle_ack_event(ev)
