@@ -209,19 +209,37 @@ class GateControl_LoRa(GateControlUIMixin):
     def onSendMessage(self, args):
         logger.warning("Event onSendMessage")
 
+    def _ensure_lora_ready(self, caller: str, install_hooks: bool = True):
+        lora = getattr(self, "lora", None)
+        if not lora:
+            logger.warning("%s: communicator not ready", caller)
+            return None
+        if install_hooks:
+            self._install_transport_hooks()
+        return lora
+
+    def _drain_events_quietly(self) -> None:
+        lora = getattr(self, "lora", None)
+        if not lora:
+            return
+        try:
+            lora.drain_events(0.0)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _resolve_target(groupFilter=255, targetDevice: GC_Device | None = None) -> tuple[bytes, int, str | None]:
+        if targetDevice is None:
+            return b"\xFF\xFF\xFF", int(groupFilter) & 0xFF, None
+        recv3 = _mac_last3_from_hex(targetDevice.addr)
+        return recv3, int(targetDevice.groupId) & 0xFF, recv3.hex().upper()
+
     def getDevices(self, groupFilter=255, targetDevice=None, addToGroup=-1):
-        if not getattr(self, "lora", None):
-            logger.warning("getDevices: communicator not ready")
+        lora = self._ensure_lora_ready("getDevices")
+        if not lora:
             return 0
 
-        self._install_transport_hooks()
-
-        if targetDevice is None:
-            recv3 = b"\xFF\xFF\xFF"
-            groupId = int(groupFilter) & 0xFF
-        else:
-            recv3 = _mac_last3_from_hex(targetDevice.addr)
-            groupId = int(targetDevice.groupId) & 0xFF
+        recv3, groupId, _ = self._resolve_target(groupFilter, targetDevice)
 
         found = 0
 
@@ -237,13 +255,10 @@ class GateControl_LoRa(GateControlUIMixin):
 
         logger.debug("GET_DEVICES -> recv3=%s group=%d flags=%d", recv3.hex().upper(), groupId, 0)
 
-        try:
-            self.lora.drain_events(0.0)
-        except Exception:
-            pass
+        self._drain_events_quietly()
 
         self._wait_rx_window(
-            lambda: self.lora.send_get_devices(recv3=recv3, group_id=groupId, flags=0),
+            lambda: lora.send_get_devices(recv3=recv3, group_id=groupId, flags=0),
             collect_pred=_collect,
             fail_safe_s=8.0,
         )
@@ -261,20 +276,11 @@ class GateControl_LoRa(GateControlUIMixin):
         return found
 
     def getStatus(self, groupFilter=255, targetDevice=None):
-        if not getattr(self, "lora", None):
-            logger.warning("getStatus: communicator not ready")
+        lora = self._ensure_lora_ready("getStatus")
+        if not lora:
             return 0
 
-        self._install_transport_hooks()
-
-        if targetDevice is None:
-            recv3 = b"\xFF\xFF\xFF"
-            groupId = int(groupFilter) & 0xFF
-            sender_filter = None
-        else:
-            recv3 = _mac_last3_from_hex(targetDevice.addr)
-            groupId = int(targetDevice.groupId) & 0xFF
-            sender_filter = recv3.hex().upper()
+        recv3, groupId, sender_filter = self._resolve_target(groupFilter, targetDevice)
 
         updated = 0
         responders = set()
@@ -303,13 +309,10 @@ class GateControl_LoRa(GateControlUIMixin):
                 pass
             return False
 
-        try:
-            self.lora.drain_events(0.0)
-        except Exception:
-            pass
+        self._drain_events_quietly()
 
         collected, got_closed = self._wait_rx_window(
-            lambda: self.lora.send_get_status(recv3=recv3, group_id=groupId, flags=0),
+            lambda: lora.send_get_status(recv3=recv3, group_id=groupId, flags=0),
             collect_pred=_collect,
             fail_safe_s=8.0,
         )
@@ -339,11 +342,9 @@ class GateControl_LoRa(GateControlUIMixin):
         return updated
 
     def setGateGroupId(self, targetDevice: GC_Device, forceSet: bool = False, wait_for_ack: bool = True) -> bool:
-        if not getattr(self, "lora", None):
-            logger.warning("setGateGroupId: communicator not ready")
+        lora = self._ensure_lora_ready("setGateGroupId")
+        if not lora:
             return False
-
-        self._install_transport_hooks()
 
         recv3 = _mac_last3_from_hex(targetDevice.addr)
         group_id = int(targetDevice.groupId) & 0xFF
@@ -353,7 +354,7 @@ class GateControl_LoRa(GateControlUIMixin):
             targetDevice.ack_clear()
 
         def _send():
-            self.lora.send_set_group(recv3, group_id)
+            lora.send_set_group(recv3, group_id)
 
         if not wait_for_ack or is_broadcast:
             _send()
@@ -387,8 +388,8 @@ class GateControl_LoRa(GateControlUIMixin):
 
     def sendGateControl(self, targetDevice, flags=None, presetId=None, brightness=None):
         """Send CONTROL to a single node (receiver = last3 of targetDevice.addr)."""
-        if not getattr(self, "lora", None):
-            logger.warning("sendGateControl: communicator not ready")
+        lora = self._ensure_lora_ready("sendGateControl", install_hooks=False)
+        if not lora:
             return
         recv3 = _mac_last3_from_hex(targetDevice.addr)
         groupId = int(targetDevice.groupId) & 0xFF
@@ -397,7 +398,7 @@ class GateControl_LoRa(GateControlUIMixin):
         p = int(targetDevice.presetId if presetId is None else presetId) & 0xFF
         b = int(targetDevice.brightness if brightness is None else brightness) & 0xFF
 
-        self.lora.send_control(recv3=recv3, group_id=groupId, flags=f, preset_id=p, brightness=b)
+        lora.send_control(recv3=recv3, group_id=groupId, flags=f, preset_id=p, brightness=b)
 
         targetDevice.flags = f
         targetDevice.presetId = p
@@ -412,8 +413,8 @@ class GateControl_LoRa(GateControlUIMixin):
 
     def sendGroupControl(self, gcGroupId, gcFlags, gcPresetId, gcBrightness):
         """Broadcast CONTROL to a group (receiver=FFFFFF); update local cache for group devices."""
-        if not getattr(self, "lora", None):
-            logger.warning("sendGroupControl: communicator not ready")
+        lora = self._ensure_lora_ready("sendGroupControl", install_hooks=False)
+        if not lora:
             return
 
         groupId = int(gcGroupId) & 0xFF
@@ -430,7 +431,7 @@ class GateControl_LoRa(GateControlUIMixin):
             except Exception:
                 continue
 
-        self.lora.send_control(
+        lora.send_control(
             recv3=b"\xFF\xFF\xFF",
             group_id=groupId,
             flags=f,
@@ -507,8 +508,8 @@ class GateControl_LoRa(GateControlUIMixin):
         wait_for_ack: bool = False,
         timeout_s: float = 6.0,
     ):
-        if not getattr(self, "lora", None):
-            logger.warning("sendConfig: communicator not ready")
+        lora = self._ensure_lora_ready("sendConfig")
+        if not lora:
             return False if wait_for_ack else None
         recv3_hex = recv3.hex().upper() if isinstance(recv3, (bytes, bytearray)) else ""
         dev = None
@@ -522,7 +523,7 @@ class GateControl_LoRa(GateControlUIMixin):
                 dev.ack_clear()
 
         def _send():
-            self.lora.send_config(
+            lora.send_config(
                 recv3=recv3,
                 option=int(option) & 0xFF,
                 data0=int(data0) & 0xFF,
@@ -559,10 +560,10 @@ class GateControl_LoRa(GateControlUIMixin):
             dev.configByte = int(dev.configByte) & (~mask & 0xFF)
 
     def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
-        if not getattr(self, "lora", None):
-            logger.warning("sendSync: communicator not ready")
+        lora = self._ensure_lora_ready("sendSync", install_hooks=False)
+        if not lora:
             return
-        self.lora.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
+        lora.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
 
     @staticmethod
     def _stream_ctrl(start: bool, stop: bool, packets_left: int) -> int:
@@ -579,11 +580,9 @@ class GateControl_LoRa(GateControlUIMixin):
         timeout_s: float = 8.0,
     ) -> dict[str, int]:
         """Send up to 128 bytes as STREAM packets (8B per packet) to a device or group broadcast."""
-        if not getattr(self, "lora", None):
-            logger.warning("sendStream: communicator not ready")
+        lora = self._ensure_lora_ready("sendStream")
+        if not lora:
             return {}
-
-        self._install_transport_hooks()
 
         data = bytes(payload or b"")
         if len(data) > 128:
@@ -625,15 +624,12 @@ class GateControl_LoRa(GateControlUIMixin):
         if recv3 == b"\xFF\xFF\xFF" and device is not None:
             return {"expected": expected, "acked": 0}
 
-        try:
-            self.lora.drain_events(0.0)
-        except Exception:
-            pass
+        self._drain_events_quietly()
 
         for ctrl, chunk, is_last in packets:
             if is_last:
                 break
-            self.lora.send_stream(recv3=recv3, ctrl=ctrl, data=chunk)
+            lora.send_stream(recv3=recv3, ctrl=ctrl, data=chunk)
             time.sleep(0.02)
 
         last_ctrl, last_chunk, _ = packets[-1]
@@ -658,7 +654,7 @@ class GateControl_LoRa(GateControlUIMixin):
 
         for attempt in range(max(0, int(retries)) + 1):
             self._wait_rx_window(
-                lambda: self.lora.send_stream(recv3=recv3, ctrl=last_ctrl, data=last_chunk),
+                lambda: lora.send_stream(recv3=recv3, ctrl=last_ctrl, data=last_chunk),
                 collect_pred=_collect,
                 fail_safe_s=timeout_s,
             )
