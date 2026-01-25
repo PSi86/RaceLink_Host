@@ -388,7 +388,7 @@ class GateControl_LoRa(GateControlUIMixin):
             if sanityCheck is True and device.groupId >= num_groups:
                 device.groupId = 0
             self.setGateGroupId(device, forceSet=True)
-            time.sleep(0.2)
+            #time.sleep(0.2)
 
     def _require_lora(self, context: str):
         if getattr(self, "lora", None):

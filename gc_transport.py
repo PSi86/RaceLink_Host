@@ -151,7 +151,7 @@ class LoRaUSB:
                 except Exception:
                     pass
                 self.ser.open()
-                time.sleep(1.0)
+                time.sleep(0.5)
                 self.ser.reset_input_buffer()
                 self.ser.write(payload)
                 # etwas Puffer, z. B. "GateCommunicator_v4" + MAC (ohne \r\n)

@@ -2011,7 +2011,7 @@ def register_gc_blueprint(
                             "message": f"Uploading firmware (try {attempt}/{retries})",
                         })
                         try:
-                            _wled_upload_firmware(base_url, fw_info["path"], timeout_s=180.0)
+                            _wled_upload_firmware(base_url, fw_info["path"], timeout_s=30.0)
                             ok = True
                             break
                         except Exception as ex:
