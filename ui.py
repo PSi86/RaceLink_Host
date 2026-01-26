@@ -277,7 +277,7 @@ class GateControlUIMixin:
 
         payload["help/gc_devices"] = ["Device List of known devices"]
         payload["help/gc_devices/addr"] = ["MAC of the device without ':' as separator"]
-        payload["help/gc_devices/type"] = ["IDENTIFY_COMMUNICATOR:1, WLED_REV3:10, WLED_REV4:11, WLED_STARTBLOCK_REV3:50"]
+        payload["help/gc_devices/dev_type"] = ["IDENTIFY_COMMUNICATOR:1, WLED_REV3:10, WLED_REV4:11, WLED_STARTBLOCK_REV3:50"]
         payload["help/gc_devices/name"] = ["UI: shown name of a device"]
         payload["help/gc_devices/groupId"] = [
             "Used to group devices for control. Valid numbers start with 3 (0-2 are reserved for device type based groups)"
@@ -294,17 +294,17 @@ class GateControlUIMixin:
         payload["help/gc_groups/static_group"] = [
             "0: normal, changeable group, 1: predefined group that will be read only in UI"
         ]
-        payload["help/gc_groups/device_type"] = [
-            "0:call all devices set to this group's id. Device_type: 20,21,22 - send to all devices of that type ignoring groupIds"
+        payload["help/gc_groups/dev_type"] = [
+            "0:call all devices set to this group's id. dev_type can target a specific device type when supported."
         ]
         payload["help/backup"] = [
             "If there is an issue with configuration you can create a clean config based on the example elements. (delete '_backup' from element name)"
         ]
 
         payload["gc_devices_backup"] = [
-            {"addr": "3C84279EBFE4", "type": 24, "name": "WLED 3C84279EBFE4", "groupId": 0, "flags": 1, "presetId": 1, "brightness": 70}
+            {"addr": "3C84279EBFE4", "dev_type": 10, "name": "WLED 3C84279EBFE4", "groupId": 0, "flags": 1, "presetId": 1, "brightness": 70}
         ]
-        payload["gc_groups_backup"] = [{"name": "All WLED Devices", "static_group": 1, "device_type": 0}]
+        payload["gc_groups_backup"] = [{"name": "All WLED Devices", "static_group": 1, "dev_type": 0}]
         return payload
 
     # GC Data Importer function: write imported data to DB

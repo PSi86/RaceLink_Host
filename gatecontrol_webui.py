@@ -49,9 +49,9 @@ import shutil
 from flask import Blueprint, request, jsonify, templating, Response, stream_with_context
 
 try:
-    from .data import get_device_type_info, is_wled_device_type  # type: ignore
+    from .data import get_dev_type_info, is_wled_dev_type  # type: ignore
 except Exception:  # pragma: no cover
-    from data import get_device_type_info, is_wled_device_type
+    from data import get_dev_type_info, is_wled_dev_type
 
 # Use gevent lock/queue if available, otherwise fallback to threading primitives
 try:
@@ -343,13 +343,13 @@ def register_gc_blueprint(
         # Online status (central link logic): always boolean, no timestamp gating.
         # Devices become online only when an expected reply is received; otherwise offline.
         online = bool(getattr(dev, "link_online", False))
-        device_type = int(getattr(dev, "type", getattr(dev, "caps", 0)) or 0)
-        type_info = get_device_type_info(device_type)
+        dev_type = int(getattr(dev, "dev_type", getattr(dev, "caps", 0)) or 0)
+        type_info = get_dev_type_info(dev_type)
 
         d = {
             "addr": getattr(dev, "addr", None),
             "name": getattr(dev, "name", None),
-            "type": device_type,
+            "dev_type": dev_type,
             "groupId": int(getattr(dev, "groupId", 0) or 0),
 
             # new proto v1.2 fields
@@ -365,9 +365,8 @@ def register_gc_blueprint(
             "host_snr": int(getattr(dev, "host_snr", 0) or 0),
 
             "version": int(getattr(dev, "version", 0) or 0),
-            "caps": int(getattr(dev, "caps", device_type) or 0),
-            "device_type": device_type,
-            "device_type_name": type_info.get("name"),
+            "caps": int(getattr(dev, "caps", dev_type) or 0),
+            "dev_type_name": type_info.get("name"),
             "last_seen_ts": float(getattr(dev, "last_seen_ts", 0.0) or 0.0),
             "last_ack": getattr(dev, "last_ack", None),
             "online": online,
@@ -388,8 +387,8 @@ def register_gc_blueprint(
         count = 0
         try:
             for dev in gc_devicelist:
-                dtype = int(getattr(dev, "type", getattr(dev, "caps", 0)) or 0)
-                if is_wled_device_type(dtype):
+                dtype = int(getattr(dev, "dev_type", getattr(dev, "caps", 0)) or 0)
+                if is_wled_dev_type(dtype):
                     count += 1
         except Exception:
             pass
@@ -490,7 +489,7 @@ def register_gc_blueprint(
                 "id": 0,
                 "name": "Unconfigured",
                 "static": False,
-                "device_type": 0,
+                "dev_type": 0,
                 "device_count": int(counts.get(0, 0)),
             })
             for i, g in enumerate(gc_grouplist):
@@ -507,7 +506,7 @@ def register_gc_blueprint(
                     "id": gid,
                     "name": name,
                     "static": bool(getattr(g, "static_group", 0)),
-                    "device_type": int(getattr(g, "device_type", 0) or 0),
+                    "dev_type": int(getattr(g, "dev_type", 0) or 0),
                     "device_count": device_count,
                 })
         return jsonify({"ok": True, "groups": group_rows})
@@ -595,7 +594,7 @@ def register_gc_blueprint(
         created_gid = None
         with _gc_lock:
             if new_group_name:
-                g = GC_DeviceGroup(str(new_group_name), static_group=0, device_type=0)
+                g = GC_DeviceGroup(str(new_group_name), static_group=0, dev_type=0)
                 gc_grouplist.append(g)
                 created_gid = len(gc_grouplist) - 1
                 _log(f"GateControl: Created group '{new_group_name}' (id={created_gid})")
@@ -691,11 +690,11 @@ def register_gc_blueprint(
     def api_groups_create():
         body = request.get_json(silent=True) or {}
         name = str(body.get("name", "")).strip()
-        device_type = int(body.get("device_type", 0) or 0)
+        dev_type = int(body.get("dev_type", body.get("device_type", 0)) or 0)
         if not name:
             return jsonify({"ok": False, "error": "name required"}), 400
         with _gc_lock:
-            gc_grouplist.append(GC_DeviceGroup(name, static_group=0, device_type=device_type))
+            gc_grouplist.append(GC_DeviceGroup(name, static_group=0, dev_type=dev_type))
             gid = len(gc_grouplist) - 1
             try:
                 gc_instance.save_to_db({"manual": True})

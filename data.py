@@ -18,7 +18,7 @@ class GC_Device:
     def __init__(
         self,
         addr: str,
-        type: int,
+        dev_type: int,
         name: str,
         groupId: int = 0,
         version: int = 0,
@@ -32,10 +32,10 @@ class GC_Device:
         configByte: int = 0,
     ):
         self.addr: str = addr
-        self.type: int = int(type)
+        self.dev_type: int = int(dev_type)
         self.name: str = name
         self.version: int = int(version)  # GateControl FW version -> via IDENTIFY_REPLY
-        # NOTE: identify reply field "caps" is now used as device_type.
+        # NOTE: identify reply field "caps" is now used as device type.
         self.caps: int = int(caps)
         self.groupId: int = int(groupId)
 
@@ -62,11 +62,11 @@ class GC_Device:
         # ACK status: last ACK from this device
         self.last_ack = {"ok": False, "opcode": None, "status": None, "seq": None, "ts": 0.0}
 
-    def update_from_identify(self, version, device_type, groupId, mac6_bytes, host_rssi=None, host_snr=None):
+    def update_from_identify(self, version, dev_type, groupId, mac6_bytes, host_rssi=None, host_snr=None):
         self.version = int(version) if version is not None else self.version
-        if device_type is not None:
-            self.caps = int(device_type)
-            self.type = int(device_type)
+        if dev_type is not None:
+            self.caps = int(dev_type)
+            self.dev_type = int(dev_type)
 
         # Only overwrite groupId if device was previously unconfigured
         if self.groupId == 0 and groupId:
@@ -146,41 +146,44 @@ class GC_Device:
 
 
 class GC_DeviceGroup:
-    def __init__(self, name: str, static_group: int = 0, device_type: int = 0):
+    def __init__(self, name: str, static_group: int = 0, dev_type: int = 0):
         self.name: str = name  # UI Name of Device
         self.static_group: int = static_group  # if static_group is false it needs to be initialized
-        self.device_type: int = int(device_type)  # device number in the gc_devicelist
+        self.dev_type: int = int(dev_type)  # device number in the gc_devicelist
 
 
-class GC_Type:
+class GC_Dev_Type:
     IDENTIFY_COMMUNICATOR = 1
     WLED_REV3 = 10
     WLED_REV4 = 11
     WLED_STARTBLOCK_REV3 = 50
 
-    GET_DEVICES = 30  # only devices with groupId != 0 should respond here
-    SET_GROUP = 31  # send this command to make a device store the received groupId
+GC_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX"]
 
-
-GC_DEVICE_TYPES = {
-    GC_Type.IDENTIFY_COMMUNICATOR: {"name": "IDENTIFY_COMMUNICATOR", "STARTBLOCK": 0, "LEDMATRIX": 0},
-    GC_Type.WLED_REV3: {"name": "WLED_REV3", "STARTBLOCK": 0, "LEDMATRIX": 0},
-    GC_Type.WLED_REV4: {"name": "WLED_REV4", "STARTBLOCK": 0, "LEDMATRIX": 0},
-    GC_Type.WLED_STARTBLOCK_REV3: {"name": "WLED_STARTBLOCK_REV3", "STARTBLOCK": 1, "LEDMATRIX": 0},
+GC_DEV_TYPE_INFO = {
+    GC_Dev_Type.IDENTIFY_COMMUNICATOR: {"name": "IDENTIFY_COMMUNICATOR"},
+    GC_Dev_Type.WLED_REV3: {"name": "WLED_REV3"},
+    GC_Dev_Type.WLED_REV4: {"name": "WLED_REV4"},
+    GC_Dev_Type.WLED_STARTBLOCK_REV3: {"name": "WLED_STARTBLOCK_REV3", "caps": ["STARTBLOCK"]},
 }
 
 
-def get_device_type_info(type_id: int | None) -> dict:
+def get_dev_type_info(type_id: int | None) -> dict:
     tid = int(type_id or 0)
-    return GC_DEVICE_TYPES.get(tid, {"name": f"UNKNOWN_{tid}", "STARTBLOCK": 0, "LEDMATRIX": 0})
+    base = GC_DEV_TYPE_INFO.get(tid, {"name": f"UNKNOWN_{tid}"})
+    caps = set(base.get("caps", []))
+    info = {"name": base.get("name", f"UNKNOWN_{tid}")}
+    for cap in GC_DEV_TYPE_CAPS:
+        info[cap] = cap in caps
+    return info
 
 
-def is_wled_device_type(type_id: int | None) -> bool:
+def is_wled_dev_type(type_id: int | None) -> bool:
     tid = int(type_id or 0)
     return tid in {
-        GC_Type.WLED_REV3,
-        GC_Type.WLED_REV4,
-        GC_Type.WLED_STARTBLOCK_REV3,
+        GC_Dev_Type.WLED_REV3,
+        GC_Dev_Type.WLED_REV4,
+        GC_Dev_Type.WLED_STARTBLOCK_REV3,
     }
 
 

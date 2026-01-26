@@ -10,7 +10,7 @@
   const WLED_TYPES = new Set([10, 11, 50]);
 
   function getDeviceTypeId(dev){
-    const v = dev.device_type ?? dev.caps ?? dev.type ?? 0;
+    const v = dev.dev_type ?? dev.caps ?? dev.type ?? 0;
     return Number(v || 0);
   }
 
@@ -270,7 +270,7 @@ function updatePresetsDownloadUi(){
       const tr = document.createElement("tr");
       const checked = state.selected.has(r.addr);
       const typeId = getDeviceTypeId(r);
-      const typeLabel = r.device_type_name || r.type_name || (isNaN(typeId) ? "" : String(typeId));
+      const typeLabel = r.dev_type_name || r.type_name || (isNaN(typeId) ? "" : String(typeId));
       const configByte = Number(r.configByte ?? 0) & 0xFF;
       const selectedConfigs = [];
       const tooltipConfigs = [];
