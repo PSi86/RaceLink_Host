@@ -7,21 +7,20 @@
     hex2: v => ("0" + (Number(v) & 0xFF).toString(16).toUpperCase()).slice(-2),
   };
 
-  const WLED_TYPES = new Set([10, 11, 50]);
-
   function getDeviceTypeId(dev){
     const v = dev.dev_type ?? dev.caps ?? dev.type ?? 0;
     return Number(v || 0);
   }
 
-  function isWledType(typeId){
-    return WLED_TYPES.has(Number(typeId || 0));
+  function hasWledCapability(dev){
+    const caps = Array.isArray(dev.dev_type_caps) ? dev.dev_type_caps : [];
+    return caps.includes("WLED");
   }
 
   function groupMatchesSelection(dev, groupId){
     const gid = Number(groupId);
     if(gid === 255){
-      return isWledType(getDeviceTypeId(dev));
+      return hasWledCapability(dev);
     }
     return Number(dev.groupId) === gid;
   }

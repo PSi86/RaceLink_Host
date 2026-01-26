@@ -367,6 +367,7 @@ def register_gc_blueprint(
             "version": int(getattr(dev, "version", 0) or 0),
             "caps": int(getattr(dev, "caps", dev_type) or 0),
             "dev_type_name": type_info.get("name"),
+            "dev_type_caps": type_info.get("caps", []),
             "last_seen_ts": float(getattr(dev, "last_seen_ts", 0.0) or 0.0),
             "last_ack": getattr(dev, "last_ack", None),
             "online": online,

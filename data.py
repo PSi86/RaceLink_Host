@@ -158,13 +158,13 @@ class GC_Dev_Type:
     WLED_REV4 = 11
     WLED_STARTBLOCK_REV3 = 50
 
-GC_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX"]
+GC_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX", "WLED"]
 
 GC_DEV_TYPE_INFO = {
     GC_Dev_Type.IDENTIFY_COMMUNICATOR: {"name": "IDENTIFY_COMMUNICATOR"},
-    GC_Dev_Type.WLED_REV3: {"name": "WLED_REV3"},
-    GC_Dev_Type.WLED_REV4: {"name": "WLED_REV4"},
-    GC_Dev_Type.WLED_STARTBLOCK_REV3: {"name": "WLED_STARTBLOCK_REV3", "caps": ["STARTBLOCK"]},
+    GC_Dev_Type.WLED_REV3: {"name": "WLED_REV3", "caps": ["WLED"]},
+    GC_Dev_Type.WLED_REV4: {"name": "WLED_REV4", "caps": ["WLED"]},
+    GC_Dev_Type.WLED_STARTBLOCK_REV3: {"name": "WLED_STARTBLOCK_REV3", "caps": ["STARTBLOCK", "WLED"]},
 }
 
 
@@ -172,19 +172,15 @@ def get_dev_type_info(type_id: int | None) -> dict:
     tid = int(type_id or 0)
     base = GC_DEV_TYPE_INFO.get(tid, {"name": f"UNKNOWN_{tid}"})
     caps = set(base.get("caps", []))
-    info = {"name": base.get("name", f"UNKNOWN_{tid}")}
+    info = {"name": base.get("name", f"UNKNOWN_{tid}"), "caps": sorted(caps)}
     for cap in GC_DEV_TYPE_CAPS:
         info[cap] = cap in caps
     return info
 
 
 def is_wled_dev_type(type_id: int | None) -> bool:
-    tid = int(type_id or 0)
-    return tid in {
-        GC_Dev_Type.WLED_REV3,
-        GC_Dev_Type.WLED_REV4,
-        GC_Dev_Type.WLED_STARTBLOCK_REV3,
-    }
+    info = get_dev_type_info(type_id)
+    return bool(info.get("WLED"))
 
 
 gc_backup_devicelist = []
