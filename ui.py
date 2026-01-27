@@ -91,7 +91,7 @@ class GateControlUIMixin:
         temp_ui_grouplist = []
         for i, group in enumerate(gc_grouplist):
             if exclude_static is False or (exclude_static is True and group.static_group == 0):
-                if group.static_group and str(getattr(group, "name", "")) == "All WLED Devices":
+                if group.static_group and str(getattr(group, "name", "")) == "All WLED Gates":
                     value = 255
                 else:
                     value = i
@@ -304,7 +304,7 @@ class GateControlUIMixin:
         payload["gc_devices_backup"] = [
             {"addr": "3C84279EBFE4", "dev_type": 10, "name": "WLED 3C84279EBFE4", "groupId": 0, "flags": 1, "presetId": 1, "brightness": 70}
         ]
-        payload["gc_groups_backup"] = [{"name": "All WLED Devices", "static_group": 1, "dev_type": 0}]
+        payload["gc_groups_backup"] = [{"name": "All WLED Gates", "static_group": 1, "dev_type": 0}]
         return payload
 
     # GC Data Importer function: write imported data to DB

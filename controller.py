@@ -172,13 +172,18 @@ class GateControl_LoRa(GateControlUIMixin):
             group_dev_type = group.get("dev_type", group.get("device_type", 0))
             gc_grouplist.append(GC_DeviceGroup(group["name"], group["static_group"], group_dev_type))
 
-        gc_grouplist[:] = [g for g in gc_grouplist if str(getattr(g, "name", "")).strip().lower() != "unconfigured"]
+        gc_grouplist[:] = [
+            g
+            for g in gc_grouplist
+            if str(getattr(g, "name", "")).strip().lower() not in {"unconfigured", "all wled devices"}
+        ]
 
-        if not any(str(getattr(g, "name", "")).strip().lower() == "all wled devices" for g in gc_grouplist):
-            gc_grouplist.append(GC_DeviceGroup("All WLED Devices", static_group=1, dev_type=0))
+        if not any(str(getattr(g, "name", "")).strip().lower() == "all wled gates" for g in gc_grouplist):
+            gc_grouplist.append(GC_DeviceGroup("All WLED Gates", static_group=1, dev_type=0))
         else:
             for g in gc_grouplist:
-                if str(getattr(g, "name", "")).strip().lower() == "all wled devices":
+                if str(getattr(g, "name", "")).strip().lower() == "all wled gates":
+                    g.name = "All WLED Gates"
                     g.static_group = 1
                     g.dev_type = 0
 

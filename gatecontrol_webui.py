@@ -497,12 +497,10 @@ def register_gc_blueprint(
                 name = getattr(g, "name", f"Group {i}")
                 if str(name).strip().lower() == "unconfigured":
                     continue
-                if str(name).strip().lower() == "all wled devices":
-                    gid = 255
-                    device_count = wled_count
-                else:
-                    gid = i
-                    device_count = int(counts.get(i, 0))
+                if str(name).strip().lower() in {"all wled gates", "all wled devices"}:
+                    continue
+                gid = i
+                device_count = int(counts.get(i, 0))
                 group_rows.append({
                     "id": gid,
                     "name": name,
