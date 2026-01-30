@@ -201,6 +201,9 @@ GC_SPECIALS = {
                 "label": "WLED",
                 "comm": "sendWledControl",
                 "vars": ["presetId", "brightness"],
+                "ui": {
+                    "presetId": {"control": "effect_select"},
+                },
                 "type": "control",
                 "unicast": True,
                 "broadcast": True,

@@ -76,6 +76,7 @@
     fwUploads: { fwId: null, cfgId: null },
     configDisplay: loadConfigDisplay(),
     presets: { files: [], current: "" },
+    effects: [],
     specials: {},
     specialDevice: null,
     specialTab: null,
@@ -157,7 +158,7 @@ function updateSpecialUi(){
   const panel = $("#specialPanel");
   if(!panel) return;
   panel.querySelectorAll("button").forEach(btn => {
-    if(btn.classList.contains("special-save") || btn.classList.contains("special-refresh")){
+    if(btn.classList.contains("special-save") || btn.classList.contains("special-refresh") || btn.classList.contains("special-action")){
       btn.disabled = state.busy || !state.specialDevice;
     }
   });
@@ -167,7 +168,61 @@ function getSpecialsForDevice(dev){
   const caps = Array.isArray(dev.dev_type_caps) ? dev.dev_type_caps : [];
   return caps
     .map(cap => ({ key: cap, info: state.specials[cap] }))
-    .filter(entry => entry.info && Array.isArray(entry.info.options) && entry.info.options.length > 0);
+    .filter(entry => {
+      if(!entry.info) return false;
+      const opts = Array.isArray(entry.info.options) ? entry.info.options.length > 0 : false;
+      const funcs = Array.isArray(entry.info.functions) ? entry.info.functions.length > 0 : false;
+      return opts || funcs;
+    });
+}
+
+function buildSpecialVarInput({varKey, varMeta, uiMeta, dev}){
+  const currentVal = dev ? dev[varKey] : undefined;
+  const defaultVal = (currentVal !== undefined && currentVal !== null)
+    ? currentVal
+    : (varMeta && varMeta.min !== undefined ? varMeta.min : 0);
+  const control = uiMeta && uiMeta.control ? uiMeta.control : "number";
+
+  if(control === "effect_select"){
+    const select = document.createElement("select");
+    const options = Array.isArray(state.effects) ? state.effects : [];
+    if(!options.length){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No presets available";
+      select.appendChild(opt);
+      select.disabled = true;
+      return { input: select, value: defaultVal };
+    }
+    options.forEach(optInfo => {
+      const opt = document.createElement("option");
+      opt.value = String(optInfo.value);
+      opt.textContent = String(optInfo.label ?? optInfo.value);
+      select.appendChild(opt);
+    });
+    const desiredNum = Number(defaultVal);
+    const match = Number.isFinite(desiredNum)
+      ? options.find(optInfo => Number(optInfo.value) === desiredNum)
+      : null;
+    if(match){
+      select.value = String(match.value);
+    }else{
+      const desired = String(defaultVal ?? options[0].value ?? "");
+      if(desired && Array.from(select.options).some(o => o.value === desired)){
+        select.value = desired;
+      }else{
+        select.value = String(options[0].value ?? "");
+      }
+    }
+    return { input: select, value: select.value };
+  }
+
+  const input = document.createElement("input");
+  input.type = "number";
+  if(varMeta && varMeta.min !== undefined) input.min = String(varMeta.min);
+  if(varMeta && varMeta.max !== undefined) input.max = String(varMeta.max);
+  if(defaultVal !== undefined && defaultVal !== null) input.value = String(defaultVal);
+  return { input, value: defaultVal };
 }
 
 function renderSpecialTabs(){
@@ -200,6 +255,23 @@ function renderSpecialTabs(){
 
   const active = specials.find(s => s.key === state.specialTab) || specials[0];
   const options = active.info.options || [];
+  const functions = active.info.functions || [];
+  const optionsByKey = {};
+  options.forEach(opt => {
+    if(opt && opt.key) optionsByKey[opt.key] = opt;
+  });
+
+  if(options.length === 0 && functions.length === 0){
+    panel.innerHTML = "<p class=\"muted\">No configurable options for this device.</p>";
+    return;
+  }
+  if(options.length){
+    const section = document.createElement("h4");
+    section.className = "gc-special-section";
+    section.textContent = "Options";
+    panel.appendChild(section);
+  }
+
   options.forEach(opt => {
     const row = document.createElement("div");
     row.className = "gc-special-row";
@@ -264,14 +336,99 @@ function renderSpecialTabs(){
     });
   });
 
+  if(functions.length){
+    const section = document.createElement("h4");
+    section.className = "gc-special-section";
+    section.textContent = "Actions";
+    panel.appendChild(section);
+  }
+
+  functions.forEach(fn => {
+    const row = document.createElement("div");
+    row.className = "gc-special-fn-row";
+    const label = document.createElement("label");
+    label.textContent = fn.label || fn.key || "Action";
+    const inputsWrap = document.createElement("div");
+    inputsWrap.className = "gc-special-inputs";
+    const varsList = Array.isArray(fn.vars) ? fn.vars : [];
+    const inputMeta = [];
+    varsList.forEach(varKey => {
+      const varMeta = optionsByKey[varKey] || {};
+      const uiMeta = (fn.ui && fn.ui[varKey]) ? fn.ui[varKey] : {};
+      const fieldWrap = document.createElement("div");
+      fieldWrap.className = "gc-special-input";
+      const fieldLabel = document.createElement("span");
+      fieldLabel.className = "gc-special-input-label";
+      fieldLabel.textContent = varMeta.label || varKey;
+      const { input } = buildSpecialVarInput({varKey, varMeta, uiMeta, dev});
+      fieldWrap.appendChild(fieldLabel);
+      fieldWrap.appendChild(input);
+      inputsWrap.appendChild(fieldWrap);
+      inputMeta.push({ key: varKey, input, uiMeta });
+    });
+    const actions = document.createElement("div");
+    actions.className = "gc-special-actions";
+    const sendBtn = document.createElement("button");
+    sendBtn.type = "button";
+    sendBtn.className = "special-action";
+    sendBtn.textContent = "Send";
+    actions.appendChild(sendBtn);
+    row.appendChild(label);
+    row.appendChild(inputsWrap);
+    row.appendChild(actions);
+    panel.appendChild(row);
+
+    sendBtn.addEventListener("click", async () => {
+      if(!state.specialDevice) return;
+      const params = {};
+      for(const meta of inputMeta){
+        const el = meta.input;
+        let value = el.value;
+        if(meta.uiMeta && meta.uiMeta.control === "effect_select"){
+          if(!value){
+            $("#specialHint").textContent = "Select a preset.";
+            return;
+          }
+        }
+        const numVal = Number(value);
+        if(!Number.isFinite(numVal)){
+          $("#specialHint").textContent = `Enter a valid number for ${meta.key}.`;
+          return;
+        }
+        params[meta.key] = numVal;
+      }
+      $("#specialHint").textContent = `Sending ${fn.label || fn.key}…`;
+      const r = await apiPost("/gatecontrol/api/specials/action", {
+        mac: state.specialDevice.addr,
+        function: fn.key,
+        params,
+      });
+      if(r && r.task){
+        try{ updateTask(r.task); }catch{}
+      }
+      if(r.busy){
+        $("#specialHint").textContent = `Busy: ${r.task?.name || "task"} is running`;
+        return;
+      }
+      if(!r.ok){
+        $("#specialHint").textContent = r.error || "Failed to send action.";
+      }
+    });
+  });
+
   updateSpecialUi();
 }
 
-function openSpecialsDialog(mac){
+async function openSpecialsDialog(mac){
   const dev = state.devices.find(d => d.addr === mac);
   if(!dev) return;
   state.specialDevice = dev;
   $("#specialHint").textContent = "";
+  try{
+    await loadEffects();
+  }catch{
+    // ignore load errors
+  }
   renderSpecialTabs();
   $("#dlgSpecials").showModal();
 }
@@ -337,8 +494,14 @@ function openSpecialsDialog(mac){
     renderTable();
   }
 
+  async function loadEffects(){
+    const s = await apiGet("/gatecontrol/api/options");
+    state.effects = s.effects || [];
+    return state.effects;
+  }
+
   async function loadAll(){
-    await Promise.all([loadGroups(), loadDevices(), loadSpecials()]);
+    await Promise.all([loadGroups(), loadDevices(), loadSpecials(), loadEffects()]);
   }
 
   function renderGroups(){
@@ -631,6 +794,20 @@ function openSpecialsDialog(mac){
       } else if(st==="running"){
         const meta = t.meta || {};
         hintEl.textContent = meta.message ? String(meta.message) : "Saving option…";
+      }
+    }
+  }
+
+  if(name==="special_action"){
+    const hintEl = $("#specialHint");
+    if(hintEl){
+      if(st==="done"){
+        hintEl.textContent = "Action sent.";
+      } else if(st==="error"){
+        hintEl.textContent = `Error: ${t.last_error || "unknown"}`;
+      } else if(st==="running"){
+        const meta = t.meta || {};
+        hintEl.textContent = meta.message ? String(meta.message) : "Sending action…";
       }
     }
   }
