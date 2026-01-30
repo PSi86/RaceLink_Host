@@ -208,6 +208,10 @@ class GateControlUIMixin:
                     vars_list = fn_info.get("vars", []) or []
                     allow_unicast = bool(fn_info.get("unicast"))
                     allow_broadcast = bool(fn_info.get("broadcast"))
+                    fn_type = fn_info.get("type", "control")
+
+                    if fn_type != "control":
+                        continue
 
                     def _build_fields(mode):
                         fields = []

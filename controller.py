@@ -538,6 +538,20 @@ class GateControl_LoRa(GateControlUIMixin):
             pass
         return True
 
+    def sendStartblockControl(self, *, targetDevice=None, targetGroup=None, params=None):
+        if not self._require_lora("sendStartblockControl"):
+            return {}
+        if params is None:
+            params = {}
+        slots = int(params.get("startblock_slots", 1)) & 0xFF
+        first_slot = int(params.get("startblock_first_slot", 1)) & 0xFF
+        payload = bytes([slots, first_slot])
+        if targetDevice is not None:
+            return self.sendStream(payload, device=targetDevice)
+        if targetGroup is not None:
+            return self.sendStream(payload, groupId=int(targetGroup))
+        return {}
+
     def _send_and_wait_for_reply(
         self,
         recv3: bytes,

@@ -210,8 +210,18 @@ GC_SPECIALS = {
                 "label": "Startblock",
                 "comm": "sendStartblockConfig",
                 "vars": ["startblock_slots", "startblock_first_slot"],
+                "type": "config",
                 "unicast": True,
                 "broadcast": False,
+            },
+            {
+                "key": "startblock_control",
+                "label": "Startblock",
+                "comm": "sendStartblockControl",
+                "vars": ["startblock_slots", "startblock_first_slot"],
+                "type": "control",
+                "unicast": True,
+                "broadcast": True,
             }
         ],
     },
@@ -227,6 +237,7 @@ GC_SPECIALS = {
                 "label": "WLED",
                 "comm": "sendWledControl",
                 "vars": ["presetId", "brightness"],
+                "type": "control",
                 "unicast": True,
                 "broadcast": True,
             }
