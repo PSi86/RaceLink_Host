@@ -408,6 +408,10 @@ function renderSpecialTabs(){
       }
       if(!r.ok){
         $("#specialHint").textContent = r.error || "Failed to send action.";
+        return;
+      }
+      if(!r.task){
+        $("#specialHint").textContent = "Action sent.";
       }
     });
   });

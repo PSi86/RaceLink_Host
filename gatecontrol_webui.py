@@ -1033,22 +1033,17 @@ def register_gc_blueprint(
 
         _ensure_transport_hooked()
 
-        def do_special_action():
-            _task_update(meta={"mac": mac_str, "function": fn_key, "message": f"Sending {fn_key} ({cap_key or 'unknown'})"})
-            with _gc_lock:
-                dev = gc_instance.getDeviceFromAddress(mac_str)
-            if not dev:
-                raise RuntimeError("device not found")
-            res = comm_fn(targetDevice=dev, targetGroup=None, params=params_coerced)
-            if res is False:
-                raise RuntimeError("action failed")
-            return {"mac": mac_str, "function": fn_key, "params": params_coerced, "result": res}
+        with _gc_lock:
+            dev = gc_instance.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
 
-        meta = {"mac": mac_str, "function": fn_key, "message": "Sending action"}
-        t = _start_task("special_action", do_special_action, meta=meta)
-        if not t:
-            return _task_busy_response()
-        return jsonify({"ok": True, "task": t})
+        res = comm_fn(targetDevice=dev, targetGroup=None, params=params_coerced)
+        if res is False:
+            return jsonify({"ok": False, "error": "action failed"}), 500
+
+        _set_master(state="TX", tx_pending=True, last_event="SPECIAL_SENT")
+        return jsonify({"ok": True, "result": res, "function": fn_key, "params": params_coerced})
 
     @bp.route("/gatecontrol/api/specials/get", methods=["POST"])
     def api_specials_get():
