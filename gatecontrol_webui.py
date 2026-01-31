@@ -49,9 +49,9 @@ import shutil
 from flask import Blueprint, request, jsonify, templating, Response, stream_with_context
 
 try:
-    from .data import get_dev_type_info, get_specials_config, get_special_keys_for_caps, get_ui_control_options, is_wled_dev_type  # type: ignore
+    from .data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type  # type: ignore
 except Exception:  # pragma: no cover
-    from data import get_dev_type_info, get_specials_config, get_special_keys_for_caps, get_ui_control_options, is_wled_dev_type
+    from data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type
 
 # Use gevent lock/queue if available, otherwise fallback to threading primitives
 try:
@@ -506,7 +506,10 @@ def register_gc_blueprint(
 
     @bp.route("/gatecontrol/api/specials", methods=["GET"])
     def api_specials():
-        return jsonify({"ok": True, "specials": get_specials_config()})
+        return jsonify({
+            "ok": True,
+            "specials": get_specials_config(effect_list=getattr(gc_instance, "uiEffectList", None), serialize_ui=True),
+        })
 
     @bp.route("/gatecontrol/api/groups", methods=["GET"])
     def api_groups():
@@ -549,7 +552,7 @@ def register_gc_blueprint(
     @bp.route("/gatecontrol/api/options", methods=["GET"])
     def api_options():
         # still called "effects" for UI legacy; values can represent preset ids
-        opts = get_ui_control_options("effect_select", effect_list=getattr(gc_instance, "uiEffectList", None))
+        opts = effect_select_options(effect_list=getattr(gc_instance, "uiEffectList", None))
         return jsonify({"ok": True, "effects": opts})
 
     # -----------------------
@@ -895,7 +898,7 @@ def register_gc_blueprint(
             if not dev:
                 return jsonify({"ok": False, "error": "device not found"}), 404
             dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
-            specials = get_specials_config()
+            specials = get_specials_config(effect_list=getattr(gc_instance, "uiEffectList", None))
             option_info = None
             for cap in dev_caps:
                 spec = specials.get(cap, {})
@@ -978,7 +981,7 @@ def register_gc_blueprint(
             if not dev:
                 return jsonify({"ok": False, "error": "device not found"}), 404
             dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
-            specials = get_specials_config()
+            specials = get_specials_config(effect_list=getattr(gc_instance, "uiEffectList", None))
             fn_info = None
             cap_key = None
             options_by_key = {}

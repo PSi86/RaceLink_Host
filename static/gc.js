@@ -76,7 +76,6 @@
     fwUploads: { fwId: null, cfgId: null },
     configDisplay: loadConfigDisplay(),
     presets: { files: [], current: "" },
-    effects: [],
     specials: {},
     specialDevice: null,
     specialTab: null,
@@ -181,11 +180,10 @@ function buildSpecialVarInput({varKey, varMeta, uiMeta, dev}){
   const defaultVal = (currentVal !== undefined && currentVal !== null)
     ? currentVal
     : (varMeta && varMeta.min !== undefined ? varMeta.min : 0);
-  const control = uiMeta && uiMeta.control ? uiMeta.control : "number";
+  const options = uiMeta && Array.isArray(uiMeta.options) ? uiMeta.options : null;
 
-  if(control === "effect_select"){
+  if(options){
     const select = document.createElement("select");
-    const options = Array.isArray(state.effects) ? state.effects : [];
     if(!options.length){
       const opt = document.createElement("option");
       opt.value = "";
@@ -384,11 +382,9 @@ function renderSpecialTabs(){
       for(const meta of inputMeta){
         const el = meta.input;
         let value = el.value;
-        if(meta.uiMeta && meta.uiMeta.control === "effect_select"){
-          if(!value){
-            $("#specialHint").textContent = "Select a preset.";
-            return;
-          }
+        if(meta.uiMeta && Array.isArray(meta.uiMeta.options) && !value){
+          $("#specialHint").textContent = "Select a preset.";
+          return;
         }
         const numVal = Number(value);
         if(!Number.isFinite(numVal)){
@@ -424,11 +420,6 @@ async function openSpecialsDialog(mac){
   if(!dev) return;
   state.specialDevice = dev;
   $("#specialHint").textContent = "";
-  try{
-    await loadEffects();
-  }catch{
-    // ignore load errors
-  }
   renderSpecialTabs();
   $("#dlgSpecials").showModal();
 }
@@ -494,14 +485,8 @@ async function openSpecialsDialog(mac){
     renderTable();
   }
 
-  async function loadEffects(){
-    const s = await apiGet("/gatecontrol/api/options");
-    state.effects = s.effects || [];
-    return state.effects;
-  }
-
   async function loadAll(){
-    await Promise.all([loadGroups(), loadDevices(), loadSpecials(), loadEffects()]);
+    await Promise.all([loadGroups(), loadDevices(), loadSpecials()]);
   }
 
   function renderGroups(){

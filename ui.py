@@ -15,7 +15,7 @@ from .data import (
     GC_FLAG_POWER_ON,
     get_dev_type_info,
     get_specials_config,
-    get_ui_control_options,
+    effect_select_options,
     gc_devicelist,
     gc_grouplist,
 )
@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 class GateControlUIMixin:
-    def _get_ui_control_select_options(self, control: str) -> list[UIFieldSelectOption]:
-        options = get_ui_control_options(control, effect_list=getattr(self, "uiEffectList", None))
-        if not options and control == "effect_select":
+    def _get_effect_select_options(self) -> list[UIFieldSelectOption]:
+        options = effect_select_options(effect_list=getattr(self, "uiEffectList", None))
+        if not options:
             return list(getattr(self, "uiEffectList", []) or [])
         return [UIFieldSelectOption(opt["value"], opt["label"]) for opt in options]
 
@@ -150,7 +150,7 @@ class GateControlUIMixin:
         return temp_ui_grouplist
 
     def register_quickset_ui(self):
-        effect_options = self._get_ui_control_select_options("effect_select")
+        effect_options = self._get_effect_select_options()
         default_effect = effect_options[0].value if effect_options else "01"
         self._rhapi.ui.register_panel("esp_gc_quickset", "GateControl Quickset", "run")
         self._rhapi.fields.register_option(
@@ -182,7 +182,7 @@ class GateControlUIMixin:
                 logger.debug("Saved Actions Register Function in GateControl Instance")
 
         if not args and self.action_reg_fn:
-            effect_options = self._get_ui_control_select_options("effect_select")
+            effect_options = self._get_effect_select_options()
             default_effect = effect_options[0].value if effect_options else "01"
             for effect in [
                 ActionEffect(
@@ -204,7 +204,7 @@ class GateControlUIMixin:
             ]:
                 self.action_reg_fn(effect)
 
-            specials = get_specials_config()
+            specials = get_specials_config(effect_list=getattr(self, "uiEffectList", None))
             for cap_key, cap_info in specials.items():
                 funcs = cap_info.get("functions", []) or []
                 if not funcs:
@@ -255,9 +255,10 @@ class GateControlUIMixin:
                             label = opt_meta.get("label", var)
                             default_val = opt_meta.get("min", 0)
                             ui_meta = (fn_info.get("ui") or {}).get(var, {})
-                            control = ui_meta.get("control")
-                            if control:
-                                select_options = self._get_ui_control_select_options(control)
+                            generator = ui_meta.get("generator")
+                            if callable(generator):
+                                select_options_raw = generator(effect_list=getattr(self, "uiEffectList", None))
+                                select_options = [UIFieldSelectOption(opt["value"], opt["label"]) for opt in select_options_raw]
                                 if select_options:
                                     default_select = select_options[0].value
                                     if default_val is not None:

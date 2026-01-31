@@ -177,10 +177,8 @@ def _normalize_select_options(raw_options) -> list[dict]:
     return options
 
 
-def get_ui_control_options(control: str, *, effect_list=None) -> list[dict]:
-    if control == "effect_select":
-        return _normalize_select_options(effect_list)
-    return []
+def effect_select_options(*, effect_list=None) -> list[dict]:
+    return _normalize_select_options(effect_list)
 
 GC_SPECIALS = {
     "STARTBLOCK": {
@@ -223,7 +221,7 @@ GC_SPECIALS = {
                 "comm": "sendWledControl",
                 "vars": ["presetId", "brightness"],
                 "ui": {
-                    "presetId": {"control": "effect_select"},
+                    "presetId": {"generator": effect_select_options},
                 },
                 "type": "control",
                 "unicast": True,
@@ -257,11 +255,27 @@ def is_wled_dev_type(type_id: int | None) -> bool:
     return bool(info.get("WLED"))
 
 
-def get_specials_config() -> dict:
+def get_specials_config(*, effect_list=None, serialize_ui: bool = False) -> dict:
     data = {}
     for cap, info in GC_SPECIALS.items():
         options = [dict(opt) for opt in info.get("options", [])]
-        functions = [dict(fn) for fn in info.get("functions", [])]
+        functions = []
+        for fn in info.get("functions", []):
+            fn_copy = dict(fn)
+            ui_meta = {}
+            for var_key, ui_info in (fn.get("ui") or {}).items():
+                ui_copy = dict(ui_info)
+                generator = ui_copy.get("generator")
+                if callable(generator):
+                    if serialize_ui:
+                        ui_copy.pop("generator", None)
+                        ui_copy["options"] = generator(effect_list=effect_list)
+                    else:
+                        ui_copy["generator"] = generator
+                ui_meta[var_key] = ui_copy
+            if ui_meta:
+                fn_copy["ui"] = ui_meta
+            functions.append(fn_copy)
         data[cap] = {
             **{k: v for k, v in info.items() if k not in {"options", "functions"}},
             "options": options,
