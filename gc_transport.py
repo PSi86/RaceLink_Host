@@ -93,6 +93,7 @@ class LoRaUSB:
         self._qmax = 1000
         self._listeners = []
         self._tx_listeners = []
+        self._rx_window_state = 0
 
     @staticmethod
     def _is_usb_port(portinfo):
@@ -150,7 +151,7 @@ class LoRaUSB:
                 except Exception:
                     pass
                 self.ser.open()
-                time.sleep(1.0)
+                time.sleep(0.5)
                 self.ser.reset_input_buffer()
                 self.ser.write(payload)
                 # etwas Puffer, z. B. "GateCommunicator_v4" + MAC (ohne \r\n)
@@ -252,6 +253,15 @@ class LoRaUSB:
             except Exception:
                 pass
 
+    def _handle_disconnect(self, msg: str) -> None:
+        logger.warning(msg)
+        self._emit({"type": EV_ERROR, "data": msg})
+        self._stop = True
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
     def _send_m2n(self, type_full:int, recv3:bytes, body:bytes=b""):
         if len(recv3) != 3:
             raise ValueError("recv3 must be 3 bytes")
@@ -270,8 +280,9 @@ class LoRaUSB:
             )
             self._emit_tx({"type": "TX_M2N", "type_full": type_full, "dir": (type_full & 0x80), "opc": (type_full & 0x7F), "recv3": recv3, "body_len": len(body or b"")})
         except serial.SerialException as e:
-            logger.error("TX write failed: %s", e)
-            raise
+            self._handle_disconnect(f"USB TX failed: {e}")
+            return False
+        return True
 
     def send_get_devices(self, recv3=b'\xFF\xFF\xFF', group_id=0, flags=0):
         body = struct.pack("<BB", group_id & 0xFF, flags & 0xFF)  # P_GetDevices
@@ -311,11 +322,9 @@ class LoRaUSB:
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SYNC), recv3, body)
 
     def send_stream(self, recv3:bytes, ctrl:int, data:bytes):
-        """Send STREAM_M2N (9B): ctrl byte + 8 data bytes."""
+        """Send STREAM_M2N: ctrl byte + data payload (variable length)."""
         if not isinstance(data, (bytes, bytearray)):
             raise ValueError("data must be bytes")
-        if len(data) != 8:
-            raise ValueError("data must be exactly 8 bytes")
         body = struct.pack("<B", int(ctrl) & 0xFF) + bytes(data)
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_STREAM), recv3, body)
 
@@ -333,7 +342,11 @@ class LoRaUSB:
     def _reader(self):
         in_frame = False; need = 0; buf = bytearray()
         while not self._stop:
-            b = self.ser.read(1)
+            try:
+                b = self.ser.read(1)
+            except serial.SerialException as e:
+                self._handle_disconnect(f"USB serial disconnected: {e}")
+                break
             if not b: 
                 continue
             x = b[0]
@@ -366,6 +379,25 @@ class LoRaUSB:
             except Exception:
                 pass
 
+    def _update_rx_window_state(self, event_type:int) -> int:
+        """Track RX window state transitions (valid states: 0 or 1)."""
+        delta = 1 if event_type == EV_RX_WINDOW_OPEN else -1
+        new_state = int(self._rx_window_state) + delta
+        if new_state not in (0, 1):
+            logger.error(
+                "RX window state invalid after %s: %s -> %s",
+                "OPEN" if event_type == EV_RX_WINDOW_OPEN else "CLOSED",
+                self._rx_window_state,
+                new_state,
+            )
+            new_state = 1 if event_type == EV_RX_WINDOW_OPEN else 0
+        self._rx_window_state = new_state
+        return self._rx_window_state
+
+    @property
+    def rx_window_state(self) -> int:
+        return int(self._rx_window_state)
+
     def _handle_frame(self, type_byte:int, data:bytes):
         """Parse one framed message from device and emit events.
 
@@ -378,13 +410,15 @@ class LoRaUSB:
         # USB-only events
         if type_byte in (EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE):
             if type_byte == EV_RX_WINDOW_OPEN and len(data) >= 2:
-                ev = {"type": type_byte, "window_ms": _u16le(data[:2]), "ts": now}
+                rx_state = self._update_rx_window_state(type_byte)
+                ev = {"type": type_byte, "window_ms": _u16le(data[:2]), "ts": now, "rx_windows": rx_state}
             elif type_byte == EV_RX_WINDOW_CLOSED and len(data) >= 2:
-                ev = {"type": type_byte, "rx_count_delta": _u16le(data[:2]), "ts": now}
+                rx_state = self._update_rx_window_state(type_byte)
+                ev = {"type": type_byte, "rx_count_delta": _u16le(data[:2]), "ts": now, "rx_windows": rx_state}
             elif type_byte == EV_TX_DONE and len(data) >= 1:
-                ev = {"type": type_byte, "last_len": data[0], "ts": now}
+                ev = {"type": type_byte, "last_len": data[0], "ts": now, "rx_windows": self.rx_window_state}
             else:
-                ev = {"type": type_byte, "data": data, "ts": now}
+                ev = {"type": type_byte, "data": data, "ts": now, "rx_windows": self.rx_window_state}
             self._emit(ev)
             return
 
@@ -415,6 +449,7 @@ class LoRaUSB:
             "host_rssi": rssi,
             "host_snr": snr,
             "ts": now,
+            "rx_windows": self.rx_window_state,
         }
 
         # Compatibility parsing for common replies
