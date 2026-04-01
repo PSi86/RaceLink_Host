@@ -44,6 +44,7 @@ class GC_Device:
         self.presetId: int = int(presetId) & 0xFF
         self.brightness: int = int(brightness) & 0xFF
         self.configByte: int = int(configByte) & 0xFF
+        self.specials: dict[str, int] = {}
 
         # Telemetry (STATUS_REPLY)
         self.voltage_mV: int = int(voltage_mV)
@@ -160,6 +161,72 @@ class GC_Dev_Type:
 
 GC_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX", "WLED"]
 
+
+def _normalize_select_options(raw_options) -> list[dict]:
+    options: list[dict] = []
+    for opt in raw_options or []:
+        if isinstance(opt, dict):
+            value = opt.get("value", opt.get("key"))
+            label = opt.get("label", opt.get("name", value))
+        else:
+            value = getattr(opt, "value", opt)
+            label = getattr(opt, "label", getattr(opt, "name", value))
+        if value is None:
+            continue
+        options.append({"value": str(value), "label": str(label)})
+    return options
+
+
+def effect_select_options(*, context=None, **_kwargs) -> list[dict]:
+    ctx = context or {}
+    gc_instance = ctx.get("gc_instance") or ctx.get("gc")
+    effect_list = None
+    if gc_instance is not None:
+        effect_list = getattr(gc_instance, "uiEffectList", None)
+    if effect_list is None:
+        effect_list = ctx.get("uiEffectList") or ctx.get("effect_list")
+    return _normalize_select_options(effect_list)
+
+GC_SPECIALS = {
+    "STARTBLOCK": {
+        "label": "Startblock",
+        "options": [
+            {"key": "startblock_slots", "label": "Number Of Slots", "option": 0x8C, "min": 1, "max": 8},
+            {"key": "startblock_first_slot", "label": "First Slot", "option": 0x8D, "min": 1, "max": 8},
+        ],
+        "functions": [
+            {
+                "key": "startblock_control",
+                "label": "Startblock Control",
+                "comm": "sendStartblockControl",
+                "vars": [],
+                "type": "control",
+                "unicast": True,
+                "broadcast": True,
+            }
+        ],
+    },
+    "WLED": {
+        "label": "WLED",
+        "options": [],
+        "functions": [
+            {
+                "key": "wled_control",
+                "label": "WLED Control",
+                "comm": "sendWledControl",
+                "vars": ["presetId", "brightness"],
+                "ui": {
+                    "presetId": {"generator": effect_select_options},
+                },
+                "type": "control",
+                "unicast": True,
+                "broadcast": True,
+            }
+        ],
+    },
+    "LEDMATRIX": {"label": "Matrix", "options": [], "functions": []},
+}
+
 GC_DEV_TYPE_INFO = {
     GC_Dev_Type.IDENTIFY_COMMUNICATOR: {"name": "IDENTIFY_COMMUNICATOR"},
     GC_Dev_Type.WLED_REV3: {"name": "WLED_REV3", "caps": ["WLED"]},
@@ -181,6 +248,70 @@ def get_dev_type_info(type_id: int | None) -> dict:
 def is_wled_dev_type(type_id: int | None) -> bool:
     info = get_dev_type_info(type_id)
     return bool(info.get("WLED"))
+
+
+def get_specials_config(*, context: dict | None = None, serialize_ui: bool = False) -> dict:
+    data = {}
+    for cap, info in GC_SPECIALS.items():
+        options = [dict(opt) for opt in info.get("options", [])]
+        functions = []
+        for fn in info.get("functions", []):
+            fn_copy = dict(fn)
+            ui_meta = {}
+            for var_key, ui_info in (fn.get("ui") or {}).items():
+                ui_copy = dict(ui_info)
+                generator = ui_copy.get("generator")
+                if callable(generator):
+                    if serialize_ui:
+                        ui_copy.pop("generator", None)
+                        ui_copy["options"] = generator(context=context or {})
+                    else:
+                        ui_copy["generator"] = generator
+                ui_meta[var_key] = ui_copy
+            if ui_meta:
+                fn_copy["ui"] = ui_meta
+            functions.append(fn_copy)
+        data[cap] = {
+            **{k: v for k, v in info.items() if k not in {"options", "functions"}},
+            "options": options,
+            "functions": functions,
+        }
+    return data
+
+
+def get_special_keys_for_caps(caps: list[str]) -> list[str]:
+    keys = []
+    for cap in caps:
+        spec = GC_SPECIALS.get(cap, {})
+        for opt in spec.get("options", []):
+            key = opt.get("key")
+            if key:
+                keys.append(key)
+    return keys
+
+
+def build_specials_state(type_id: int | None, stored: dict | None = None) -> dict[str, int]:
+    caps = get_dev_type_info(type_id).get("caps", [])
+    stored = stored or {}
+    state: dict[str, int] = {}
+    for cap in caps:
+        spec = GC_SPECIALS.get(cap, {})
+        for opt in spec.get("options", []):
+            key = opt.get("key")
+            if not key:
+                continue
+            default_val = opt.get("min", 0)
+            try:
+                state[key] = int(stored.get(key, default_val))
+            except Exception:
+                state[key] = int(default_val)
+    return state
+
+
+def create_device(*, dev_type: int, specials: dict | None = None, **kwargs) -> GC_Device:
+    dev = GC_Device(dev_type=dev_type, **kwargs)
+    dev.specials = build_specials_state(dev_type, specials)
+    return dev
 
 
 gc_backup_devicelist = []
