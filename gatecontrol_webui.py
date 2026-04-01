@@ -49,9 +49,9 @@ import shutil
 from flask import Blueprint, request, jsonify, templating, Response, stream_with_context
 
 try:
-    from .data import get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type  # type: ignore
+    from .data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type  # type: ignore
 except Exception:  # pragma: no cover
-    from data import get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type
+    from data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type
 
 # Use gevent lock/queue if available, otherwise fallback to threading primitives
 try:
@@ -506,7 +506,11 @@ def register_gc_blueprint(
 
     @bp.route("/gatecontrol/api/specials", methods=["GET"])
     def api_specials():
-        return jsonify({"ok": True, "specials": get_specials_config()})
+        context = {"gc_instance": gc_instance}
+        return jsonify({
+            "ok": True,
+            "specials": get_specials_config(context=context, serialize_ui=True),
+        })
 
     @bp.route("/gatecontrol/api/groups", methods=["GET"])
     def api_groups():
@@ -549,16 +553,7 @@ def register_gc_blueprint(
     @bp.route("/gatecontrol/api/options", methods=["GET"])
     def api_options():
         # still called "effects" for UI legacy; values can represent preset ids
-        opts = []
-        try:
-            for opt in gc_instance.uiEffectList:
-                val = getattr(opt, "value", None)
-                lab = getattr(opt, "label", None) or getattr(opt, "name", None) or str(opt)
-                if val is None:
-                    continue
-                opts.append({"value": str(val), "label": str(lab)})
-        except Exception:
-            opts = []
+        opts = effect_select_options(context={"gc_instance": gc_instance})
         return jsonify({"ok": True, "effects": opts})
 
     # -----------------------
@@ -904,7 +899,7 @@ def register_gc_blueprint(
             if not dev:
                 return jsonify({"ok": False, "error": "device not found"}), 404
             dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
-            specials = get_specials_config()
+            specials = get_specials_config(context={"gc_instance": gc_instance})
             option_info = None
             for cap in dev_caps:
                 spec = specials.get(cap, {})
@@ -962,6 +957,93 @@ def register_gc_blueprint(
         if not t:
             return _task_busy_response()
         return jsonify({"ok": True, "task": t})
+
+    @bp.route("/gatecontrol/api/specials/action", methods=["POST"])
+    def api_specials_action():
+        if _task_is_running():
+            return _task_busy_response()
+
+        body = request.get_json(silent=True) or {}
+        mac = body.get("mac", None)
+        fn_key = body.get("function", None) or body.get("fn", None)
+        params = body.get("params", None) or {}
+        if not mac or not fn_key:
+            return jsonify({"ok": False, "error": "missing mac/function"}), 400
+
+        recv3 = _parse_recv3_from_addr(mac)
+        if not recv3:
+            return jsonify({"ok": False, "error": "invalid mac/address"}), 400
+        if recv3 == b"\xFF\xFF\xFF":
+            return jsonify({"ok": False, "error": "broadcast not allowed for action"}), 400
+
+        mac_str = str(mac).upper()
+        with _gc_lock:
+            dev = gc_instance.getDeviceFromAddress(mac_str)
+            if not dev:
+                return jsonify({"ok": False, "error": "device not found"}), 404
+            dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
+            specials = get_specials_config(context={"gc_instance": gc_instance})
+            fn_info = None
+            cap_key = None
+            options_by_key = {}
+            for cap in dev_caps:
+                spec = specials.get(cap, {})
+                for opt in spec.get("options", []):
+                    key = opt.get("key")
+                    if key:
+                        options_by_key[key] = opt
+                for fn in spec.get("functions", []):
+                    if fn.get("key") == fn_key:
+                        fn_info = fn
+                        cap_key = cap
+                        break
+                if fn_info:
+                    break
+
+        if not fn_info:
+            return jsonify({"ok": False, "error": "function not supported for device"}), 400
+        if not fn_info.get("unicast", False):
+            return jsonify({"ok": False, "error": "function does not support unicast"}), 400
+
+        comm_name = fn_info.get("comm")
+        if not comm_name:
+            return jsonify({"ok": False, "error": "missing comm handler"}), 400
+        comm_fn = getattr(gc_instance, comm_name, None)
+        if not callable(comm_fn):
+            return jsonify({"ok": False, "error": "comm handler not found"}), 400
+
+        vars_list = fn_info.get("vars", []) or []
+        params_coerced = {}
+        for var in vars_list:
+            raw_val = params.get(var, None)
+            if raw_val is None:
+                raw_val = options_by_key.get(var, {}).get("min", 0)
+            try:
+                value_int = int(raw_val)
+            except Exception:
+                return jsonify({"ok": False, "error": f"invalid value for {var}"}), 400
+            opt_meta = options_by_key.get(var, {})
+            min_v = opt_meta.get("min")
+            max_v = opt_meta.get("max")
+            if min_v is not None and value_int < int(min_v):
+                return jsonify({"ok": False, "error": f"{var} must be >= {min_v}"}), 400
+            if max_v is not None and value_int > int(max_v):
+                return jsonify({"ok": False, "error": f"{var} must be <= {max_v}"}), 400
+            params_coerced[var] = value_int
+
+        _ensure_transport_hooked()
+
+        with _gc_lock:
+            dev = gc_instance.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
+
+        res = comm_fn(targetDevice=dev, targetGroup=None, params=params_coerced)
+        if res is False:
+            return jsonify({"ok": False, "error": "action failed"}), 500
+
+        _set_master(state="TX", tx_pending=True, last_event="SPECIAL_SENT")
+        return jsonify({"ok": True, "result": res, "function": fn_key, "params": params_coerced})
 
     @bp.route("/gatecontrol/api/specials/get", methods=["POST"])
     def api_specials_get():
