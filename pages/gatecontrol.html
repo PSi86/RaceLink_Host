@@ -14,6 +14,7 @@
       <button id="btnStatusSel">Get Status (Selection)</button>
       <button id="btnStatusAll">Get Status (All)</button>
       <button id="btnFwUpdate">Firmware Update</button>
+      <button id="btnWledPresets">WLED Presets</button>
       <button id="btnForce">Set all Groups</button>
       <button id="btnSave">Save</button>
       <button id="btnReload">Reload</button>
@@ -63,13 +64,6 @@
   <div id="configDisplayOptions" class="gc-config-options"></div>
 </div>
 
-<div class="gc-toolbar">
-  <label>Presets.json:</label>
-  <input id="presetsFile" type="file" accept=".json,application/json" />
-  <button id="btnPresetsUpload">Upload</button>
-  <span id="presetsInfo" class="muted"></span>
-</div>
-
 
       <table class="gc-table" id="gcTable">
         <thead>
@@ -88,7 +82,7 @@
             <th data-key="host_rssi">Host RSSI</th>
             <th data-key="host_snr">Host SNR</th>
             <th data-key="version">FW</th>
-            <th data-key="caps">Caps</th>
+            <th data-key="dev_type">Type</th>
             <th data-key="online">Online</th>
           </tr>
         </thead>
@@ -177,9 +171,8 @@
 
       <div class="row">
         <label><input id="fwDoPresets" type="checkbox" /> Upload presets.json</label>
-        <input id="fwPresets" type="file" accept=".json,application/json" disabled />
-        <button id="btnFwUploadPresets" type="button" disabled>Upload</button>
-        <span id="fwPresetsInfo" class="muted"></span>
+        <select id="fwPresetsSelect" disabled></select>
+        <span id="fwPresetsHint" class="muted"></span>
       </div>
 
       <div class="row">
@@ -195,6 +188,79 @@
       </div>
 
       <p id="fwHint" class="muted"></p>
+    </form>
+  </dialog>
+
+  <dialog id="dlgPresets">
+    <form method="dialog" class="gc-form">
+      <h3>WLED Presets</h3>
+      <p class="muted">Upload and select the presets.json file used for RotorHazard UI synchronization.</p>
+
+      <div class="row">
+        <label>Upload presets.json:</label>
+        <input id="presetsUploadFile" type="file" accept=".json,application/json" />
+        <button id="btnPresetsUpload" type="button">Upload</button>
+        <span id="presetsUploadInfo" class="muted"></span>
+      </div>
+
+      <div class="row">
+        <label>WLED base URL:</label>
+        <input id="presetsBaseUrl" value="http://4.3.2.1" style="width: 240px;" />
+        <span class="muted">Default AP-IP: 4.3.2.1</span>
+      </div>
+
+      <div class="row">
+        <label>Host WiFi (nmcli profile):</label>
+        <input id="presetsWifiConnName" value="gatecontrol-wled-ap" style="width: 190px;" />
+        <select id="presetsWifiIface" style="width: 140px;"></select>
+        <input id="presetsWifiSsid" value="WLED-AP" style="width: 160px;" />
+      </div>
+
+      <div class="row">
+        <label></label>
+        <label class="inline"><input id="presetsHostWifiEnable" type="checkbox" checked /> Enable host WiFi during download</label>
+        <label class="inline"><input id="presetsHostWifiRestore" type="checkbox" checked /> Restore previous host WiFi state after download</label>
+      </div>
+
+      <div class="row">
+        <label>WiFi timeout (s):</label>
+        <input id="presetsWifiTimeoutS" type="number" min="5" max="120" value="35" style="width: 90px;" />
+        <span class="muted">How long the host scans/connects to the node AP</span>
+      </div>
+
+      <div class="row">
+        <label>Download presets.json:</label>
+        <button id="btnPresetsDownload" type="button">Download from device</button>
+        <span id="presetsDownloadHint" class="muted">Select exactly one device</span>
+      </div>
+
+      <div class="row">
+        <label>Available presets:</label>
+        <select id="presetsSelect"></select>
+        <span id="presetsCurrentInfo" class="muted"></span>
+      </div>
+
+      <div class="gc-dialog-actions">
+        <button id="btnPresetsSave" type="button">Save</button>
+        <button value="cancel">Close</button>
+      </div>
+
+      <p id="presetsHint" class="muted"></p>
+    </form>
+  </dialog>
+
+  <dialog id="dlgSpecials">
+    <form method="dialog" class="gc-form">
+      <h3>Device Options</h3>
+
+      <div class="gc-tabs" id="specialTabs"></div>
+      <div id="specialPanel" class="gc-tab-panel"></div>
+
+      <div class="gc-dialog-actions">
+        <button value="cancel">Cancel</button>
+      </div>
+
+      <p id="specialHint" class="muted"></p>
     </form>
   </dialog>
 
