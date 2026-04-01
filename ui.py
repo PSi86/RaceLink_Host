@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 
 from data_import import DataImporter
 from data_export import DataExporter
@@ -10,19 +9,28 @@ from EventActions import ActionEffect
 from RHUI import UIField, UIFieldType, UIFieldSelectOption
 
 from .data import (
-    RL_DeviceGroup,
-    RL_FLAG_HAS_BRI,
-    RL_FLAG_POWER_ON,
     get_dev_type_info,
     get_specials_config,
-    rl_devicelist,
-    rl_grouplist,
 )
+from .usecases import apply_device_control, apply_group_control, execute_special_action, run_discovery
 
 logger = logging.getLogger(__name__)
 
 
 class RaceLinkUIMixin:
+    def get_devices(self):
+        return []
+
+    def get_groups(self):
+        return []
+
+    @staticmethod
+    def _as_int(value, fallback=0):
+        try:
+            return int(value)
+        except Exception:
+            return int(fallback)
+
     def _get_select_options(self, fn_key: str, var_key: str) -> list[UIFieldSelectOption]:
         context = {"rhapi": self._rhapi, "gc": self}
         specials = get_specials_config(context=context)
@@ -98,7 +106,7 @@ class RaceLinkUIMixin:
     def createUiDevList(self):
         logger.debug("RL: Creating UI Device Select Options")
         temp_ui_devlist = []
-        for device in rl_devicelist:
+        for device in self.get_devices():
             temp_ui_devlist.append(UIFieldSelectOption(device.addr, device.name))
         return temp_ui_devlist
 
@@ -122,7 +130,7 @@ class RaceLinkUIMixin:
                     return False
             return True
 
-        selected_devs = [dev for dev in rl_devicelist if _matches_device(dev)]
+        selected_devs = [dev for dev in self.get_devices() if _matches_device(dev)]
         output = {"devices": [], "groups": []}
 
         if outputDevices:
@@ -131,7 +139,7 @@ class RaceLinkUIMixin:
         if outputGroups:
             group_ids = {int(getattr(dev, "groupId", 0) or 0) for dev in selected_devs}
             temp_groups = []
-            for i, group in enumerate(rl_grouplist):
+            for i, group in enumerate(self.get_groups()):
                 if group.static_group and str(getattr(group, "name", "")) == "All WLED Nodes":
                     if cap_set and "WLED" not in cap_set:
                         continue
@@ -147,7 +155,7 @@ class RaceLinkUIMixin:
     def createUiGroupList(self, exclude_static=False):
         logger.debug("RL: Creating UI Device Select Options")
         temp_ui_grouplist = []
-        for i, group in enumerate(rl_grouplist):
+        for i, group in enumerate(self.get_groups()):
             if exclude_static is False or (exclude_static is True and group.static_group == 0):
                 if group.static_group and str(getattr(group, "name", "")) == "All WLED Nodes":
                     value = 255
@@ -322,55 +330,13 @@ class RaceLinkUIMixin:
         return _handler
 
     def specialAction(self, action, fn_key: str, mode: str):
-        specials = get_specials_config()
-        fn_info = None
-        cap_key = None
-        for cap, info in specials.items():
-            for fn in info.get("functions", []) or []:
-                if fn.get("key") == fn_key:
-                    fn_info = fn
-                    cap_key = cap
-                    break
-            if fn_info:
-                break
-        if not fn_info:
-            logger.warning("specialAction: function not found: %s", fn_key)
-            return
-
-        vars_list = fn_info.get("vars", []) or []
-        params = {}
-        for var in vars_list:
-            key = f"rl_special_{fn_key}_{var}"
-            try:
-                params[var] = int(action.get(key, 0))
-            except Exception:
-                params[var] = action.get(key, 0)
-
-        target_device = None
-        target_group = None
-        if mode == "device":
-            target_addr = action.get(f"rl_special_{fn_key}_device")
-            if target_addr:
-                target_device = self.getDeviceFromAddress(target_addr)
-        else:
-            try:
-                target_group = int(action.get(f"rl_special_{fn_key}_group"))
-            except Exception:
-                target_group = None
-
-        comm_name = fn_info.get("comm")
-        if not comm_name:
-            logger.warning("specialAction: missing comm function for %s", fn_key)
-            return
-
-        comm_fn = getattr(self, comm_name, None)
-        if not callable(comm_fn):
-            logger.warning("specialAction: comm function missing: %s", comm_name)
-            return
-
-        logger.debug("RL: specialAction %s (%s)", fn_key, cap_key or "unknown")
         try:
-            comm_fn(targetDevice=target_device, targetGroup=target_group, params=params)
+            result = execute_special_action(self, action=action, fn_key=fn_key, mode=mode)
+            if not result.get("ok"):
+                logger.warning("specialAction: %s", result.get("message"))
+                self._rhapi.ui.message_notify(self._rhapi.__(result.get("message", "Special action failed")))
+            else:
+                self._rhapi.ui.message_notify(self._rhapi.__(result.get("message", "Special action executed")))
         except Exception:
             logger.exception("RL: specialAction failed: %s", fn_key)
 
@@ -403,76 +369,45 @@ class RaceLinkUIMixin:
         self._rhapi.ui.message_notify("text")
 
     def nodeSwitch(self, action, args=None):
-        # control triggered by ActionEffect
         if "rl_action_device" in action:
-            logger.debug("Action triggered")
-            targetDevice = self.getDeviceFromAddress(action["rl_action_device"])
-            if targetDevice is None:
-                logger.warning("nodeSwitch: device not found: %r", action["rl_action_device"])
-                return
-            targetDevice.brightness = int(action["rl_action_brightness"])
-            targetDevice.presetId = int(action["rl_action_effect"])
-            targetDevice.flags = (RL_FLAG_POWER_ON if int(action["rl_action_brightness"]) > 0 else 0) | RL_FLAG_HAS_BRI
+            target_device = self.getDeviceFromAddress(action["rl_action_device"])
+            brightness = self._as_int(action.get("rl_action_brightness"), 0)
+            effect = self._as_int(action.get("rl_action_effect"), 1)
+        elif "manual" in action:
+            target_device = self.getDeviceFromAddress(self._rhapi.db.option("rl_quickset_device", None))
+            brightness = self._as_int(self._rhapi.db.option("rl_quickset_brightness", 0), 0)
+            effect = self._as_int(self._rhapi.db.option("rl_quickset_effect", 1), 1)
+        else:
+            return
 
-            logger.debug("sendRaceLink action call - device")
-            self.sendRaceLink(targetDevice)
-
-        # control triggered by UI button press
-        if "manual" in action:
-            logger.debug("Manual triggered")
-            targetDevice = self.getDeviceFromAddress(self._rhapi.db.option("rl_quickset_device", None))
-            if targetDevice is None:
-                logger.warning("nodeSwitch(manual): device not found in DB option")
-                return
-            targetDevice.brightness = int(self._rhapi.db.option("rl_quickset_brightness", None))
-            targetDevice.presetId = int(self._rhapi.db.option("rl_quickset_effect", None))
-            targetDevice.flags = (
-                RL_FLAG_POWER_ON if int(self._rhapi.db.option("rl_quickset_brightness", None)) > 0 else 0
-            ) | RL_FLAG_HAS_BRI
-
-            logger.debug("sendRaceLink manual call - device")
-            self.sendRaceLink(targetDevice)
+        result = apply_device_control(self, target_device=target_device, brightness=brightness, effect=effect)
+        if not result.get("ok"):
+            logger.warning("nodeSwitch: %s", result.get("message"))
+        self._rhapi.ui.message_notify(self._rhapi.__(result.get("message", "Device control failed")))
 
     def groupSwitch(self, action, args=None):
-        # control triggered by ActionEffect
         if "rl_action_group" in action:
-            logger.debug("Action triggered")
-            targetGroup = int(action["rl_action_group"])
-            targetBrightness = int(action["rl_action_brightness"])
-            targetEffect = int(action["rl_action_effect"])
-            targetFlags = (RL_FLAG_POWER_ON if int(action["rl_action_brightness"]) > 0 else 0) | RL_FLAG_HAS_BRI
+            group_id = self._as_int(action.get("rl_action_group"), 0)
+            brightness = self._as_int(action.get("rl_action_brightness"), 0)
+            effect = self._as_int(action.get("rl_action_effect"), 1)
+        elif "manual" in action:
+            group_id = self._as_int(self._rhapi.db.option("rl_quickset_group", 0), 0)
+            brightness = self._as_int(self._rhapi.db.option("rl_quickset_brightness", 0), 0)
+            effect = self._as_int(self._rhapi.db.option("rl_quickset_effect", 1), 1)
+        else:
+            return
 
-            logger.debug("RL: groupSwitch called by Action (event based)")
-            self.sendGroupControl(targetGroup, targetFlags, targetEffect, targetBrightness)
-
-        # control triggered by UI button press
-        if "manual" in action:
-            logger.debug("Manual triggered")
-            targetGroup = int(self._rhapi.db.option("rl_quickset_group", None))
-            targetBrightness = int(self._rhapi.db.option("rl_quickset_brightness", None))
-            targetEffect = int(self._rhapi.db.option("rl_quickset_effect", None))
-            targetFlags = (
-                RL_FLAG_POWER_ON if int(self._rhapi.db.option("rl_quickset_brightness", None)) > 0 else 0
-            ) | RL_FLAG_HAS_BRI
-
-            logger.debug("RL: groupSwitch called from UI")
-            self.sendGroupControl(targetGroup, targetFlags, int(targetEffect), targetBrightness)
+        result = apply_group_control(self, group_id=group_id, brightness=brightness, effect=effect)
+        self._rhapi.ui.message_notify(self._rhapi.__(result.get("message", "Group control failed")))
 
     def discoveryAction(self, args):
-        group_selected = int(self._rhapi.db.option("rl_assignToGroup", None))
-        new_group_str = self._rhapi.db.option("rl_assignToNewGroup", None)
+        result = run_discovery(
+            self,
+            selected_group=self._rhapi.db.option("rl_assignToGroup", 0),
+            new_group_name=self._rhapi.db.option("rl_assignToNewGroup", ""),
+        )
 
-        if group_selected == 0:
-            if not new_group_str or len(new_group_str) == 0:
-                new_group_str = "New Group"
-
-            new_group_str += " " + datetime.now().strftime("%Y%m%d_%H%M%S")
-            group_selected = len(rl_grouplist)
-
-        num_found = self.getDevices(groupFilter=0, addToGroup=group_selected)
-
-        if num_found > 0 and group_selected == len(rl_grouplist):
-            rl_grouplist.append(RL_DeviceGroup(new_group_str))
+        if result.get("group_created"):
             self.uiGroupList = self.createUiGroupList()
             self.uiDiscoveryGroupList = self.createUiGroupList(True)
             self.register_settings()
@@ -480,6 +415,9 @@ class RaceLinkUIMixin:
             self.registerActions()
             self._rhapi.ui.broadcast_ui("settings")
             self._rhapi.ui.broadcast_ui("run")
+        self._rhapi.ui.message_notify(
+            self._rhapi.__("Discovery complete: {} device(s) found").format(result.get("num_found", 0))
+        )
 
     # RL Data Exporter write function
     def rl_write_json(self, data):
@@ -495,8 +433,8 @@ class RaceLinkUIMixin:
         payload = {}
         payload["help"] = ["See help tags below current configuration elements"]
 
-        payload["rl_devices"] = [obj.__dict__ for obj in rl_devicelist]
-        payload["rl_groups"] = [obj.__dict__ for obj in rl_grouplist]
+        payload["rl_devices"] = [obj.__dict__ for obj in self.get_devices()]
+        payload["rl_groups"] = [obj.__dict__ for obj in self.get_groups()]
 
         payload["help/rl_devices"] = ["Device List of known devices"]
         payload["help/rl_devices/addr"] = ["MAC of the device without ':' as separator"]

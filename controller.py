@@ -166,6 +166,12 @@ class RaceLink_LoRa(RaceLinkUIMixin):
         self.load_from_db()
         self.discoverPort({})
 
+    def get_devices(self):
+        return rl_devicelist
+
+    def get_groups(self):
+        return rl_grouplist
+
     def save_to_db(self, args):
         logger.debug("RL: Writing current states to Database")
         config_str_devices = str([obj.__dict__ for obj in rl_devicelist])
