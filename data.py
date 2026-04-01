@@ -161,6 +161,32 @@ class GC_Dev_Type:
 
 GC_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX", "WLED"]
 
+
+def _normalize_select_options(raw_options) -> list[dict]:
+    options: list[dict] = []
+    for opt in raw_options or []:
+        if isinstance(opt, dict):
+            value = opt.get("value", opt.get("key"))
+            label = opt.get("label", opt.get("name", value))
+        else:
+            value = getattr(opt, "value", opt)
+            label = getattr(opt, "label", getattr(opt, "name", value))
+        if value is None:
+            continue
+        options.append({"value": str(value), "label": str(label)})
+    return options
+
+
+def effect_select_options(*, context=None, **_kwargs) -> list[dict]:
+    ctx = context or {}
+    gc_instance = ctx.get("gc_instance") or ctx.get("gc")
+    effect_list = None
+    if gc_instance is not None:
+        effect_list = getattr(gc_instance, "uiEffectList", None)
+    if effect_list is None:
+        effect_list = ctx.get("uiEffectList") or ctx.get("effect_list")
+    return _normalize_select_options(effect_list)
+
 GC_SPECIALS = {
     "STARTBLOCK": {
         "label": "Startblock",
@@ -170,19 +196,10 @@ GC_SPECIALS = {
         ],
         "functions": [
             {
-                "key": "startblock_config",
-                "label": "Startblock",
-                "comm": "sendStartblockConfig",
-                "vars": ["startblock_slots", "startblock_first_slot"],
-                "type": "config",
-                "unicast": True,
-                "broadcast": False,
-            },
-            {
                 "key": "startblock_control",
-                "label": "Startblock",
+                "label": "Startblock Control",
                 "comm": "sendStartblockControl",
-                "vars": ["startblock_slots", "startblock_first_slot"],
+                "vars": [],
                 "type": "control",
                 "unicast": True,
                 "broadcast": True,
@@ -191,16 +208,16 @@ GC_SPECIALS = {
     },
     "WLED": {
         "label": "WLED",
-        "options": [
-            {"key": "presetId", "label": "Preset", "option": 0x90, "min": 1, "max": 255},
-            {"key": "brightness", "label": "Brightness", "option": 0x91, "min": 0, "max": 255},
-        ],
+        "options": [],
         "functions": [
             {
                 "key": "wled_control",
-                "label": "WLED",
+                "label": "WLED Control",
                 "comm": "sendWledControl",
                 "vars": ["presetId", "brightness"],
+                "ui": {
+                    "presetId": {"generator": effect_select_options},
+                },
                 "type": "control",
                 "unicast": True,
                 "broadcast": True,
@@ -233,11 +250,27 @@ def is_wled_dev_type(type_id: int | None) -> bool:
     return bool(info.get("WLED"))
 
 
-def get_specials_config() -> dict:
+def get_specials_config(*, context: dict | None = None, serialize_ui: bool = False) -> dict:
     data = {}
     for cap, info in GC_SPECIALS.items():
         options = [dict(opt) for opt in info.get("options", [])]
-        functions = [dict(fn) for fn in info.get("functions", [])]
+        functions = []
+        for fn in info.get("functions", []):
+            fn_copy = dict(fn)
+            ui_meta = {}
+            for var_key, ui_info in (fn.get("ui") or {}).items():
+                ui_copy = dict(ui_info)
+                generator = ui_copy.get("generator")
+                if callable(generator):
+                    if serialize_ui:
+                        ui_copy.pop("generator", None)
+                        ui_copy["options"] = generator(context=context or {})
+                    else:
+                        ui_copy["generator"] = generator
+                ui_meta[var_key] = ui_copy
+            if ui_meta:
+                fn_copy["ui"] = ui_meta
+            functions.append(fn_copy)
         data[cap] = {
             **{k: v for k, v in info.items() if k not in {"options", "functions"}},
             "options": options,
