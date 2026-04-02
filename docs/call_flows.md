@@ -49,20 +49,23 @@ Dieses Dokument beschreibt zentrale Laufzeit-Sequenzen von RaceLink im RotorHaza
 - `plugins/rotorhazard/host/rotorhazard_provider.py` → `RotorHazardRaceEventAdapter.start(event_sink)`
 
 ### Zwischenstationen
-1. Während App-Initialisierung (`RaceLinkApp.__init__`) wird bei vorhandenem Event-Port ausgeführt:
-   - `self.race_event_port.start(self.on_race_event)`
-2. `RotorHazardRaceEventAdapter.start(...)` registriert RH-Events:
+1. Während Komposition (`RotorHazardPlugin.build(...)`) wird `RaceLinkApp(...)` inkl. `race_event_port` erstellt, **aber noch nicht gestartet**.
+2. In `RotorHazardPlugin.start()` werden zuerst Feature-Module aktiviert; danach startet der Lifecycle explizit:
+   - `self.app.start_event_stream()`
+3. `RotorHazardRaceEventAdapter.start(...)` registriert RH-Events:
    - `Evt.RACE_START` → `_on_race_start`
    - `Evt.RACE_FINISH` → `_on_race_finish`
    - `Evt.RACE_STOP` → `_on_race_stop`
-3. Jeder Handler ruft `_emit(...)` auf:
+4. Jeder Handler ruft `_emit(...)` auf:
    - erzeugt `HostRaceEvent(type=..., payload={"source_payload": payload})`
    - übergibt an den Sink (`RaceLinkApp.on_race_event`)
-4. `RaceLinkApp.on_race_event(event)` dispatcht nach `event.type`:
+5. `RaceLinkApp.on_race_event(event)` dispatcht nach `event.type`:
    - `RACE_STARTED` → `on_race_start(...)`
    - `RACE_FINISHED` → `on_race_finish(...)`
    - `RACE_STOPPED` → `on_race_stop(...)`
    - `RACE_SNAPSHOT` → Debug-Log
+6. Optionaler Shutdown (`RotorHazardPlugin.stop()`):
+   - `self.app.stop_event_stream()` ruft `race_event_port.stop()` auf und meldet den Sink sauber ab.
 
 ### Seiteneffekte
 - **DB-Load/Save**:
