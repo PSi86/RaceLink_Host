@@ -1,32 +1,4 @@
-"""
-RaceLink WebUI (importable module)
--------------------------------------
-
-This module registers a Flask blueprint for the RaceLink LoRa plugin.
-
-Key goals:
-- No periodic polling required (uses Server-Sent Events / SSE for live UI state)
-- "Busy" protection: only one long-running radio task at a time (discover/status)
-- UI can show master activity (TX pending / RX window open) based on USB events
-- UI can show task progress (RX reply counts) based on LoRa/USB events
-
-Usage in your plugin's __init__.py:
-
-    from .racelink_webui import register_rl_blueprint
-
-    def initialize(rhapi):
-        ...
-        register_rl_blueprint(
-            rhapi,
-            rl_instance=rl_instance,
-            rl_devicelist=rl_devicelist,
-            rl_grouplist=rl_grouplist,
-            RL_DeviceGroup=RL_DeviceGroup,
-            logger=logger
-        )
-
-This registers the page at /racelink and JSON endpoints under /racelink/api/*.
-"""
+"""RaceLink WebUI composition root."""
 
 from __future__ import annotations
 
@@ -46,14 +18,13 @@ import uuid
 import subprocess
 import shutil
 
-from flask import Blueprint, request, jsonify, templating, Response, stream_with_context
+from flask import Blueprint, request, jsonify
 
 try:
     from ....data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type  # type: ignore
 except Exception:  # pragma: no cover
     from data import effect_select_options, get_dev_type_info, get_specials_config, get_special_keys_for_caps, is_wled_dev_type
 
-# Use gevent lock/queue if available, otherwise fallback to threading primitives
 try:
     from gevent.lock import Semaphore as _RLLock  # type: ignore
     _DefaultLock = _RLLock
@@ -67,10 +38,13 @@ except Exception:  # pragma: no cover
 try:
     from gevent.queue import Queue as _RLQueue  # type: ignore
 except Exception:  # pragma: no cover
-    try:
-        from queue import Queue as _RLQueue  # type: ignore
-    except Exception:  # pragma: no cover
-        _RLQueue = None  # should never happen
+    from queue import Queue as _RLQueue  # type: ignore
+
+from .webui.sse_state import SseState
+from .webui.task_runner import TaskRunner
+from .webui.transport_hooks import TransportHooks
+from .webui.utils import busy_task_response, parse_recv3_from_addr
+from .webui.routes_runtime import register_runtime_routes
 
 
 def register_rl_blueprint(
@@ -80,19 +54,14 @@ def register_rl_blueprint(
     rl_devicelist,
     rl_grouplist,
     RL_DeviceGroup,
-    logger=None
+    logger=None,
 ):
-    """
-    Register the RaceLink blueprint with RotorHazard.
-
-    All references are passed explicitly to avoid tight coupling with __init__.py globals.
-    """
+    """Compose RaceLink WebUI from small modules and register blueprint."""
 
     _rl_lock = _DefaultLock()
     _clients_lock = _DefaultLock()
     _task_lock = _DefaultLock()
 
-    # --- helpers ---
     def _log(msg):
         try:
             if logger:
@@ -102,154 +71,6 @@ def register_rl_blueprint(
         except Exception:
             print(msg)
 
-    # --- Master state mirrored to UI ---
-    _master = {
-        "state": "IDLE",              # IDLE | TX | RX | ERROR
-        "tx_pending": False,
-        "rx_window_open": False,
-        "rx_windows": 0,
-        "rx_window_ms": 0,
-        "last_event": None,
-        "last_event_ts": 0.0,
-        "last_tx_len": 0,
-        "last_rx_count_delta": 0,
-        "last_error": None,
-    }
-
-    # --- Task state (one at a time) ---
-    _task = None  # dict or None
-    _task_seq = 0
-
-    # --- SSE clients ---
-    _clients = set()  # set[Queue]
-
-    def _master_snapshot():
-        return dict(_master)
-
-    def _task_snapshot():
-        with _task_lock:
-            return dict(_task) if _task else None
-
-    def _broadcast(ev_name: str, payload):
-        # Fan-out to all connected SSE clients
-        with _clients_lock:
-            dead = []
-            for q in list(_clients):
-                try:
-                    q.put((ev_name, payload), timeout=0.01)
-                except Exception:
-                    dead.append(q)
-            for q in dead:
-                try:
-                    _clients.remove(q)
-                except Exception:
-                    pass
-
-    def _set_master(**updates):
-        changed = False
-        for k, v in updates.items():
-            if _master.get(k) != v:
-                _master[k] = v
-                changed = True
-        if changed:
-            _master["last_event_ts"] = time.time()
-            _broadcast("master", _master_snapshot())
-
-    def _set_task(new_task: Optional[dict]):
-        nonlocal _task
-        with _task_lock:
-            _task = new_task
-        _broadcast("task", _task_snapshot())
-
-    def _task_update(**updates):
-        with _task_lock:
-            if not _task:
-                return
-            for k, v in updates.items():
-                _task[k] = v
-        _broadcast("task", _task_snapshot())
-
-    def _task_is_running() -> bool:
-        with _task_lock:
-            return bool(_task and _task.get("state") == "running")
-
-    def _task_busy_response():
-        snap = _task_snapshot()
-        return jsonify({"ok": False, "busy": True, "task": snap}), 409
-
-    def _parse_recv3_from_addr(addr_str) -> Optional[bytes]:
-        """Parse address string (3B or 6B, with/without separators) and return last3 bytes."""
-        if addr_str is None:
-            return None
-        try:
-            s = str(addr_str)
-        except Exception:
-            return None
-        hexchars = "0123456789abcdefABCDEF"
-        s = "".join(ch for ch in s if ch in hexchars)
-        if len(s) < 6:
-            return None
-        s = s[-6:]
-        try:
-            return bytes.fromhex(s)
-        except Exception:
-            return None
-
-    # --- Transport event hookup (LoRaUSB.on_event) ---
-    _hooked_lora = {"ok": False}
-
-    def _ensure_transport_hooked():
-        """
-        Attach a callback to LoRa transport events so we can update master/task state
-        and feed SSE clients.
-
-        Prefers a listener registry (lora.add_listener) when available; otherwise
-        falls back to chaining lora.on_event.
-        """
-        if _hooked_lora["ok"]:
-            return
-
-        lora = getattr(rl_instance, "lora", None)
-        if not lora:
-            return
-
-        # Newer transport: listener registry
-        if hasattr(lora, "add_listener"):
-            try:
-                lora.add_listener(_on_transport_event)  # type: ignore[attr-defined]
-                _hooked_lora["ok"] = True
-                _log("RaceLink: transport event listener installed (add_listener)")
-                return
-            except Exception as ex:
-                _log(f"RaceLink: add_listener failed, falling back to on_event: {ex}")
-
-        # Legacy transport: single on_event callback
-        if not hasattr(lora, "on_event"):
-            return
-
-        prev = getattr(lora, "on_event", None)
-
-        def _mux(ev: dict):
-            # 1) our handler
-            try:
-                _on_transport_event(ev)
-            except Exception:
-                pass
-            # 2) previous handler (if any)
-            try:
-                if prev and prev is not _mux:
-                    prev(ev)
-            except Exception:
-                pass
-
-        try:
-            lora.on_event = _mux
-            _hooked_lora["ok"] = True
-            _log("RaceLink: transport event hook installed")
-        except Exception as ex:
-            _log(f"RaceLink: transport hook failed: {ex}")
-
-    # Event type constants from racelink_transport (optional)
     try:
         from ....racelink_transport import EV_ERROR, EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED, EV_TX_DONE  # type: ignore
     except Exception:
@@ -261,105 +82,54 @@ def register_rl_blueprint(
             EV_RX_WINDOW_CLOSED = 0xF2
             EV_TX_DONE = 0xF3
 
-    def _on_transport_event(ev: dict):
-        """
-        Receive USB transport events (EV_*) and LoRa reply events and update UI state.
-        """
-        t = ev.get("type", None)
+    state = SseState(_clients_lock, _task_lock)
+    task_runner = TaskRunner(state)
+    transport_hooks = TransportHooks(
+        rl_instance,
+        state,
+        _log,
+        {
+            "EV_ERROR": EV_ERROR,
+            "EV_RX_WINDOW_OPEN": EV_RX_WINDOW_OPEN,
+            "EV_RX_WINDOW_CLOSED": EV_RX_WINDOW_CLOSED,
+            "EV_TX_DONE": EV_TX_DONE,
+        },
+    )
 
-        # USB-only events
-        if t == EV_RX_WINDOW_OPEN:
-            rx_state = int(ev.get("rx_windows", 1) or 0)
-            rx_open = rx_state == 1
-            _set_master(
-                state="RX" if rx_open else ("TX" if _master.get("tx_pending") else "IDLE"),
-                rx_windows=rx_state,
-                rx_window_open=rx_open,
-                rx_window_ms=int(ev.get("window_ms", 0) or 0),
-                last_event="RX_WINDOW_OPEN",
-                last_error=None,
-            )
-            if _task_is_running():
-                snap = _task_snapshot() or {}
-                _task_update(rx_window_events=int(snap.get("rx_window_events", 0)) + 1)
-            return
+    def _master_snapshot():
+        return state.master_snapshot()
 
-        if t == EV_RX_WINDOW_CLOSED:
-            delta = int(ev.get("rx_count_delta", 0) or 0)
-            rx_state = int(ev.get("rx_windows", 0) or 0)
-            rx_open = rx_state == 1
-            _set_master(
-                state="RX" if rx_open else ("TX" if _master.get("tx_pending") else "IDLE"),
-                rx_windows=rx_state,
-                rx_window_open=rx_open,
-                rx_window_ms=0,
-                last_event="RX_WINDOW_CLOSED",
-                last_rx_count_delta=delta,
-                last_error=None,
-            )
-            if _task_is_running():
-                snap = _task_snapshot() or {}
-                _task_update(
-                    rx_count_delta_total=int(snap.get("rx_count_delta_total", 0)) + delta,
-                    rx_window_events=int(snap.get("rx_window_events", 0)) + 1,
-                )
-            return
+    def _task_snapshot():
+        return state.task_snapshot()
 
-        if t == EV_TX_DONE:
-            _set_master(
-                tx_pending=False,
-                state="RX" if _master.get("rx_window_open") else "IDLE",
-                last_event="TX_DONE",
-                last_tx_len=int(ev.get("last_len", 0) or 0),
-                last_error=None,
-            )
-            return
+    def _broadcast(ev_name: str, payload):
+        state.broadcast(ev_name, payload)
 
-        if t == EV_ERROR:
-            # Keep error state visible; tasks can continue but UI should show error
-            raw = ev.get("data", b"")
-            try:
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.hex().upper()
-            except Exception:
-                pass
-            _set_master(
-                state="ERROR",
-                last_event="USB_ERROR",
-                last_error=str(raw),
-            )
-            if _task_is_running():
-                _task_update(last_error=str(raw))
-            return
+    def _set_master(**updates):
+        state.set_master(**updates)
 
-        # LoRa reply events from LoRaUSB parser
-        reply = ev.get("reply")
-        if not reply:
-            return
+    def _set_task(new_task: Optional[dict]):
+        state.set_task(new_task)
 
-        if reply == "ACK":
-            with _clients_lock:
-                has_clients = bool(_clients)
-            if has_clients:
-                _broadcast("refresh", {"what": ["devices"]})
+    def _task_update(**updates):
+        state.task_update(**updates)
 
-        # Track replies for running tasks
-        if _task_is_running():
-            snap = _task_snapshot() or {}
-            tname = snap.get("name")
-            if tname == "discover" and reply == "IDENTIFY_REPLY":
-                _task_update(rx_replies=int(snap.get("rx_replies", 0)) + 1)
-            elif tname == "status" and reply == "STATUS_REPLY":
-                _task_update(rx_replies=int(snap.get("rx_replies", 0)) + 1)
+    def _task_is_running() -> bool:
+        return state.task_is_running()
 
-        # Update master activity hint (we received something)
-        _set_master(last_event=reply, last_error=None)
+    def _task_busy_response():
+        return busy_task_response(state.task_snapshot())
 
-    # --- Serialization ---
+    def _parse_recv3_from_addr(addr_str) -> Optional[bytes]:
+        return parse_recv3_from_addr(addr_str)
+
+    def _ensure_transport_hooked():
+        transport_hooks.ensure_hooked()
+
+    def _start_task(name: str, target_fn, meta: Optional[dict] = None):
+        return task_runner.start_task(name, target_fn, meta=meta)
+
     def _rl_serialize_device(dev):
-        """Make RL_Device JSON-serializable for the UI table."""
-        # Online status (central link logic): always boolean, no timestamp gating.
-        # Devices become online only when an expected reply is received; otherwise offline.
         online = bool(getattr(dev, "link_online", False))
         dev_type = int(getattr(dev, "dev_type", getattr(dev, "caps", 0)) or 0)
         type_info = get_dev_type_info(dev_type)
@@ -369,20 +139,16 @@ def register_rl_blueprint(
             "name": getattr(dev, "name", None),
             "dev_type": dev_type,
             "groupId": int(getattr(dev, "groupId", 0) or 0),
-
-            # new proto v1.2 fields
             "flags": int(getattr(dev, "flags", 0) or 0),
             "configByte": int(getattr(dev, "configByte", 0) or 0),
             "presetId": int(getattr(dev, "presetId", 0) or 0),
             "brightness": int(getattr(dev, "brightness", 0) or 0),
             "specials": dict(getattr(dev, "specials", {}) or {}),
-
             "voltage_mV": int(getattr(dev, "voltage_mV", 0) or 0),
             "node_rssi": int(getattr(dev, "node_rssi", 0) or 0),
             "node_snr": int(getattr(dev, "node_snr", 0) or 0),
             "host_rssi": int(getattr(dev, "host_rssi", 0) or 0),
             "host_snr": int(getattr(dev, "host_snr", 0) or 0),
-
             "version": int(getattr(dev, "version", 0) or 0),
             "caps": int(getattr(dev, "caps", dev_type) or 0),
             "dev_type_name": type_info.get("name"),
@@ -408,267 +174,34 @@ def register_rl_blueprint(
             pass
         return counts
 
-    def _rl_wled_count():
-        count = 0
-        try:
-            for dev in rl_devicelist:
-                dtype = int(getattr(dev, "dev_type", getattr(dev, "caps", 0)) or 0)
-                if is_wled_dev_type(dtype):
-                    count += 1
-        except Exception:
-            pass
-        return count
-
     bp = Blueprint(
         "racelink",
         __name__,
         template_folder="pages",
         static_folder="static",
-        static_url_path="/racelink/static"
+        static_url_path="/racelink/static",
     )
 
-    # -----------------------
-    # Page
-    # -----------------------
-    @bp.route("/racelink")
-    def rl_render():
-        _ensure_transport_hooked()
-        return templating.render_template(
-            "racelink.html",
-            serverInfo=None,
-            getOption=rhapi.db.option,
-            __=rhapi.__
-        )
-
-    # -----------------------
-    # SSE Events
-    # -----------------------
-    @bp.route("/racelink/api/events")
-    def api_events():
-        _ensure_transport_hooked()
-
-        q = _RLQueue()
-        with _clients_lock:
-            _clients.add(q)
-
-        # Push initial snapshots
-        try:
-            q.put(("master", _master_snapshot()), timeout=0.01)
-            q.put(("task", _task_snapshot()), timeout=0.01)
-        except Exception:
-            pass
-
-        def _encode(event_name: str, payload) -> str:
-            return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',',':'))}\n\n"
-
-        @stream_with_context
-        def gen():
-            # Keep-alive ping every ~15s
-            last_ping = time.time()
-            try:
-                while True:
-                    try:
-                        item = q.get(timeout=1.0)
-                    except Exception:
-                        item = None
-
-                    now = time.time()
-                    if item is None:
-                        if now - last_ping >= 15.0:
-                            last_ping = now
-                            yield ": ping\n\n"
-                        continue
-
-                    ev_name, payload = item
-                    yield _encode(ev_name, payload)
-            finally:
-                with _clients_lock:
-                    try:
-                        _clients.remove(q)
-                    except Exception:
-                        pass
-
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # harmless without nginx, helpful with proxies
-        }
-        return Response(gen(), mimetype="text/event-stream", headers=headers)
-
-    # -----------------------
-    # JSON API: Read
-    # -----------------------
-    @bp.route("/racelink/api/devices", methods=["GET"])
-    def api_devices():
-        with _rl_lock:
-            rows = [_rl_serialize_device(d) for d in rl_devicelist]
-        return jsonify({"ok": True, "devices": rows})
-
-    @bp.route("/racelink/api/specials", methods=["GET"])
-    def api_specials():
-        context = {"rl_instance": rl_instance}
-        return jsonify({
-            "ok": True,
-            "specials": get_specials_config(context=context, serialize_ui=True),
-        })
-
-    @bp.route("/racelink/api/groups", methods=["GET"])
-    def api_groups():
-        with _rl_lock:
-            group_rows = []
-            counts = _rl_group_counts()
-            wled_count = _rl_wled_count()
-            group_rows.append({
-                "id": 0,
-                "name": "Unconfigured",
-                "static": False,
-                "dev_type": 0,
-                "device_count": int(counts.get(0, 0)),
-            })
-            for i, g in enumerate(rl_grouplist):
-                name = getattr(g, "name", f"Group {i}")
-                if str(name).strip().lower() == "unconfigured":
-                    continue
-                if str(name).strip().lower() in {"all wled nodes", "all wled devices"}:
-                    continue
-                gid = i
-                device_count = int(counts.get(i, 0))
-                group_rows.append({
-                    "id": gid,
-                    "name": name,
-                    "static": bool(getattr(g, "static_group", 0)),
-                    "dev_type": int(getattr(g, "dev_type", 0) or 0),
-                    "device_count": device_count,
-                })
-        return jsonify({"ok": True, "groups": group_rows})
-
-    @bp.route("/racelink/api/master", methods=["GET"])
-    def api_master():
-        return jsonify({"ok": True, "master": _master_snapshot(), "task": _task_snapshot()})
-
-    @bp.route("/racelink/api/task", methods=["GET"])
-    def api_task():
-        return jsonify({"ok": True, "task": _task_snapshot()})
-
-    @bp.route("/racelink/api/options", methods=["GET"])
-    def api_options():
-        # still called "effects" for UI legacy; values can represent preset ids
-        opts = effect_select_options(context={"rl_instance": rl_instance})
-        return jsonify({"ok": True, "effects": opts})
-
-    # -----------------------
-    # JSON API: Actions (Tasks)
-    # -----------------------
-    def _start_task(name: str, target_fn, meta: Optional[dict] = None):
-        nonlocal _task_seq, _task
-        with _task_lock:
-            if _task and _task.get("state") == "running":
-                return None
-            _task_seq += 1
-            tid = _task_seq
-            _task_obj = {
-                "id": tid,
-                "name": name,
-                "state": "running",  # running|done|error
-                "started_ts": time.time(),
-                "ended_ts": None,
-                "meta": meta or {},
-                "rx_replies": 0,
-                "rx_window_events": 0,
-                "rx_count_delta_total": 0,
-                "last_error": None,
-                "result": None,
-            }
-            _task = _task_obj
-
-        _broadcast("task", _task_snapshot())
-
-        def runner():
-            try:
-                # hint: something is going out now
-                _set_master(state="TX", tx_pending=True, last_event=f"TASK_{name.upper()}_START")
-                res = target_fn()
-                _task_update(state="done", ended_ts=time.time(), result=res)
-                _set_master(state="IDLE" if not _master.get("rx_window_open") else "RX", last_event=f"TASK_{name.upper()}_DONE")
-                # Tell UI to refresh lists
-                _broadcast("refresh", {"what": ["groups", "devices"]})
-            except Exception as ex:
-                _task_update(state="error", ended_ts=time.time(), last_error=str(ex))
-                _set_master(state="ERROR", last_event=f"TASK_{name.upper()}_ERROR", last_error=str(ex))
-            finally:
-                pass
-
-        th = threading.Thread(target=runner, daemon=True)
-        th.start()
-        return _task_snapshot()
-
-    @bp.route("/racelink/api/discover", methods=["POST"])
-    def api_discover():
-        _ensure_transport_hooked()
-        if _task_is_running():
-            return _task_busy_response()
-
-        body = request.get_json(silent=True) or {}
-        target_gid = body.get("targetGroupId", None)
-        new_group_name = body.get("newGroupName", None)
-
-        # group creation is cheap; do it before starting the radio task
-        created_gid = None
-        with _rl_lock:
-            if new_group_name:
-                g = RL_DeviceGroup(str(new_group_name), static_group=0, dev_type=0)
-                rl_grouplist.append(g)
-                created_gid = len(rl_grouplist) - 1
-                _log(f"RaceLink: Created group '{new_group_name}' (id={created_gid})")
-            if target_gid is None and created_gid is not None:
-                target_gid = created_gid
-
-        def do_discover():
-            # Discovery: ask nodes with groupId=0 and assign to group
-            add_to_group = -1
-            if target_gid not in (None, 0, "0"):
-                add_to_group = int(target_gid)
-            n_found = int(rl_instance.getDevices(groupFilter=0, addToGroup=add_to_group) or 0)
-            return {"found": n_found, "createdGroupId": created_gid, "targetGroupId": target_gid}
-
-        t = _start_task("discover", do_discover, meta={"createdGroupId": created_gid, "targetGroupId": target_gid})
-        if not t:
-            return _task_busy_response()
-        return jsonify({"ok": True, "task": t})
-
-    @bp.route("/racelink/api/status", methods=["POST"])
-    def api_status():
-        _ensure_transport_hooked()
-        if _task_is_running():
-            return _task_busy_response()
-
-        body = request.get_json(silent=True) or {}
-        selection = body.get("selection") or body.get("macs") or []
-        group_id = body.get("groupId", None)
-
-        def do_status():
-            updated = 0
-            if selection:
-                # If plugin has getStatusSelection(selection) prefer it
-                if hasattr(rl_instance, "getStatusSelection"):
-                    updated = int(rl_instance.getStatusSelection(selection) or 0)
-                else:
-                    for mac in selection:
-                        dev = rl_instance.getDeviceFromAddress(mac)
-                        if dev:
-                            updated += int(rl_instance.getStatus(targetDevice=dev) or 0)
-            elif group_id is not None:
-                updated = int(rl_instance.getStatus(groupFilter=int(group_id)) or 0)
-            else:
-                updated = int(rl_instance.getStatus(groupFilter=255) or 0)
-            return {"updated": updated, "groupId": group_id, "selectionCount": len(selection) if selection else 0}
-
-        meta = {"groupId": group_id, "selectionCount": len(selection) if selection else 0}
-        t = _start_task("status", do_status, meta=meta)
-        if not t:
-            return _task_busy_response()
-        return jsonify({"ok": True, "task": t})
-
+    register_runtime_routes(
+        bp,
+        rhapi=rhapi,
+        rl_instance=rl_instance,
+        rl_devicelist=rl_devicelist,
+        rl_grouplist=rl_grouplist,
+        RL_DeviceGroup=RL_DeviceGroup,
+        rl_lock=_rl_lock,
+        queue_factory=_RLQueue,
+        state=state,
+        task_runner=task_runner,
+        transport_hooks=transport_hooks,
+        serializers={"device": _rl_serialize_device, "group_counts": _rl_group_counts},
+        helpers={
+            "specials_config": get_specials_config,
+            "effect_select_options": effect_select_options,
+            "busy_response": busy_task_response,
+            "log": _log,
+        },
+    )
     # -----------------------
     # JSON API: Meta updates (group/name)
     # -----------------------
