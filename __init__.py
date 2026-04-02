@@ -14,7 +14,7 @@ from .data import (
     RL_FLAG_FORCE_TT0,
     RL_FLAG_FORCE_REAPPLY,
 )
-from .plugins.rotorhazard.plugin_runtime import RotorHazardPluginRuntime
+from .plugins.rotorhazard import RotorHazardPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,8 @@ def initialize(rhapi):
 
     global rl_instance, rh_adapter
 
-    rh_adapter = RotorHazardPluginRuntime(rhapi)
-    rl_instance = rh_adapter.initialize()
+    rh_adapter = RotorHazardPlugin.build(rhapi)
+    rl_instance = rh_adapter.start()
 
 
 __all__ = [

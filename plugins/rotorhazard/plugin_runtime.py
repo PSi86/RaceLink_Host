@@ -1,56 +1,68 @@
 from __future__ import annotations
 
-import logging
-
-from eventmanager import Evt
-
 from ...controller import RaceLink_LoRa
 from ...core.app import RaceLinkApp
 from ...core.repository import InMemoryDeviceRepository
-from ...data import RL_DeviceGroup
 from ...providers.rotorhazard_provider import RotorHazardRaceEventAdapter, RotorHazardRaceProvider
-from ...racelink_webui import register_rl_blueprint
+from .features import config_io, events, ui_extensions, web_blueprint
 from .ui import RotorHazardHostUIAdapter
 
-logger = logging.getLogger(__name__)
 
+class RotorHazardPlugin:
+    """RH plugin composition root.
 
-class RotorHazardPluginRuntime:
-    """RH-specific facade that owns `rhapi` and bridges RH events to RaceLinkApp callbacks."""
+    Owns RH-specific wiring and feature activation; core app only receives abstract ports.
+    """
 
-    def __init__(self, rhapi):
+    def __init__(self, rhapi, app: RaceLinkApp, controller: RaceLink_LoRa, repository: InMemoryDeviceRepository, feature_flags=None):
         self.rhapi = rhapi
-        self.repository = InMemoryDeviceRepository()
-        self.race_provider = RotorHazardRaceProvider(rhapi)
-        self.race_events = RotorHazardRaceEventAdapter(rhapi)
-        self.controller: RaceLink_LoRa | None = None
-        self.app: RaceLinkApp | None = None
+        self.app = app
+        self.controller = controller
+        self.repository = repository
+        self.feature_flags = {
+            "events": True,
+            "ui_extensions": True,
+            "web_blueprint": True,
+            "config_io": True,
+            **(feature_flags or {}),
+        }
 
-    def initialize(self) -> RaceLink_LoRa:
-        self.controller = RaceLink_LoRa(
-            self.rhapi,
+    @classmethod
+    def build(cls, rhapi, *, feature_flags=None) -> "RotorHazardPlugin":
+        repository = InMemoryDeviceRepository()
+        race_provider = RotorHazardRaceProvider(rhapi)
+        race_events = RotorHazardRaceEventAdapter(rhapi)
+
+        controller = RaceLink_LoRa(
+            rhapi,
             "RaceLink_LoRa",
             "RaceLink",
-            repository=self.repository,
-            race_provider=self.race_provider,
-            race_event_port=self.race_events,
+            repository=repository,
+            race_provider=race_provider,
+            race_event_port=race_events,
         )
-        self.app = self.controller.app
-        host_ui = RotorHazardHostUIAdapter(self.controller)
-        self.controller.bind_host_ui(host_ui)
+        controller.bind_host_ui(RotorHazardHostUIAdapter(controller))
 
-        register_rl_blueprint(
-            self.rhapi,
-            rl_instance=self.controller,
-            rl_devicelist=self.repository.device_items,
-            rl_grouplist=self.repository.group_items,
-            RL_DeviceGroup=RL_DeviceGroup,
-            logger=logger,
+        return cls(
+            rhapi=rhapi,
+            app=controller.app,
+            controller=controller,
+            repository=repository,
+            feature_flags=feature_flags,
         )
 
-        self.rhapi.events.on(Evt.DATA_IMPORT_INITIALIZE, self.controller.host_ui.register_rl_dataimporter)
-        self.rhapi.events.on(Evt.DATA_EXPORT_INITIALIZE, self.controller.host_ui.register_rl_dataexporter)
-        self.rhapi.events.on(Evt.ACTIONS_INITIALIZE, self.controller.host_ui.registerActions)
-        self.rhapi.events.on(Evt.STARTUP, self.controller.onStartup)
+    def start(self) -> RaceLink_LoRa:
+        if self.feature_flags.get("web_blueprint", True):
+            web_blueprint.activate(self)
+        if self.feature_flags.get("config_io", True):
+            config_io.activate(self)
+        if self.feature_flags.get("ui_extensions", True):
+            ui_extensions.activate(self)
+        if self.feature_flags.get("events", True):
+            events.activate(self)
 
         return self.controller
+
+
+# Backward-compatible alias for older imports.
+RotorHazardPluginRuntime = RotorHazardPlugin

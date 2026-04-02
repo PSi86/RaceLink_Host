@@ -1,104 +1,17 @@
 from __future__ import annotations
 
-import logging
-from collections import defaultdict
-from typing import Any, Callable
-
-from eventmanager import Evt
-
 from ..controller import RaceLink_LoRa
-from ..core.repository import InMemoryDeviceRepository
-from ..data import RL_DeviceGroup
-from ..racelink_webui import register_rl_blueprint
-from ..providers.rotorhazard_provider import RotorHazardRaceEventAdapter, RotorHazardRaceProvider
-from ..plugins.rotorhazard.ui import RotorHazardHostUIAdapter
-from .ports import ConfigStorePort, EventBusPort, UINotificationPort
-
-logger = logging.getLogger(__name__)
-
-
-class RHEventBus(EventBusPort):
-    def __init__(self, rhapi):
-        self._rhapi = rhapi
-        self._listeners: dict[str, list[Callable[[Any], None]]] = defaultdict(list)
-
-    def subscribe(self, event_name: str, handler: Callable[[Any], None]) -> None:
-        self._listeners[event_name].append(handler)
-        self._rhapi.events.on(event_name, handler)
-
-    def publish(self, event_name: str, payload: Any = None) -> None:
-        trigger = getattr(self._rhapi.events, "trigger", None)
-        if callable(trigger):
-            trigger(event_name, payload)
-            return
-
-        for handler in list(self._listeners.get(event_name, [])):
-            handler(payload)
-
-
-class RHConfigStore(ConfigStorePort):
-    def __init__(self, rhapi):
-        self._rhapi = rhapi
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._rhapi.db.option(key, default)
-
-    def set(self, key: str, value: Any) -> None:
-        self._rhapi.db.option_set(key, value)
-
-
-class RHUINotifier(UINotificationPort):
-    def __init__(self, rhapi):
-        self._rhapi = rhapi
-
-    def notify(self, message: str, level: str = "info") -> None:
-        # RH API typically offers `notify`; keep fallback to logger.
-        notifier = getattr(self._rhapi.ui, "notify", None)
-        if callable(notifier):
-            notifier(message, level)
-        else:
-            logger.info("[%s] %s", level.upper(), message)
-
-    def broadcast_ui(self, panel: str) -> None:
-        self._rhapi.ui.broadcast_ui(panel)
+from ..plugins.rotorhazard import RotorHazardPlugin
 
 
 class RotorHazardAdapter:
-    """Adapter wiring RaceLink to RotorHazard runtime (`rhapi`)."""
+    """Compatibility adapter delegating RH runtime wiring to `RotorHazardPlugin`."""
 
-    def __init__(self, rhapi):
+    def __init__(self, rhapi, feature_flags=None):
         self.rhapi = rhapi
-        self.repository = InMemoryDeviceRepository()
-        self.event_bus = RHEventBus(rhapi)
-        self.config_store = RHConfigStore(rhapi)
-        self.ui = RHUINotifier(rhapi)
-        self.race_provider = RotorHazardRaceProvider(rhapi)
-        self.race_events = RotorHazardRaceEventAdapter(rhapi)
-        self.rl_instance: RaceLink_LoRa | None = None
+        self.feature_flags = feature_flags or {}
+        self.plugin: RotorHazardPlugin | None = None
 
     def initialize(self) -> RaceLink_LoRa:
-        self.rl_instance = RaceLink_LoRa(
-            self.rhapi,
-            "RaceLink_LoRa",
-            "RaceLink",
-            repository=self.repository,
-            race_provider=self.race_provider,
-            race_event_port=self.race_events,
-        )
-
-        self.rl_instance.bind_host_ui(RotorHazardHostUIAdapter(self.rl_instance))
-
-        register_rl_blueprint(
-            self.rhapi,
-            rl_instance=self.rl_instance,
-            rl_devicelist=self.repository.device_items,
-            rl_grouplist=self.repository.group_items,
-            RL_DeviceGroup=RL_DeviceGroup,
-            logger=logger,
-        )
-
-        self.event_bus.subscribe(Evt.DATA_IMPORT_INITIALIZE, self.rl_instance.host_ui.register_rl_dataimporter)
-        self.event_bus.subscribe(Evt.DATA_EXPORT_INITIALIZE, self.rl_instance.host_ui.register_rl_dataexporter)
-        self.event_bus.subscribe(Evt.ACTIONS_INITIALIZE, self.rl_instance.host_ui.registerActions)
-        self.event_bus.subscribe(Evt.STARTUP, self.rl_instance.onStartup)
-        return self.rl_instance
+        self.plugin = RotorHazardPlugin.build(self.rhapi, feature_flags=self.feature_flags)
+        return self.plugin.start()
