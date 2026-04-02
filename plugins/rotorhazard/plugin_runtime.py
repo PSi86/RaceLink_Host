@@ -60,8 +60,12 @@ class RotorHazardPlugin:
             ui_extensions.activate(self)
         if self.feature_flags.get("events", True):
             events.activate(self)
+        self.app.start_event_stream()
 
         return self.controller
+
+    def stop(self) -> None:
+        self.app.stop_event_stream()
 
 
 # Backward-compatible alias for older imports.

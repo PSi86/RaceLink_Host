@@ -47,8 +47,19 @@ class RaceLinkApp:
             self.save_to_db,
             self.repository,
         )
-        if self.race_event_port is not None:
-            self.race_event_port.start(self.on_race_event)
+        self._event_stream_started = False
+
+    def start_event_stream(self) -> None:
+        if self.race_event_port is None or self._event_stream_started:
+            return
+        self.race_event_port.start(self.on_race_event)
+        self._event_stream_started = True
+
+    def stop_event_stream(self) -> None:
+        if self.race_event_port is None or not self._event_stream_started:
+            return
+        self.race_event_port.stop()
+        self._event_stream_started = False
 
     def on_race_event(self, event: HostRaceEvent) -> None:
         event_type = getattr(event, "type", None)
