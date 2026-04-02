@@ -67,3 +67,17 @@ Ziel: Services und App-Layer arbeiten primär gegen Port-Interfaces; konkrete Tr
    - `controller.py` delegiert weiter; Aufrufer bleiben unverändert, während intern schrittweise umgestellt wird.
 5. **Legacy-Pfade entfernen**
    - Nach erfolgreicher Nutzung der Ports direkte Kopplungen und Übergangscode in kleinen PRs abbauen.
+
+
+## WebUI-Teilung (RotorHazard Presentation)
+
+Die Runtime-WebUI wurde in kleinere Module getrennt, um Verantwortlichkeiten klar zu isolieren:
+
+- `plugins/rotorhazard/presentation/racelink_webui.py`: Composition-Root (Dependency-Wiring + Blueprint-Registrierung)
+- `plugins/rotorhazard/presentation/webui/sse_state.py`: SSE-State, Client-Registry, Broadcast
+- `plugins/rotorhazard/presentation/webui/task_runner.py`: Busy-Gate und Task-Lifecycle
+- `plugins/rotorhazard/presentation/webui/transport_hooks.py`: Transport-Event-Hooking
+- `plugins/rotorhazard/presentation/webui/routes_runtime.py`: Runtime-Endpunkte nach Domäne
+- `plugins/rotorhazard/presentation/webui/utils.py`: gemeinsame Response-/Address-Helfer
+
+Damit bleibt die äußere Plugin-Schnittstelle unverändert (`register_rl_blueprint(...)`), während interne Verantwortlichkeiten schicht- und domänengerecht getrennt sind.
