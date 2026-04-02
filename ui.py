@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 class RaceLinkUIMixin:
     def _get_select_options(self, fn_key: str, var_key: str):
-        context = {"rhapi": self._rhapi, "gc": self}
+        context = {"rhapi": self._race_host, "gc": self}
         specials = get_specials_config(context=context)
         for cap_info in specials.values():
             for fn_info in cap_info.get("functions", []) or []:
@@ -82,7 +82,7 @@ class RaceLinkUIMixin:
         return rh_register_dataexporter(self, args)
 
     def registerHandlers(self, args):
-        self._rhapi.ui.message_notify("text")
+        self._notifier.notify("text")
 
     def nodeSwitch(self, action, args=None):
         if "rl_action_device" in action:
@@ -99,14 +99,14 @@ class RaceLinkUIMixin:
 
         if "manual" in action:
             logger.debug("Manual triggered")
-            target_device = self.getDeviceFromAddress(self._rhapi.db.option("rl_quickset_device", None))
+            target_device = self.getDeviceFromAddress(self._race_host.option("rl_quickset_device", None))
             if target_device is None:
                 logger.warning("nodeSwitch(manual): device not found in DB option")
                 return
             self.control_service.apply_device_switch(
                 target_device=target_device,
-                brightness=int(self._rhapi.db.option("rl_quickset_brightness", None)),
-                preset_id=int(self._rhapi.db.option("rl_quickset_effect", None)),
+                brightness=int(self._race_host.option("rl_quickset_brightness", None)),
+                preset_id=int(self._race_host.option("rl_quickset_effect", None)),
             )
 
     def groupSwitch(self, action, args=None):
@@ -121,14 +121,14 @@ class RaceLinkUIMixin:
         if "manual" in action:
             logger.debug("Manual triggered")
             self.control_service.apply_group_switch(
-                group_id=int(self._rhapi.db.option("rl_quickset_group", None)),
-                brightness=int(self._rhapi.db.option("rl_quickset_brightness", None)),
-                preset_id=int(self._rhapi.db.option("rl_quickset_effect", None)),
+                group_id=int(self._race_host.option("rl_quickset_group", None)),
+                brightness=int(self._race_host.option("rl_quickset_brightness", None)),
+                preset_id=int(self._race_host.option("rl_quickset_effect", None)),
             )
 
     def discoveryAction(self, args):
-        group_selected = int(self._rhapi.db.option("rl_assignToGroup", None))
-        new_group_str = self._rhapi.db.option("rl_assignToNewGroup", None)
+        group_selected = int(self._race_host.option("rl_assignToGroup", None))
+        new_group_str = self._race_host.option("rl_assignToNewGroup", None)
 
         if group_selected == 0:
             if not new_group_str:
@@ -145,8 +145,8 @@ class RaceLinkUIMixin:
             self.register_settings()
             self.register_quickset_ui()
             self.registerActions()
-            self._rhapi.ui.broadcast_ui("settings")
-            self._rhapi.ui.broadcast_ui("run")
+            self._ui_extension.broadcast_ui("settings")
+            self._ui_extension.broadcast_ui("run")
 
     def rl_write_json(self, data):
         return rh_rl_write_json(self, data)

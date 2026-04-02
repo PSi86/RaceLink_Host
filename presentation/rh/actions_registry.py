@@ -41,7 +41,7 @@ def registerActions(gc, args=None):
         )
     )
 
-    specials = get_specials_config(context={"rhapi": gc._rhapi, "gc": gc})
+    specials = get_specials_config(context={"rhapi": gc._race_host, "gc": gc})
     for cap_key, cap_info in specials.items():
         funcs = cap_info.get("functions", []) or []
         if not funcs:

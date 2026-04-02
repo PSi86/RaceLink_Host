@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from typing import Any, Callable, Protocol
+
+
+class RaceHostPort(Protocol):
+    """Host runtime abstraction (storage, events, translation, race context)."""
+
+    def option(self, key: str, default: Any = None) -> Any: ...
+
+    def option_set(self, key: str, value: Any) -> None: ...
+
+    def on(self, event_name: str, handler: Callable[[Any], None]) -> None: ...
+
+    def trigger(self, event_name: str, payload: Any = None) -> None: ...
+
+    def translate(self, text: str) -> str: ...
+
+    @property
+    def race(self) -> Any: ...
+
+    @property
+    def racecontext(self) -> Any: ...
+
+
+class NotificationPort(Protocol):
+    """User-visible notifications."""
+
+    def notify(self, message: str, level: str = "info") -> None: ...
+
+
+class UiExtensionPort(Protocol):
+    """UI extension registration + panel refresh."""
+
+    def broadcast_ui(self, panel: str) -> None: ...
+
+    def register_panel(self, panel_id: str, title: str, location: str) -> None: ...
+
+    def register_option(self, option: Any, panel_id: str) -> None: ...
+
+    def register_quickbutton(self, panel_id: str, button_id: str, label: str, handler: Callable[..., Any], args: dict | None = None) -> None: ...
+
+    def blueprint_add(self, blueprint: Any) -> None: ...

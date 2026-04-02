@@ -12,16 +12,16 @@ def register_settings(gc):
     temp_ui_group_list = [UIFieldSelectOption(0, "New Group")]
     temp_ui_group_list += gc.uiDiscoveryGroupList
 
-    gc._rhapi.ui.register_panel("rl_settings", "RaceLink Plugin", "settings")
-    gc._rhapi.fields.register_option(
+    gc._ui_extension.register_panel("rl_settings", "RaceLink Plugin", "settings")
+    gc._ui_extension.register_option(
         UIField("rl_device_config", "Device Config", UIFieldType.TEXT, private=False),
         "rl_settings",
     )
-    gc._rhapi.fields.register_option(
+    gc._ui_extension.register_option(
         UIField("rl_groups_config", "Groups Config", UIFieldType.TEXT, private=False),
         "rl_settings",
     )
-    gc._rhapi.fields.register_option(
+    gc._ui_extension.register_option(
         UIField(
             "rl_assignToGroup",
             "Add discovered Devices to Group",
@@ -31,32 +31,32 @@ def register_settings(gc):
         ),
         "rl_settings",
     )
-    gc._rhapi.fields.register_option(
+    gc._ui_extension.register_option(
         UIField("rl_assignToNewGroup", "New Group Name", UIFieldType.TEXT, private=False),
         "rl_settings",
     )
-    gc._rhapi.ui.register_quickbutton(
+    gc._ui_extension.register_quickbutton(
         "rl_settings",
         "rl_btn_set_defaults",
         "Save Configuration",
         gc.save_to_db,
         args={"manual": True},
     )
-    gc._rhapi.ui.register_quickbutton(
+    gc._ui_extension.register_quickbutton(
         "rl_settings",
         "rl_btn_force_groups",
         "Set all Groups",
         gc.forceGroups,
         args={"manual": True},
     )
-    gc._rhapi.ui.register_quickbutton(
+    gc._ui_extension.register_quickbutton(
         "rl_settings",
         "rl_btn_get_devices",
         "Discover Devices",
         gc.discoveryAction,
         args={"manual": True},
     )
-    gc._rhapi.ui.register_quickbutton(
+    gc._ui_extension.register_quickbutton(
         "rl_settings",
         "rl_run_autodetect",
         "Detect USB Communicator",

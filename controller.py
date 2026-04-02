@@ -11,7 +11,6 @@ from .core.services.device_service import DeviceService
 from .core.services.startblock_service import StartblockService
 from .infrastructure.lora_transport_adapter import LoRaTransportAdapter
 from .ui import RaceLinkUIMixin
-from .providers.rotorhazard_provider import RotorHazardRaceProvider
 from RHUI import UIFieldSelectOption
 from .data import (
     RL_Device,
@@ -105,8 +104,10 @@ def build_startblock_payload_v1(
 
 
 class RaceLink_LoRa(RaceLinkUIMixin):
-    def __init__(self, rhapi, name, label, repository: InMemoryDeviceRepository | None = None, race_provider=None):
-        self._rhapi = rhapi
+    def __init__(self, race_host, notifier, ui_extension, name, label, repository: InMemoryDeviceRepository | None = None, race_provider=None):
+        self._race_host = race_host
+        self._notifier = notifier
+        self._ui_extension = ui_extension
         self.name = name
         self.label = label
         self.lora = None
@@ -119,7 +120,8 @@ class RaceLink_LoRa(RaceLinkUIMixin):
         self.uiDiscoveryGroupList = None
         self.repository = repository or InMemoryDeviceRepository()
         self.transport_adapter = LoRaTransportAdapter(
-            rhapi=self._rhapi,
+            race_host=self._race_host,
+            notifier=self._notifier,
             get_device_by_address=self.getDeviceFromAddress,
             on_status_update=self._on_status_update,
             on_identify_update=self._on_identify_update,
@@ -129,7 +131,7 @@ class RaceLink_LoRa(RaceLinkUIMixin):
         self.device_service = DeviceService(self.transport_adapter, self.repository, notifier=self)
         self.control_service = ControlService(self.transport_adapter, self.repository)
         self.config_service = ConfigService(self.transport_adapter, device_lookup=self)
-        self.race_provider = race_provider or RotorHazardRaceProvider(self._rhapi)
+        self.race_provider = race_provider
         self.startblock_service = StartblockService(
             self.transport_adapter,
             self.control_service,
@@ -161,27 +163,27 @@ class RaceLink_LoRa(RaceLinkUIMixin):
 
     def save_to_db(self, args):
         logger.debug("RL: Writing current states to Database")
-        self._rhapi.db.option_set("rl_device_config", LegacyConfigMigration.dump_devices(self.repository))
-        self._rhapi.db.option_set("rl_groups_config", LegacyConfigMigration.dump_groups(self.repository))
+        self._race_host.option_set("rl_device_config", LegacyConfigMigration.dump_devices(self.repository))
+        self._race_host.option_set("rl_groups_config", LegacyConfigMigration.dump_groups(self.repository))
 
     def load_from_db(self):
         logger.debug("RL: Applying config from Database")
-        config_str_devices = self._rhapi.db.option("rl_device_config", None)
-        config_str_groups = self._rhapi.db.option("rl_groups_config", None)
+        config_str_devices = self._race_host.option("rl_device_config", None)
+        config_str_groups = self._race_host.option("rl_groups_config", None)
 
         if config_str_devices is None:
             config_str_devices = "[]"
-            self._rhapi.db.option_set("rl_device_config", config_str_devices)
+            self._race_host.option_set("rl_device_config", config_str_devices)
 
         if config_str_devices == "":
             config_str_devices = "[]"
-            self._rhapi.db.option_set("rl_device_config", config_str_devices)
+            self._race_host.option_set("rl_device_config", config_str_devices)
 
         LegacyConfigMigration.load_devices_into_repo(config_str_devices, self.repository)
 
         if config_str_groups is None or config_str_groups == "":
             config_str_groups = str([{"name": "All WLED Nodes", "static_group": 1, "dev_type": 0}])
-            self._rhapi.db.option_set("rl_groups_config", config_str_groups)
+            self._race_host.option_set("rl_groups_config", config_str_groups)
 
         LegacyConfigMigration.load_groups_into_repo(config_str_groups, self.repository)
 
@@ -191,8 +193,8 @@ class RaceLink_LoRa(RaceLinkUIMixin):
         self.register_settings()
         self.register_quickset_ui()
         self.registerActions()
-        self._rhapi.ui.broadcast_ui("settings")
-        self._rhapi.ui.broadcast_ui("run")
+        self._ui_extension.broadcast_ui("settings")
+        self._ui_extension.broadcast_ui("run")
 
     def discoverPort(self, args):
         self.ready = self.transport_adapter.discover_port(args)
@@ -510,7 +512,7 @@ class RaceLink_LoRa(RaceLinkUIMixin):
         return self.getDeviceFromAddress(addr)
 
     def notify(self, msg: str) -> None:
-        self._rhapi.ui.message_notify(msg)
+        self._notifier.notify(msg)
 
     @staticmethod
     def _to_hex_str(addr: Union[str, bytes, bytearray, None]) -> str:

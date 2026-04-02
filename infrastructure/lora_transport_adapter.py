@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class LoRaTransportAdapter:
-    def __init__(self, rhapi, get_device_by_address, on_status_update, on_identify_update, on_disconnect, repository):
-        self._rhapi = rhapi
+    def __init__(self, race_host, notifier, get_device_by_address, on_status_update, on_identify_update, on_disconnect, repository):
+        self._race_host = race_host
+        self._notifier = notifier
         self._get_device = get_device_by_address
         self._on_status_update = on_status_update
         self._on_identify_update = on_identify_update
@@ -28,7 +29,7 @@ class LoRaTransportAdapter:
         self._last_error_notify_ts = 0.0
 
     def discover_port(self, args):
-        port = self._rhapi.db.option("psi_comms_port", None)
+        port = self._race_host.option("psi_comms_port", None)
         try:
             self._transport_hooks_installed = False
             self.lora = LoRaUSB(port=port, on_event=None)
@@ -39,15 +40,15 @@ class LoRaTransportAdapter:
                 used = self.lora.port or "unknown"
                 mac = getattr(self.lora, "ident_mac", None)
                 if mac and "manual" in args:
-                    self._rhapi.ui.message_notify(self._rhapi.__("RaceLink Communicator ready on {} with MAC: {}").format(used, mac))
+                    self._notifier.notify(self._race_host.translate("RaceLink Communicator ready on {} with MAC: {}").format(used, mac))
                 return True
             if "manual" in args:
-                self._rhapi.ui.message_notify(self._rhapi.__("No RaceLink Communicator module discovered or configured"))
+                self._notifier.notify(self._race_host.translate("No RaceLink Communicator module discovered or configured"))
             return False
         except Exception as ex:
             logger.error("LoRaUSB init failed: %s", ex)
             if "manual" in args:
-                self._rhapi.ui.message_notify(self._rhapi.__("Failed to initialize communicator: {}").format(str(ex)))
+                self._notifier.notify(self._race_host.translate("Failed to initialize communicator: {}").format(str(ex)), level="error")
             return False
 
     def ensure_ready(self, context: str):
@@ -192,7 +193,7 @@ class LoRaTransportAdapter:
         if (now - self._last_error_notify_ts) > 2:
             self._last_error_notify_ts = now
             try:
-                self._rhapi.ui.message_notify(self._rhapi.__("RaceLink Communicator disconnected: {}").format(reason))
+                self._notifier.notify(self._race_host.translate("RaceLink Communicator disconnected: {}").format(reason), level="warning")
             except Exception:
                 logger.exception("RaceLink: failed to notify UI about disconnect")
         self._on_disconnect()

@@ -62,13 +62,42 @@ class _StandaloneUI:
     def broadcast_ui(self, panel: str):
         self._notifier.broadcast_ui(panel)
 
+    def register_panel(self, panel_id: str, title: str, location: str):
+        return None
+
+    def register_option(self, option: Any, panel_id: str):
+        return None
+
+    def register_quickbutton(self, panel_id: str, button_id: str, label: str, handler: Callable[..., Any], args: dict | None = None):
+        return None
+
+    def blueprint_add(self, blueprint: Any):
+        return None
+
 
 class _StandaloneRHAPI:
-    """Minimal RHAPI-compatible facade for standalone execution."""
+    """Minimal host-port-compatible facade for standalone execution."""
 
     def __init__(self, config: InMemoryConfigStore, notifier: FlaskUINotifier):
         self.db = _StandaloneDB(config)
         self.ui = _StandaloneUI(notifier)
+        self.race = None
+        self.racecontext = None
+
+    def option(self, key: str, default: Any = None):
+        return self.db.option(key, default)
+
+    def option_set(self, key: str, value: Any):
+        self.db.option_set(key, value)
+
+    def on(self, event_name: str, handler: Callable[[Any], None]) -> None:
+        return None
+
+    def trigger(self, event_name: str, payload: Any = None) -> None:
+        return None
+
+    def translate(self, text: str) -> str:
+        return text
 
 
 class FlaskStandaloneAdapter:
@@ -78,6 +107,9 @@ class FlaskStandaloneAdapter:
         self.config_store = InMemoryConfigStore()
         self.ui = FlaskUINotifier()
         self.rhapi = _StandaloneRHAPI(self.config_store, self.ui)
+        self.race_host = self.rhapi
+        self.ui_extension = self.rhapi.ui
+        self.notifier = self.ui
         self.rl_instance: RaceLink_LoRa | None = None
 
     def create_app(self) -> Flask:
@@ -96,9 +128,12 @@ class FlaskStandaloneAdapter:
 
     def initialize(self) -> RaceLink_LoRa:
         self.rl_instance = RaceLink_LoRa(
-            self.rhapi,
-            "RaceLink_LoRa",
-            "RaceLink Standalone",
+            race_host=self.race_host,
+            notifier=self.notifier,
+            ui_extension=self.ui_extension,
+            name="RaceLink_LoRa",
+            label="RaceLink Standalone",
             repository=self.repository,
+            race_provider=None,
         )
         return self.rl_instance
