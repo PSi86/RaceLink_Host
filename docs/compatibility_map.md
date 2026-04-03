@@ -1,8 +1,10 @@
 # Compatibility Map (Backward-Compat / Legacy APIs)
 
-Stand: 2026-04-02.
+Stand: 2026-04-03.
 
 Dieses Dokument erfasst bestehende Kompatibilitäts-Shims und Legacy-Aliase, benennt den Zielpfad (neuer API-Name), dokumentiert bekannte aktive Nutzung und definiert Bereinigungskriterien inkl. geplantem Meilenstein.
+
+> Update 2026-04-03: Top-Level-`providers/*` wurde entfernt. Gültige Provider-Importpfade sind `plugins.rotorhazard.providers.*` (produktiver RH-Host) und `plugins.mock.providers.*` (Beispiel-/Dev-Plugin).
 
 ## 1) Backward-Compat Import-Shims (`platform/*`) — **historisch (entfernt)**
 
@@ -24,6 +26,13 @@ Die frühere Kompatibilitätsschicht unter `platform/*` wurde im Major-Cleanup a
 | `discoverPort(args)` | `discover_port(args)` | Legacy-Wrapper vorhanden; Settings-Button nutzt Snake Case. | Externe Aufrufer auf `discover_port` umstellen. | Keine Callback-Registrierung mehr auf `discoverPort`. | **M2 erledigt**, **M3** entfernen. |
 | `getDeviceFromAddress(addr)` | `get_device_from_address(addr)` | Legacy-Wrapper für Alt-Aufrufer (WebUI/Alt-Integrationen). | Neue Aufrufer nur Snake Case. | Keine CamelCase-Aufrufe mehr. | **M2** beibehalten, **M3** entfernen. |
 | `forceGroups(args, sanityCheck)` | `force_groups(args, sanity_check)` | Legacy-Wrapper für Alt-Aufrufer. | Neue Aufrufer nur Snake Case. | Keine CamelCase-Aufrufe mehr. | **M2** beibehalten, **M3** entfernen. |
+
+## 2.5) Provider-Default im Controller (Runtime-Verhalten)
+
+| Verhalten | Status | Details | Migrationshinweis |
+|---|---|---|---|
+| Impliziter `MockRaceProvider` im Controller | **Entfernt am 2026-04-03** | `RaceLink_LoRa` importiert kein Top-Level-`providers.*` mehr. | Host-Plugin soll den gewünschten `RaceProviderPort` explizit injizieren. |
+| Default ohne injizierten Provider | **Aktiv** | Fallback auf neutralen `core.ports.noop_race_provider.NoOpRaceProvider` (liefert nur leere Werte/`None`). | Für produktive Daten immer hostspezifischen Provider (z. B. `plugins.rotorhazard.providers.RotorHazardRaceProvider`) übergeben. |
 
 ## 3) Legacy-Methoden / Alias-Namen in `plugins/rotorhazard/ui/host_ui_adapter.py`
 
