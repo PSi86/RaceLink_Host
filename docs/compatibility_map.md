@@ -31,6 +31,7 @@ Die frühere Kompatibilitätsschicht unter `platform/*` wurde im Major-Cleanup a
 
 | Verhalten | Status | Details | Migrationshinweis |
 |---|---|---|---|
+| Impliziter `NoOpRaceProvider` im Controller | **Entfernt am 2026-04-03** | Der frühere NoOp-Fallback ist entfernt und wird nicht mehr als Default verwendet. | Aufrufer müssen den gewünschten `RaceProviderPort` explizit injizieren. |
 | Impliziter `MockRaceProvider` im Controller | **Entfernt am 2026-04-03** | `RaceLink_LoRa` importiert kein Top-Level-`providers.*` mehr. | Host-Plugin soll den gewünschten `RaceProviderPort` explizit injizieren. |
 | Default ohne injizierten Provider | **Entfernt am 2026-04-03** | Kein Fallback mehr: `RaceLink_LoRa` erwartet einen injizierten `RaceProviderPort` und wirft sonst `ValueError`. | Host-Plugin muss immer einen hostspezifischen Provider (z. B. `plugins.rotorhazard.providers.RotorHazardRaceProvider`) übergeben. |
 
