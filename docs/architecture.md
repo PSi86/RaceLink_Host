@@ -22,6 +22,8 @@
 - RH-Race-Provider und RH-Event-Adapter wurden nach `plugins/rotorhazard/providers/` verschoben.
 - Das frühere Top-Level-Verzeichnis `providers/` wurde entfernt. Host-spezifische Provider liegen ausschließlich unter `plugins/<host>/providers/`.
 - `controller.py` nutzt **keinen** impliziten Mock-Provider mehr; Host-Plugins müssen einen produktiven `RaceProviderPort` explizit übergeben. Ohne Übergabe bricht die Initialisierung mit `ValueError` ab.
+- `RaceLink_LoRa` besitzt **keinen** Default-`RaceProviderPort` mehr; der Provider wird ausschließlich durch das aktive Plugin bereitgestellt.
+- Plugin-basierte Provider-Injektion ist Pflicht: Das aktive Host-Plugin verdrahtet Event- und Race-Provider explizit beim Bootstrap/Runtime-Wiring.
 - Die produktive Presentation-Schicht (Blueprint + Templates + Static Assets) liegt unter `plugins/rotorhazard/presentation/`.
 - Das Top-Level-Verzeichnis `presentation/` ist **kein** Laufzeit- oder Packaging-Entry-Point und wurde entfernt, um den Importpfad eindeutig auf `plugins.rotorhazard.presentation` zu halten.
 - Die frühere Kompatibilitätsschicht `platform/*` wurde im Major-Cleanup am 2026-04-02 entfernt; gültige Importpfade sind `plugins.rotorhazard.*`, `plugins.standalone.*` und `adapters.ports`.

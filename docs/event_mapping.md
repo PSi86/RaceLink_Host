@@ -37,7 +37,7 @@ Als Referenz ist im Beispielplugin `plugins/mock/providers/mock_provider.py` ein
 {"race_state": "running", "heat_id": 3}
 ```
 
-Hinweis zum Default-Wiring: `controller.py` nutzt keinen impliziten Mock-Provider aus einem Root-`providers`-Pfad mehr. Der aktive Host muss einen `RaceProviderPort` injizieren; ohne Provider schlägt die Initialisierung mit `ValueError` fehl.
+Wiring-Hinweis: Event-Provider (`HostRaceEventPort`) und Race-Provider (`RaceProviderPort`) werden über das aktive Host-Plugin verdrahtet. `RaceLink_LoRa` setzt keinen NoOp-/Mock-Default und erwartet die explizite Plugin-Injektion beim Bootstrap.
 
 ## Daten-Mapping für Startblock
 
