@@ -21,7 +21,7 @@ Die App-Orchestrierung (`core/app/racelink_app.py`) registriert den Event-Sink u
 
 ## Integration ohne Host-Eventbus (Polling)
 
-Als Referenz ist in `providers/mock_provider.py` ein minimaler Polling-Adapter enthalten:
+Als Referenz ist im Beispielplugin `plugins/mock/providers/mock_provider.py` ein minimaler Polling-Adapter enthalten:
 
 - `MockPollingRaceEventAdapter(state_supplier, interval_s=0.5)`
 - zyklische Abfrage über `state_supplier()`
@@ -36,6 +36,8 @@ Als Referenz ist in `providers/mock_provider.py` ein minimaler Polling-Adapter e
 ```python
 {"race_state": "running", "heat_id": 3}
 ```
+
+Hinweis zum Default-Wiring: `controller.py` nutzt keinen impliziten Mock-Provider aus einem Root-`providers`-Pfad mehr. Ohne injizierten Host-Provider wird neutral `NoOpRaceProvider` (`core/ports/noop_race_provider.py`) verwendet.
 
 ## Daten-Mapping für Startblock
 
