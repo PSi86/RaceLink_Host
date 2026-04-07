@@ -154,11 +154,12 @@ class RL_DeviceGroup:
 
 
 class RL_Dev_Type:
-    IDENTIFY_COMMUNICATOR = 1
-    WLED_REV1 = 10
-    WLED_REV3 = 11
-    WLED_REV4 = 12
-    WLED_STARTBLOCK_REV3 = 50
+    GATEWAY_REV1 = 1
+    NODE_WLED_REV1 = 10
+    NODE_WLED_REV3 = 11
+    NODE_WLED_REV4 = 12
+    NODE_WLED_REV5 = 13
+    NODE_WLED_STARTBLOCK_REV3 = 50
 
 RL_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX", "WLED"]
 
@@ -229,11 +230,12 @@ RL_SPECIALS = {
 }
 
 RL_DEV_TYPE_INFO = {
-    RL_Dev_Type.IDENTIFY_COMMUNICATOR: {"name": "IDENTIFY_COMMUNICATOR"},
-    RL_Dev_Type.WLED_REV1: {"name": "WLED_REV1", "caps": ["WLED"]},
-    RL_Dev_Type.WLED_REV3: {"name": "WLED_REV3", "caps": ["WLED"]},
-    RL_Dev_Type.WLED_REV4: {"name": "WLED_REV4", "caps": ["WLED"]},
-    RL_Dev_Type.WLED_STARTBLOCK_REV3: {"name": "WLED_STARTBLOCK_REV3", "caps": ["STARTBLOCK", "WLED"]},
+    RL_Dev_Type.GATEWAY_REV1: {"name": "Gateway_Rev1"},
+    RL_Dev_Type.NODE_WLED_REV1: {"name": "WLED_Rev1", "caps": ["WLED"]},
+    RL_Dev_Type.NODE_WLED_REV3: {"name": "WLED_Rev3", "caps": ["WLED"]},
+    RL_Dev_Type.NODE_WLED_REV4: {"name": "WLED_Rev4", "caps": ["WLED"]},
+    RL_Dev_Type.NODE_WLED_REV5: {"name": "WLED_Rev5", "caps": ["WLED"]},
+    RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3: {"name": "WLED_Startblock_Rev3", "caps": ["STARTBLOCK", "WLED"]},
 }
 
 

@@ -8,6 +8,17 @@
 // Broadcast: receiver3 == FF:FF:FF
 // NOTE: All multi-byte fields are little-endian.
 
+// Device Type Lookup (unused, only for reference)
+enum RL_Dev_Type : uint8_t {
+  GATEWAY_REV1 = 1,
+  NODE_WLED_REV1 = 10,
+  NODE_WLED_REV3 = 11,
+  NODE_WLED_REV4 = 12,
+  NODE_WLED_REV5 = 13,
+  NODE_WLED_STARTBLOCK_REV3 = 50
+  // Add more device types as needed
+};
+
 namespace LoraProto {
 
 // -------------------- Versioning --------------------
@@ -55,6 +66,25 @@ struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; ui
 struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
 
+struct StreamCtrl {
+  bool start;
+  bool stop;
+  uint8_t packets_left;
+};
+
+inline uint8_t encode_stream_ctrl(bool start, bool stop, uint8_t packets_left) {
+  uint8_t ctrl = (start ? 0x80U : 0x00U) | (stop ? 0x40U : 0x00U);
+  return static_cast<uint8_t>(ctrl | (packets_left & 0x3FU));
+}
+
+inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
+  StreamCtrl decoded{};
+  decoded.start = (ctrl & 0x80U) != 0U;
+  decoded.stop = (ctrl & 0x40U) != 0U;
+  decoded.packets_left = static_cast<uint8_t>(ctrl & 0x3FU);
+  return decoded;
+}
+
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
 struct __attribute__((packed)) P_IdentifyReply { uint8_t fw; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B // fw, caps, groupId, mac6[6] // 9B
@@ -95,7 +125,7 @@ static constexpr PacketRule RULES[] = {
   { OPC_DEVICES,    DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(), "DEVICES/IDENTIFY" },
   // SET_GROUP (M2N, 1B) -> ACK
   { OPC_SET_GROUP,  DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_SetGroup>(),    SZ<P_Ack>(),           "SET_GROUP" },
-  // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 7B)
+  // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 8B)
   { OPC_STATUS,     DIR_M2N, RESP_SPECIFIC, OPC_STATUS,  SZ<P_GetStatus>(),   SZ<P_StatusReply>(),   "STATUS" },
   // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
   { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),     0,                     "CONTROL" },

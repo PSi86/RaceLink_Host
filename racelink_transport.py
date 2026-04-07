@@ -114,7 +114,6 @@ class LoRaUSB:
             pass
         return False
     
-    # Keep legacy ASCII identify "RaceLink_Gateway_v4" for discovery
     
     def discover_and_open(self) -> bool:
         # Explizit gesetzter Port? -> direkt öffnen, kein Scan
@@ -136,7 +135,7 @@ class LoRaUSB:
                 raise
 
         # Kein Port vorgegeben -> nur USB-Ports scannen
-        payload = struct.pack(">BBBB", 0x00, 0x01, 1, 0xFF)  # IDENTIFY legacy
+        payload = struct.pack(">BBBB", 0x00, 0x01, 1, 0xFF)
         ident = b"RaceLink_Gateway_v4"
 
         for p in serial.tools.list_ports.comports():

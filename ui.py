@@ -500,7 +500,7 @@ class RaceLinkUIMixin:
 
         payload["help/rl_devices"] = ["Device List of known devices"]
         payload["help/rl_devices/addr"] = ["MAC of the device without ':' as separator"]
-        payload["help/rl_devices/dev_type"] = ["IDENTIFY_COMMUNICATOR:1, WLED_REV3:10, WLED_REV4:11, WLED_STARTBLOCK_REV3:50"]
+        payload["help/rl_devices/dev_type"] = ["GATEWAY_REV1:1, NODE_WLED_REV1:10, NODE_WLED_REV3:11, NODE_WLED_REV4:12, NODE_WLED_REV5:13, NODE_WLED_STARTBLOCK_REV3:50"]
         payload["help/rl_devices/name"] = ["UI: shown name of a device"]
         payload["help/rl_devices/groupId"] = [
             "Used to group devices for control. Valid numbers start with 3 (0-2 are reserved for device type based groups)"
