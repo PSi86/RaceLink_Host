@@ -51,7 +51,12 @@ class ArchitectureImportTests(unittest.TestCase):
         package_root = RACELINK_ROOT / package_rel
         for path in _iter_python_files(package_root):
             imports = _import_targets(path)
-            bad = [name for name in imports if name and name.startswith(forbidden_prefixes)]
+            bad = []
+            for name in imports:
+                if not name:
+                    continue
+                if any(name == forbidden or name.startswith(f"{forbidden}.") for forbidden in forbidden_prefixes):
+                    bad.append(name)
             self.assertEqual(
                 bad,
                 [],
@@ -95,6 +100,22 @@ class ArchitectureImportTests(unittest.TestCase):
                 package_rel,
                 ("racelink.integrations.rotorhazard",),
             )
+
+    def test_package_internal_modules_do_not_fall_back_to_root_shims(self):
+        self._assert_no_forbidden_imports(
+            ".",
+            (
+                "data",
+                "lora_proto_auto",
+                "ui",
+                "racelink_transport",
+                "racelink_webui",
+            ),
+        )
+
+    def test_removed_root_shims_do_not_exist(self):
+        for name in ("data.py", "lora_proto_auto.py", "racelink_transport.py", "racelink_webui.py", "ui.py"):
+            self.assertFalse((ROOT / name).exists(), msg=f"{name} should have been removed")
 
 
 if __name__ == "__main__":

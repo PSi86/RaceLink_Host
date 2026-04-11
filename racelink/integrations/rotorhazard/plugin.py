@@ -10,14 +10,12 @@ from eventmanager import Evt
 
 from ...app import RaceLinkApp
 from ...core import NullSink
+from ...domain import RL_DeviceGroup
 from ...services import HostWifiService, OTAService, PresetsService
 from ...state import get_runtime_state_repository
 from ...web import register_rl_blueprint
 from .ui import RotorHazardUIAdapter
 from ....controller import RaceLink_LoRa
-from ....data import (
-    RL_DeviceGroup,
-)
 
 logger = logging.getLogger(__name__)
 

@@ -3,20 +3,16 @@
 ## Current State
 
 The active architecture now lives primarily under `racelink/`. The repository
-root still keeps a small set of compatibility shims for plugin/runtime entry
-compatibility:
+root is now limited to the RotorHazard plugin entrypoint:
 
 - `__init__.py` bootstraps the plugin, registers the blueprint, and wires
   RotorHazard events as the root plugin entry.
-- `controller.py` still combines state handling, persistence, transport
-  orchestration, discovery, status/control/config/sync/stream flows, startblock
-  behavior, and some remaining integration coupling; newer work is being
-  pushed into `racelink/services/`, `racelink/state/`, `racelink/web/`, and
-  `racelink/integrations/`.
-- `data.py`, `racelink_transport.py`, `racelink_webui.py`, and `ui.py` are now
-  compatibility shims that forward to package-based modules.
+- `controller.py` now acts mostly as a compatibility facade and coordinator for
+  persistence, communicator lifecycle, legacy entrypoints, and service
+  delegation. Discovery, status, control/config/sync/stream, gateway
+  orchestration, and startblock behavior live in `racelink/services/`.
 - `lora_proto.h` remains the source of truth for the protocol, mirrored by
-  `gen_lora_proto_py.py` and `lora_proto_auto.py`.
+  `gen_lora_proto_py.py` into `racelink/lora_proto_auto.py`.
 
 ## Target Structure
 
@@ -24,7 +20,7 @@ The long-term architecture is introduced as a package scaffold under
 `racelink/`:
 
 - `racelink/app.py`
-  Future application container and dependency wiring entrypoint.
+  Active application container and dependency wiring entrypoint.
 - `racelink/core/`
   Cross-cutting runtime abstractions, events, source/sink contracts, and
   application-level contracts.
@@ -55,14 +51,19 @@ The long-term architecture is introduced as a package scaffold under
   concerns.
 - `protocol` exposes protocol structure cleanly so higher layers do not depend
   on raw body layouts.
+  The generated module `racelink/lora_proto_auto.py` is the canonical mirror
+  for protocol constants, rules, packed sizes, and packed field layouts.
 - `transport` handles USB/serial/framing and emits low-level events only.
 - `state` owns in-memory repositories and persistence concerns.
 - `services` implement business workflows against protocol, transport, and
   repositories.
 - `integrations/*` adapt environment-specific systems into the core.
 - `web` adapts HTTP/SSE traffic to services without embedding business logic.
-- `app.py` becomes the single wiring point once later tasks move logic into the
-  new layers.
+  Specials metadata lives in `domain/specials.py`, but the web layer reads it
+  through `SpecialsService` so routes do not depend directly on domain helpers.
+- `app.py` is now the single dependency-wiring container; remaining cleanup is
+  mostly about reducing legacy controller surface and moving heavy route
+  workflows out of `web/api.py`.
 
 ## Source / Sink Model
 
@@ -98,11 +99,13 @@ clear place for `event_source` and `data_sink` wiring.
 - One backlog task per branch/PR.
 - No behavior changes unless the task explicitly requires them.
 - No protocol changes in `lora_proto.h` unless a task explicitly requires them.
+- The only supported Python protocol mirror path is
+  `lora_proto.h -> gen_lora_proto_py.py -> racelink/lora_proto_auto.py`.
 - No UI redesign during the architecture refactor.
 - RotorHazard remains fully functional during the migration.
 - Standalone support is added as an additional path, not as a replacement.
-- Compatibility shims are acceptable temporarily, but later tasks must remove
-  them once the new structure becomes the real structure.
+- Temporary compatibility layers should be aggressively removed once the
+  package-based import path is established.
 
 ## Import Boundaries
 
@@ -113,6 +116,8 @@ expected to hold, without trying to lint every architectural nuance.
 
 - `domain` must not import Flask or RotorHazard modules.
 - `protocol` should not depend on web or RotorHazard concerns.
+- `protocol` and `transport` must import the generated protocol mirror via the
+  package path `racelink.lora_proto_auto`, never via a top-level fallback.
 - `transport` must not import RotorHazard modules.
 - `state` should remain framework-agnostic.
 - `services` may depend on domain/state/protocol/transport abstractions, but
@@ -123,6 +128,9 @@ expected to hold, without trying to lint every architectural nuance.
   layers must not import RotorHazard-specific modules.
 - `integrations/standalone` and `integrations/polling` follow the same adapter
   direction: inward to the core, never the other way around.
+- RotorHazard adapters may still read domain-level specials metadata directly
+  for RH-specific UI/action construction; the stricter service boundary is
+  currently enforced for the generic web/API layer.
 
 Review cues:
 
@@ -147,34 +155,34 @@ layout used for new work:
 - RL-013 through RL-017 move integrations and standalone support to the edges.
 - RL-018 through RL-020 add tests, import-boundary enforcement, and cleanup.
 
-## Compatibility Layers
+## Backlog Status
 
-Temporary compatibility layers still exist at the repository root so existing
-plugin entrypoints keep working, but they are intentionally thin:
-
-- `data.py` -> `racelink.domain` / `racelink.state`
-- `racelink_transport.py` -> `racelink.transport`
-- `racelink_webui.py` -> `racelink.web`
-- `ui.py` -> `racelink.integrations.rotorhazard.ui`
-
-New internal imports should target the package modules directly. Future cleanup
-may remove some of these shims once external consumers no longer depend on
-them.
+| Area | Status | Notes |
+| --- | --- | --- |
+| RL-001 to RL-010 | done | Package structure, bootstrap, state, persistence, transport, protocol, gateway/discovery/status services are in place. |
+| RL-011 to RL-017 | done | Active send services, startblock service, RH integration split, web split, operating services, source/sink model, and standalone bootstrap exist. |
+| RL-018 to RL-019 | done | Tests and import-boundary checks exist and run in the standard test suite. |
+| RL-020 | done | Package imports are primary and the old root shim modules have been removed. |
+| Follow-up cleanup | follow-up needed | `controller.py` is smaller but still central for persistence/lifecycle, and `racelink/web/api.py` still contains route-heavy orchestration around some web flows. |
 
 ## RL-020 Migration Note
 
 What moved:
 - Internal integration bootstraps now import the package-based web layer
   directly.
+- Business logic for gateway, device operations, startblock, OTA, presets, and
+  host WiFi lives in package services.
 - Documentation now treats `racelink/` as the primary structure instead of a
   future scaffold.
 
 What stayed compatible:
 - Root plugin/bootstrap imports still work.
-- Legacy root-level shim modules still re-export the package-based modules.
 
 Risks:
-- `controller.py` is still a significant remaining monolith, so the final
-  architecture is improved but not fully normalized yet.
-- Root compatibility shims remain intentionally present until consumers can move
-  off them safely.
+- `controller.py` still owns persistence and communicator lifecycle, so the
+  final architecture is improved but not fully normalized yet.
+- `racelink/web/api.py` is thinner than before but still carries route-heavy
+  orchestration that should continue to move toward smaller service entrypoints.
+- The protocol mirror is now packaged correctly, but packet builders and reply
+  decoding are still hand-written Python logic. They are protected by drift
+  tests against `racelink/lora_proto_auto.py`, not yet fully code-generated.

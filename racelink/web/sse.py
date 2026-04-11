@@ -28,16 +28,7 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         _RLQueue = None
 
-try:
-    from ..transport import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WINDOW_OPEN, EV_TX_DONE
-except Exception:  # pragma: no cover
-    try:
-        from racelink.transport import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WINDOW_OPEN, EV_TX_DONE  # type: ignore
-    except Exception:  # pragma: no cover
-        EV_ERROR = 0xF0
-        EV_RX_WINDOW_OPEN = 0xF1
-        EV_RX_WINDOW_CLOSED = 0xF2
-        EV_TX_DONE = 0xF3
+from ..transport import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WINDOW_OPEN, EV_TX_DONE
 
 
 class MasterState:

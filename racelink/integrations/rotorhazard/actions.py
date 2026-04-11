@@ -7,7 +7,7 @@ import logging
 from EventActions import ActionEffect
 from RHUI import UIField, UIFieldType
 
-from ....data import RL_FLAG_HAS_BRI, RL_FLAG_POWER_ON, get_specials_config
+from ...domain import RL_FLAG_HAS_BRI, RL_FLAG_POWER_ON, get_specials_config
 
 logger = logging.getLogger(__name__)
 

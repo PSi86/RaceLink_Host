@@ -2,50 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-import hashlib
-import json
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import time
-import uuid
-from datetime import datetime
-
 from flask import jsonify, request
-from RHUI import UIFieldSelectOption
 
-try:
-    from ..domain import effect_select_options, get_dev_type_info, get_specials_config
-    from .dto import group_counts, serialize_device
-except Exception:  # pragma: no cover
-    from racelink.domain import effect_select_options, get_dev_type_info, get_specials_config  # type: ignore
-    from racelink.web.dto import group_counts, serialize_device  # type: ignore
+from ..domain import effect_select_options
+from ..services import OTAWorkflowService, SpecialsService
+from .dto import group_counts, serialize_device
+from .request_helpers import parse_recv3_from_addr, parse_wifi_options
 
 
 def register_api_routes(bp, ctx):
     host_wifi_service = ctx.services["host_wifi"]
     ota_service = ctx.services["ota"]
     presets_service = ctx.services["presets"]
-
-    def _parse_recv3_from_addr(addr_str):
-        if addr_str is None:
-            return None
-        try:
-            value = str(addr_str)
-        except Exception:
-            return None
-        hexchars = "0123456789abcdefABCDEF"
-        value = "".join(ch for ch in value if ch in hexchars)
-        if len(value) < 6:
-            return None
-        try:
-            return bytes.fromhex(value[-6:])
-        except Exception:
-            return None
+    specials_service = SpecialsService(rl_instance=ctx.rl_instance)
+    ota_workflows = OTAWorkflowService(
+        host_wifi_service=host_wifi_service,
+        ota_service=ota_service,
+        presets_service=presets_service,
+    )
 
 
     @bp.route("/racelink/api/devices", methods=["GET"])
@@ -56,7 +30,7 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/racelink/api/specials", methods=["GET"])
     def api_specials():
-        return jsonify({"ok": True, "specials": get_specials_config(context={"rl_instance": ctx.rl_instance}, serialize_ui=True)})
+        return jsonify({"ok": True, "specials": specials_service.get_serialized_config()})
 
     @bp.route("/racelink/api/groups", methods=["GET"])
     def api_groups():
@@ -301,7 +275,7 @@ def register_api_routes(bp, ctx):
         if len(macs) != 1:
             return jsonify({"ok": False, "error": "select exactly one device"}), 400
 
-        recv3 = _parse_recv3_from_addr(macs[0])
+        recv3 = parse_recv3_from_addr(macs[0])
         if not recv3:
             return jsonify({"ok": False, "error": "invalid mac/address"}), 400
         if recv3 == b"\xFF\xFF\xFF":
@@ -343,7 +317,7 @@ def register_api_routes(bp, ctx):
         if not mac or not key:
             return jsonify({"ok": False, "error": "missing mac/key"}), 400
 
-        recv3 = _parse_recv3_from_addr(mac)
+        recv3 = parse_recv3_from_addr(mac)
         if not recv3:
             return jsonify({"ok": False, "error": "invalid mac/address"}), 400
         if recv3 == b"\xFF\xFF\xFF":
@@ -359,29 +333,17 @@ def register_api_routes(bp, ctx):
             dev = ctx.rl_instance.getDeviceFromAddress(mac_str)
             if not dev:
                 return jsonify({"ok": False, "error": "device not found"}), 404
-            dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
-            specials = get_specials_config(context={"rl_instance": ctx.rl_instance})
-            option_info = None
-            for cap in dev_caps:
-                spec = specials.get(cap, {})
-                for opt in spec.get("options", []):
-                    if opt.get("key") == key:
-                        option_info = opt
-                        break
-                if option_info:
-                    break
+            option_info = specials_service.resolve_option(dev, key)
 
         if not option_info:
             return jsonify({"ok": False, "error": "option not supported for device"}), 400
         option = option_info.get("option", None)
         if option is None:
             return jsonify({"ok": False, "error": "option not writable"}), 400
-        min_v = option_info.get("min")
-        max_v = option_info.get("max")
-        if min_v is not None and value_int < int(min_v):
-            return jsonify({"ok": False, "error": f"value must be >= {min_v}"}), 400
-        if max_v is not None and value_int > int(max_v):
-            return jsonify({"ok": False, "error": f"value must be <= {max_v}"}), 400
+        try:
+            specials_service.validate_option_value(option_info, value_int)
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
 
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
 
@@ -420,7 +382,7 @@ def register_api_routes(bp, ctx):
         if not mac or not fn_key:
             return jsonify({"ok": False, "error": "missing mac/function"}), 400
 
-        recv3 = _parse_recv3_from_addr(mac)
+        recv3 = parse_recv3_from_addr(mac)
         if not recv3:
             return jsonify({"ok": False, "error": "invalid mac/address"}), 400
         if recv3 == b"\xFF\xFF\xFF":
@@ -431,22 +393,7 @@ def register_api_routes(bp, ctx):
             dev = ctx.rl_instance.getDeviceFromAddress(mac_str)
             if not dev:
                 return jsonify({"ok": False, "error": "device not found"}), 404
-            dev_caps = set(get_dev_type_info(getattr(dev, "dev_type", 0)).get("caps", []))
-            specials = get_specials_config(context={"rl_instance": ctx.rl_instance})
-            fn_info = None
-            options_by_key = {}
-            for cap in dev_caps:
-                spec = specials.get(cap, {})
-                for opt in spec.get("options", []):
-                    key_name = opt.get("key")
-                    if key_name:
-                        options_by_key[key_name] = opt
-                for fn in spec.get("functions", []):
-                    if fn.get("key") == fn_key:
-                        fn_info = fn
-                        break
-                if fn_info:
-                    break
+            fn_info, options_by_key = specials_service.resolve_action(dev, fn_key)
 
         if not fn_info:
             return jsonify({"ok": False, "error": "function not supported for device"}), 400
@@ -460,23 +407,10 @@ def register_api_routes(bp, ctx):
         if not callable(comm_fn):
             return jsonify({"ok": False, "error": "comm handler not found"}), 400
 
-        params_coerced = {}
-        for var in fn_info.get("vars", []) or []:
-            raw_val = params.get(var, None)
-            if raw_val is None:
-                raw_val = options_by_key.get(var, {}).get("min", 0)
-            try:
-                value_int = int(raw_val)
-            except Exception:
-                return jsonify({"ok": False, "error": f"invalid value for {var}"}), 400
-            opt_meta = options_by_key.get(var, {})
-            min_v = opt_meta.get("min")
-            max_v = opt_meta.get("max")
-            if min_v is not None and value_int < int(min_v):
-                return jsonify({"ok": False, "error": f"{var} must be >= {min_v}"}), 400
-            if max_v is not None and value_int > int(max_v):
-                return jsonify({"ok": False, "error": f"{var} must be <= {max_v}"}), 400
-            params_coerced[var] = value_int
+        try:
+            params_coerced = specials_service.coerce_action_params(fn_info, options_by_key, params)
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
 
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
         with ctx.rl_lock:
@@ -604,88 +538,24 @@ def register_api_routes(bp, ctx):
         mac = str(body.get("mac") or "").strip()
         if not mac:
             return jsonify({"ok": False, "error": "missing mac"}), 400
-        base_url = ota_service.wled_base_url(body.get("baseUrl") or "")
-        wifi = body.get("wifi") or {}
-        wifi_ssid = str(wifi.get("ssid") or body.get("wifiSsid") or "WLED-AP")
-        wifi_iface = str(wifi.get("iface") or body.get("wifiIface") or "wlan0")
-        wifi_conn_name = str(wifi.get("connName") or body.get("wifiConnName") or "racelink-wled-ap")
-        wifi_bssid = str(wifi.get("bssid") or body.get("wifiBssid") or "")
-        wifi_timeout_s = float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 35.0)
-        host_wifi_enable = bool(wifi.get("hostWifiEnable") if "hostWifiEnable" in wifi else body.get("hostWifiEnable", True))
-        host_wifi_restore = bool(wifi.get("hostWifiRestore") if "hostWifiRestore" in wifi else body.get("hostWifiRestore", True))
+        wifi = parse_wifi_options(body, ota_service)
 
         expected_mac = ota_service.expected_mac_hex(mac)
         if not expected_mac:
             return jsonify({"ok": False, "error": "invalid mac"}), 400
 
         def do_presets_download():
-            results = {"ok": True, "baseUrl": base_url, "addr": mac, "file": None, "errors": []}
-            host_wifi_initial = host_wifi_service.radio_enabled()
-            host_wifi_changed = False
-            results["hostWifi"] = {"wasEnabled": host_wifi_initial, "enabled": host_wifi_initial, "restored": False}
+            return ota_workflows.download_presets(
+                rl_instance=ctx.rl_instance,
+                task_manager=ctx.tasks,
+                mac=mac,
+                base_url=wifi["base_url"],
+                wifi=wifi,
+                host_wifi_enable=wifi["host_wifi_enable"],
+                host_wifi_restore=wifi["host_wifi_restore"],
+            )
 
-            try:
-                if host_wifi_enable and not host_wifi_initial:
-                    ctx.tasks.update(meta={"stage": "HOST_WIFI_ON", "addr": mac, "message": "Enabling host WiFi radio..."})
-                    host_wifi_service.set_radio(True)
-                    host_wifi_changed = True
-                    host_wifi_service.wait_iface_ready(wifi_iface, timeout_s=15.0)
-                    results["hostWifi"]["enabled"] = True
-
-                ctx.tasks.update(meta={"stage": "LORA_AP_ON", "addr": mac, "message": "Enable WLED AP via LoRa (waiting for ACK)"})
-                ok_ap = ctx.rl_instance.sendConfig(0x04, data0=1, recv3=ota_service.recv3_bytes_from_addr(mac), wait_for_ack=True, timeout_s=8.0)
-                if not ok_ap:
-                    raise RuntimeError(f"Timeout waiting for CONFIG ACK from {mac}")
-
-                ctx.tasks.update(meta={"stage": "CONNECT_WIFI", "addr": mac, "message": f'Connecting host WiFi via profile "{wifi_conn_name}" (iface {wifi_iface}) to SSID "{wifi_ssid}"'})
-                try:
-                    host_wifi_service.connect_profile(wifi_conn_name, wifi_ssid, iface=wifi_iface, bssid=wifi_bssid, timeout_s=wifi_timeout_s)
-                except Exception as ex1:
-                    msg1 = str(ex1)
-                    if host_wifi_enable and (not host_wifi_changed) and ("Wi-Fi is disabled" in msg1 or "wireless is disabled" in msg1.lower()):
-                        ctx.tasks.update(meta={"stage": "HOST_WIFI_ON", "addr": mac, "message": f"Host WiFi appears disabled; enabling on {wifi_iface}..."})
-                        host_wifi_service.set_radio(True)
-                        host_wifi_changed = True
-                        results["hostWifi"]["enabled"] = True
-                        host_wifi_service.wait_iface_ready(wifi_iface, timeout_s=15.0)
-                        host_wifi_service.connect_profile(wifi_conn_name, wifi_ssid, iface=wifi_iface, bssid=wifi_bssid, timeout_s=wifi_timeout_s)
-                    else:
-                        raise
-
-                ctx.tasks.update(meta={"stage": "WAIT_HTTP", "addr": mac, "message": f"Waiting for WLED /json/info mac to match {expected_mac}"})
-                info = ota_service.wait_for_expected_node(base_url, expected_mac, timeout_s=90.0, poll_s=1.0)
-                if not info:
-                    raise RuntimeError(f"Timeout waiting for node (baseUrl={base_url}) to report expected mac {expected_mac}")
-
-                ctx.tasks.update(meta={"stage": "DOWNLOAD_PRESETS", "addr": mac, "message": "Downloading presets.json"})
-                payload = ota_service.wled_download_presets(base_url, timeout_s=15.0)
-                saved = presets_service.save_payload(payload)
-                results["file"] = {k: saved[k] for k in ("name", "size", "saved_ts")}
-                results["files"] = presets_service.list_files()
-
-                try:
-                    ctx.rl_instance.sendConfig(0x04, data0=0, recv3=ota_service.recv3_bytes_from_addr(mac), wait_for_ack=True, timeout_s=6.0)
-                except Exception:
-                    pass
-            except Exception as ex:
-                results["ok"] = False
-                results["errors"].append(str(ex))
-            finally:
-                if host_wifi_restore and (host_wifi_initial is False) and host_wifi_service.radio_enabled():
-                    try:
-                        try:
-                            host_wifi_service.profile_down(wifi_conn_name, timeout_s=10.0)
-                        except Exception:
-                            pass
-                        host_wifi_service.set_radio(False)
-                        results["hostWifi"]["enabled"] = False
-                        results["hostWifi"]["restored"] = True
-                    except Exception as ex2:
-                        results["errors"].append(f"Host WiFi restore failed: {ex2}")
-                        results["ok"] = False
-            return results
-
-        task = ctx.tasks.start("presets_download", do_presets_download, meta={"stage": "INIT", "addr": mac, "message": "Preset download started", "baseUrl": base_url})
+        task = ctx.tasks.start("presets_download", do_presets_download, meta={"stage": "INIT", "addr": mac, "message": "Preset download started", "baseUrl": wifi["base_url"]})
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
@@ -728,98 +598,27 @@ def register_api_routes(bp, ctx):
         except Exception:
             retries = 3
         retries = max(1, min(retries, 10))
-        base_url = ota_service.wled_base_url(body.get("baseUrl") or "")
+        wifi = parse_wifi_options(body, ota_service)
         stop_on_error = bool(body.get("stopOnError") or False)
-        wifi = body.get("wifi") or {}
-        wifi_ssid = str(wifi.get("ssid") or body.get("wifiSsid") or "WLED-AP")
-        wifi_iface = str(wifi.get("iface") or body.get("wifiIface") or "wlan0")
-        wifi_conn_name = str(wifi.get("connName") or body.get("wifiConnName") or "racelink-wled-ap")
-        wifi_bssid = str(wifi.get("bssid") or body.get("wifiBssid") or "")
-        wifi_timeout_s = float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 35.0)
-        host_wifi_enable = bool(wifi.get("hostWifiEnable") if "hostWifiEnable" in wifi else body.get("hostWifiEnable", True))
-        host_wifi_restore = bool(wifi.get("hostWifiRestore") if "hostWifiRestore" in wifi else body.get("hostWifiRestore", True))
 
         def do_fwupdate():
-            results = {"ok": True, "baseUrl": base_url, "devices": [], "errors": []}
-            host_wifi_initial = host_wifi_service.radio_enabled()
-            host_wifi_changed = False
-            results["hostWifi"] = {"wasEnabled": host_wifi_initial, "enabled": host_wifi_initial, "restored": False}
-            if fw_info:
-                results["fw"] = {k: fw_info[k] for k in ("id", "name", "size", "sha256")}
-            if presets_info:
-                results["presets"] = {k: presets_info[k] for k in ("name", "size", "sha256")}
-            if cfg_info:
-                results["cfg"] = {k: cfg_info[k] for k in ("id", "name", "size", "sha256")}
+            return ota_workflows.run_firmware_update(
+                rl_instance=ctx.rl_instance,
+                task_manager=ctx.tasks,
+                devices_provider=ctx.devices,
+                macs=macs,
+                base_url=wifi["base_url"],
+                fw_info=fw_info,
+                presets_info=presets_info,
+                cfg_info=cfg_info,
+                retries=retries,
+                stop_on_error=stop_on_error,
+                wifi=wifi,
+                host_wifi_enable=wifi["host_wifi_enable"],
+                host_wifi_restore=wifi["host_wifi_restore"],
+            )
 
-            try:
-                if host_wifi_enable and not host_wifi_initial:
-                    host_wifi_service.set_radio(True)
-                    host_wifi_changed = True
-                    host_wifi_service.wait_iface_ready(wifi_iface, timeout_s=15.0)
-                    results["hostWifi"]["enabled"] = True
-
-                total = len(macs)
-                for idx, addr in enumerate(macs, start=1):
-                    expected_mac = ota_service.expected_mac_hex(str(addr))
-                    dev_res = {"addr": addr, "expectedMac": expected_mac, "groupId": ota_service.lookup_group_id_for_addr(str(addr), ctx.devices()), "ok": False, "error": None}
-                    results["devices"].append(dev_res)
-                    try:
-                        ctx.tasks.update(meta={"stage": "LORA_AP_ON", "index": idx, "total": total, "addr": addr, "retries": retries, "message": "Enable WLED AP via LoRa"})
-                        ctx.rl_instance.sendConfig(0x04, data0=1, recv3=ota_service.recv3_bytes_from_addr(str(addr)))
-                        ctx.tasks.update(meta={"stage": "CONNECT_WIFI", "index": idx, "total": total, "addr": addr, "retries": retries, "message": f'Connecting host WiFi via profile "{wifi_conn_name}" (iface {wifi_iface}) to SSID "{wifi_ssid}"'})
-                        host_wifi_service.connect_profile(wifi_conn_name, wifi_ssid, iface=wifi_iface, bssid=wifi_bssid, timeout_s=wifi_timeout_s)
-                        ctx.tasks.update(meta={"stage": "WAIT_HTTP", "index": idx, "total": total, "addr": addr, "retries": retries, "message": f"Waiting for WLED /json/info mac to match {expected_mac}"})
-                        info = ota_service.wait_for_expected_node(base_url, expected_mac, timeout_s=90.0, poll_s=1.0)
-                        if not info:
-                            raise RuntimeError(f"Timeout waiting for node (baseUrl={base_url}) to report expected mac {expected_mac}")
-                        dev_res["info_before"] = {k: info.get(k) for k in ("mac", "ver", "arch", "name")}
-
-                        if presets_info:
-                            ota_service.wled_upload_file(base_url, presets_info["path"], timeout_s=45.0, dest_name="presets.json")
-                        if cfg_info:
-                            ota_service.wled_upload_file(base_url, cfg_info["path"], timeout_s=45.0, dest_name="cfg.json")
-                        if fw_info:
-                            ok = False
-                            last_err = None
-                            for attempt in range(1, retries + 1):
-                                try:
-                                    ctx.tasks.update(meta={"stage": "UPLOAD_FW", "index": idx, "total": total, "addr": addr, "attempt": attempt, "retries": retries, "message": f"Uploading firmware (try {attempt}/{retries})"})
-                                    ota_service.wled_upload_firmware(base_url, fw_info["path"], timeout_s=30.0)
-                                    ok = True
-                                    break
-                                except Exception as ex:
-                                    last_err = ex
-                                    time.sleep(2.0)
-                            if not ok:
-                                raise RuntimeError(f"Firmware upload failed: {last_err}")
-                        dev_res["ok"] = True
-                    except Exception as ex:
-                        dev_res["error"] = str(ex)
-                        results["errors"].append(str(ex))
-                        if stop_on_error:
-                            raise
-                    finally:
-                        try:
-                            ctx.rl_instance.sendConfig(0x04, data0=0, recv3=ota_service.recv3_bytes_from_addr(str(addr)))
-                        except Exception:
-                            pass
-            except Exception:
-                results["ok"] = False
-            finally:
-                if host_wifi_restore and (host_wifi_initial is False) and host_wifi_service.radio_enabled():
-                    try:
-                        try:
-                            host_wifi_service.profile_down(wifi_conn_name, timeout_s=10.0)
-                        except Exception:
-                            pass
-                        host_wifi_service.set_radio(False)
-                        results["hostWifi"]["enabled"] = False
-                        results["hostWifi"]["restored"] = True
-                    except Exception as ex2:
-                        results["errors"].append(f"Host WiFi restore failed: {ex2}")
-            return results
-
-        task = ctx.tasks.start("fwupdate", do_fwupdate, meta={"stage": "INIT", "index": 0, "total": len(macs), "retries": retries, "addr": None, "message": "Firmware update started", "baseUrl": base_url})
+        task = ctx.tasks.start("fwupdate", do_fwupdate, meta={"stage": "INIT", "index": 0, "total": len(macs), "retries": retries, "addr": None, "message": "Firmware update started", "baseUrl": wifi["base_url"]})
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})

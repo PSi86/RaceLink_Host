@@ -1,22 +1,16 @@
 from __future__ import annotations
 
 import logging
-import json
-import re
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Union
 
-from .data import (
+from .racelink.domain import (
     RL_Device,
     RL_DeviceGroup,
-    RL_Dev_Type,
-    build_specials_state,
-    create_device,
-    get_dev_type_info,
     RL_FLAG_HAS_BRI,
     RL_FLAG_POWER_ON,
+    build_specials_state,
+    create_device,
 )
-from .racelink.state import get_runtime_state_repository
-from .racelink.state.persistence import dump_records, load_records
 from .racelink.services import (
     ConfigService,
     ControlService,
@@ -26,46 +20,13 @@ from .racelink.services import (
     StatusService,
     StreamService,
     SyncService,
-    build_startblock_payload_v1,
 )
+from .racelink.state import get_runtime_state_repository
+from .racelink.state.persistence import dump_records, load_records
 
-# ---- transport import (tolerant to both package and flat layout) ----
-try:
-    from .racelink.transport import (
-        LP,
-        LoRaUSB,
-        mac_last3_from_hex,
-    )
-except Exception:
-    try:
-        from .racelink_transport import (
-            LP,
-            LoRaUSB,
-            _mac_last3_from_hex as mac_last3_from_hex,
-        )
-    except Exception:
-        from racelink_transport import (
-            LP,
-            LoRaUSB,
-            _mac_last3_from_hex as mac_last3_from_hex,
-        )
+from .racelink.transport import LP, LoRaUSB, mac_last3_from_hex
 
 logger = logging.getLogger(__name__)
-
-
-_DE_UMLAUT_MAP = {
-    "ä": "ae",
-    "ö": "oe",
-    "ü": "ue",
-    "ß": "ss",
-    "Ä": "AE",
-    "Ö": "OE",
-    "Ü": "UE",
-}
-
-_ALLOWED_NAME_RE = re.compile(r"[^A-Z0-9 _\-\.\+]", re.IGNORECASE)
-
-
 
 
 class RaceLink_LoRa:
@@ -229,7 +190,7 @@ class RaceLink_LoRa:
             logger.debug(device)
             try:
                 flags = device.get("flags", None)
-                presetId = device.get("presetId", None)
+                preset_id = device.get("presetId", None)
 
                 if flags is None:
                     legacy_state = int(device.get("state", 1) or 0)
@@ -237,8 +198,8 @@ class RaceLink_LoRa:
                     if "brightness" in device:
                         flags |= RL_FLAG_HAS_BRI
 
-                if presetId is None:
-                    presetId = int(device.get("effect", 1) or 1)
+                if preset_id is None:
+                    preset_id = int(device.get("effect", 1) or 1)
 
                 brightness = int(device.get("brightness", 70) or 0)
 
@@ -258,7 +219,7 @@ class RaceLink_LoRa:
                         version=int(device.get("version", 0) or 0),
                         caps=int(dev_type or 0),
                         flags=int(flags) & 0xFF,
-                        presetId=int(presetId) & 0xFF,
+                        presetId=int(preset_id) & 0xFF,
                         brightness=brightness & 0xFF,
                         specials=special_state,
                     )
@@ -284,19 +245,19 @@ class RaceLink_LoRa:
             loaded_groups.append(RL_DeviceGroup(group["name"], group["static_group"], group_dev_type))
 
         loaded_groups = [
-            g
-            for g in loaded_groups
-            if str(getattr(g, "name", "")).strip().lower() not in {"unconfigured", "all wled devices"}
+            group
+            for group in loaded_groups
+            if str(getattr(group, "name", "")).strip().lower() not in {"unconfigured", "all wled devices"}
         ]
 
-        if not any(str(getattr(g, "name", "")).strip().lower() == "all wled nodes" for g in loaded_groups):
+        if not any(str(getattr(group, "name", "")).strip().lower() == "all wled nodes" for group in loaded_groups):
             loaded_groups.append(RL_DeviceGroup("All WLED Nodes", static_group=1, dev_type=0))
         else:
-            for g in loaded_groups:
-                if str(getattr(g, "name", "")).strip().lower() == "all wled nodes":
-                    g.name = "All WLED Nodes"
-                    g.static_group = 1
-                    g.dev_type = 0
+            for group in loaded_groups:
+                if str(getattr(group, "name", "")).strip().lower() == "all wled nodes":
+                    group.name = "All WLED Nodes"
+                    group.static_group = 1
+                    group.dev_type = 0
         self.group_repository.replace_all(loaded_groups)
 
         self.uiDeviceList = self.createUiDevList()
@@ -326,11 +287,10 @@ class RaceLink_LoRa:
                     if "manual" in args:
                         self._rhapi.ui.message_notify(self._rhapi.__("RaceLink Communicator ready on {} with MAC: {}").format(used, mac))
                 return
-            else:
-                self.ready = False
-                logger.warning("No RaceLink Communicator module discovered or configured")
-                if "manual" in args:
-                    self._rhapi.ui.message_notify(self._rhapi.__("No RaceLink Communicator module discovered or configured"))
+            self.ready = False
+            logger.warning("No RaceLink Communicator module discovered or configured")
+            if "manual" in args:
+                self._rhapi.ui.message_notify(self._rhapi.__("No RaceLink Communicator module discovered or configured"))
         except Exception as ex:
             self.ready = False
             logger.error("LoRaUSB init failed: %s", ex)
@@ -413,7 +373,6 @@ class RaceLink_LoRa:
             if sanityCheck is True and device.groupId >= num_groups:
                 device.groupId = 0
             self.setNodeGroupId(device, forceSet=True)
-            #time.sleep(0.2)
 
     def _require_lora(self, context: str):
         if getattr(self, "lora", None):
@@ -441,15 +400,19 @@ class RaceLink_LoRa:
                 continue
 
     def sendRaceLink(self, targetDevice, flags=None, presetId=None, brightness=None):
+        """Compatibility entrypoint forwarding device control to ControlService."""
         return self.control_service.send_device_control(targetDevice, flags, presetId, brightness)
 
     def sendGroupControl(self, gcGroupId, gcFlags, gcPresetId, gcBrightness):
+        """Compatibility entrypoint forwarding group control to ControlService."""
         return self.control_service.send_group_control(gcGroupId, gcFlags, gcPresetId, gcBrightness)
 
     def sendWledControl(self, *, targetDevice=None, targetGroup=None, params=None):
+        """Compatibility entrypoint forwarding WLED actions to ControlService."""
         return self.control_service.send_wled_control(targetDevice=targetDevice, targetGroup=targetGroup, params=params)
 
     def sendStartblockConfig(self, *, targetDevice=None, targetGroup=None, params=None):
+        """Compatibility entrypoint forwarding startblock config to StartblockService."""
         return self.startblock_service.send_startblock_config(
             target_device=targetDevice,
             target_group=targetGroup,
@@ -457,155 +420,31 @@ class RaceLink_LoRa:
         )
 
     def _is_startblock_device(self, dev: RL_Device) -> bool:
+        """Compatibility helper kept for legacy callers during controller slimming."""
         return self.startblock_service.is_startblock_device(dev)
 
     def _iter_startblock_devices(self, *, targetDevice=None, targetGroup=None) -> list[RL_Device]:
+        """Compatibility helper kept for legacy callers during controller slimming."""
         return self.startblock_service.iter_startblock_devices(
             target_device=targetDevice,
             target_group=targetGroup,
         )
-        """
-        Liefert die Startblock-Geräte, die angesprochen werden sollen:
-        - wenn targetDevice gesetzt: genau dieses (wenn STARTBLOCK)
-        - wenn targetGroup gesetzt: alle STARTBLOCK-Geräte dieser Gruppe
-        - sonst: alle STARTBLOCK-Geräte
-        """
-        if targetDevice is not None:
-            return [targetDevice] if self._is_startblock_device(targetDevice) else []
-
-        if targetGroup is not None:
-            gid = int(targetGroup)
-            return [
-                dev
-                for dev in self.device_repository.list()
-                if self._is_startblock_device(dev) and int(getattr(dev, "groupId", 0) or 0) == gid
-            ]
-
-        return [dev for dev in self.device_repository.list() if self._is_startblock_device(dev)]
 
     def get_current_heat_slot_list(self):
+        """Compatibility helper forwarding heat-slot lookup to the active source adapter."""
         return self.startblock_service.get_current_heat_slot_list()
 
     def sendStartblockControl(self, *, targetDevice=None, targetGroup=None, params=None):
+        """Compatibility entrypoint forwarding startblock dispatch to StartblockService."""
         return self.startblock_service.send_startblock_control(
             target_device=targetDevice,
             target_group=targetGroup,
             params=params,
         )
-        if not self._require_lora("sendStartblockControl"):
-            return {}
-        if params is None:
-            params = {}
-
-        # Default: immer Current Heat nutzen (UI sendet den Key oft gar nicht)
-        use_heat = params.get("startblock_use_current_heat")
-        if use_heat is None:
-            use_heat = True
-
-        # 1) Slots-Daten holen
-        if use_heat:
-            slot_list = self.get_current_heat_slot_list()  # [(slot0, callsign, racechannel), ...]
-        else:
-            # Optional: falls UI manuelle Daten liefert (wenn du das nutzt)
-            slot_list = params.get("startblock_slot_list") or []
-            slot_list = self._normalize_startblock_slot_list(slot_list)
-
-        # Immer 8 Slots (0..7) bereitstellen
-        slot_map = {int(s): (cs or "", rc or "--") for (s, cs, rc) in slot_list}
-        slots_0based = [(i, *slot_map.get(i, ("", "--"))) for i in range(8)]
-
-        # 3) Wenn targetGroup gesetzt: Gruppe ist Ziel, keine Device-Details prüfen
-        if targetGroup is not None:
-            gid = int(targetGroup)
-            sent = []
-            # 6) Payloads für alle Slots nacheinander broadcasten
-            for slot0, cs, rc in slots_0based:
-                payload = build_startblock_payload_v1(slot0 + 1, rc, cs)
-                sent.append({
-                    "slot": slot0 + 1,
-                    "result": self.sendStream(payload, groupId=gid)
-                })
-            return {"mode": "group", "groupId": gid, "sent": sent}
-
-        # 2) targetDevice explizit -> STARTBLOCK prüfen
-        if targetDevice is not None:
-            if not self._is_startblock_device(targetDevice):
-                return {"error": "targetDevice has no STARTBLOCK capability"}
-            devices = [targetDevice]
-        else:
-            # 4) targetDevice None und targetGroup None -> passende Devices suchen
-            devices = self._iter_startblock_devices(targetDevice=None, targetGroup=None)
-
-        if not devices:
-            return {"mode": "unicast", "sent": []}
-
-        # 5) startblock_slots / startblock_first_slot lesen und Slot->Device Mapping bauen
-        slot_to_dev = {}  # slot_1based -> device
-        dev_ranges = []
-        for dev in devices:
-            try:
-                startblock_slots = int(dev.specials["startblock_slots"])
-                startblock_first_slot = int(dev.specials["startblock_first_slot"])
-            except Exception:
-                # Fallback: wenn Specials fehlen, als "vollständig" behandeln
-                startblock_slots = 8
-                startblock_first_slot = 1
-
-            # clamp
-            startblock_slots = max(1, min(8, startblock_slots))
-            startblock_first_slot = max(1, min(8, startblock_first_slot))
-            last = min(8, startblock_first_slot + startblock_slots - 1)
-
-            dev_ranges.append((dev, startblock_first_slot, last))
-
-            for s in range(startblock_first_slot, last + 1):
-                # Falls Überschneidung: erstes Gerät gewinnt (kannst du bei Bedarf anders lösen)
-                slot_to_dev.setdefault(s, dev)
-
-        # 6) Unicast: pro Slot das passende Gerät adressieren (bis zu 8 Streams)
-        sent = []
-        for slot0, cs, rc in slots_0based:
-            slot1 = slot0 + 1
-            dev = slot_to_dev.get(slot1)
-            if dev is None:
-                continue
-
-            payload = build_startblock_payload_v1(slot1, rc, cs)
-            sent.append({
-                "slot": slot1,
-                "device": getattr(dev, "deviceId", getattr(dev, "mac", None)),
-                "result": self.sendStream(payload, device=dev),
-            })
-
-        return {
-            "mode": "unicast",
-            "devices": [
-                {
-                    "device": getattr(d, "deviceId", getattr(d, "mac", None)),
-                    "first": a,
-                    "last": b
-                } for (d, a, b) in dev_ranges
-            ],
-            "sent": sent
-        }
 
     def _normalize_startblock_slot_list(self, slot_list):
+        """Compatibility helper forwarding slot normalization to StartblockService."""
         return self.startblock_service.normalize_slot_list(slot_list)
-        """
-        Akzeptiert grob:
-        - [(slot0, callsign, racechannel), ...]
-        - [{"slot":0,"callsign":"...","racechannel":"R3"}, ...]
-        """
-        out = []
-        for item in (slot_list or []):
-            if isinstance(item, (list, tuple)) and len(item) >= 3:
-                out.append((int(item[0]), str(item[1] or ""), str(item[2] or "--")))
-            elif isinstance(item, dict):
-                s = int(item.get("slot", 0))
-                cs = str(item.get("callsign", "") or "")
-                rc = str(item.get("racechannel", "--") or "--")
-                out.append((s, cs, rc))
-        return out
 
     def _send_and_wait_for_reply(
         self,
@@ -627,6 +466,7 @@ class RaceLink_LoRa:
         wait_for_ack: bool = False,
         timeout_s: float = 6.0,
     ):
+        """Compatibility entrypoint forwarding config writes to ConfigService."""
         return self.config_service.send_config(
             option,
             data0=data0,
@@ -639,9 +479,11 @@ class RaceLink_LoRa:
         )
 
     def _apply_config_update(self, dev: RL_Device, option: int, data0: int) -> None:
+        """Compatibility hook forwarding ACK-side config updates to ConfigService."""
         return self.config_service.apply_config_update(dev, option, data0)
 
     def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
+        """Compatibility entrypoint forwarding sync packets to SyncService."""
         return self.sync_service.send_sync(ts24, brightness, recv3=recv3)
 
     @staticmethod
@@ -656,6 +498,7 @@ class RaceLink_LoRa:
         retries: int = 2,
         timeout_s: float = 8.0,
     ) -> dict[str, int]:
+        """Compatibility entrypoint forwarding payload streams to StreamService."""
         return self.stream_service.send_stream(payload, groupId=groupId, device=device, retries=retries, timeout_s=timeout_s)
 
     def _wait_rx_window(self, send_fn, collect_pred=None, fail_safe_s: float = 8.0):

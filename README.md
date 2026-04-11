@@ -17,7 +17,7 @@ RaceLink now uses the `racelink/` package as the primary home for the refactored
 - `racelink/state/`
   Runtime repositories plus JSON persistence helpers.
 - `racelink/services/`
-  Business services for gateway orchestration, discovery, status, OTA, presets, and host WiFi.
+  Business services for gateway orchestration, discovery, status, control, config, sync, stream, startblock, OTA, presets, and host WiFi.
 - `racelink/integrations/rotorhazard/`
   RotorHazard bootstrap, UI, actions, import/export, and RH data source adapter.
 - `racelink/integrations/standalone/`
@@ -27,22 +27,10 @@ RaceLink now uses the `racelink/` package as the primary home for the refactored
 - `racelink/web/`
   Blueprint assembly, API routes, SSE handling, DTO helpers, and task state.
 
-## Compatibility Shims
+## Root Surface
 
-The repository root still contains a few thin compatibility modules so existing plugin/runtime entrypoints keep working:
-
-- `__init__.py`
-  Root plugin bootstrap entry for RotorHazard.
-- `data.py`
-  Legacy import shim to `racelink.domain` and runtime state repositories.
-- `racelink_transport.py`
-  Legacy import shim to `racelink.transport`.
-- `racelink_webui.py`
-  Legacy import shim to `racelink.web`.
-- `ui.py`
-  Legacy import shim to `racelink.integrations.rotorhazard.ui`.
-
-New internal code should import from `racelink/*` directly instead of these root-level shims.
+The repository root now exposes only the RotorHazard plugin entry in `__init__.py`.
+All other internal imports are expected to use the canonical package paths under `racelink/*`.
 
 ## Running Checks
 
@@ -52,5 +40,11 @@ New internal code should import from `racelink/*` directly instead of these root
 ## Notes
 
 - `lora_proto.h` remains the protocol source of truth.
+- The supported Python mirror path is `lora_proto.h -> gen_lora_proto_py.py -> racelink/lora_proto_auto.py`.
+- The generator now mirrors constants, response rules, packed struct sizes, and packed field layouts used by the Python side.
+- `packets.py` and `codec.py` still contain the active Python builders/decoders, so generator-backed drift tests are used to keep those hand-written paths aligned with the shared header.
 - RotorHazard remains the primary supported integration path.
 - Standalone support exists as an additional minimal path and is not yet feature-complete.
+- `controller.py` is now mostly a compatibility facade plus lifecycle/persistence coordinator, but it is still larger than the target architecture.
+- `racelink/web/api.py` uses dedicated services for the heavier OTA/presets/specials flows, though some route orchestration still remains and is a candidate for further cleanup.
+- Root-level legacy shim modules (`data.py`, `racelink_transport.py`, `racelink_webui.py`, `ui.py`) have been removed; package imports are now the only supported internal import path.

@@ -6,7 +6,9 @@ from .discovery_service import DiscoveryService
 from .gateway_service import GatewayService
 from .host_wifi_service import HostWifiService
 from .ota_service import OTAService
+from .ota_workflow_service import OTAWorkflowService
 from .presets_service import PresetsService
+from .specials_service import SpecialsService
 from .startblock_service import StartblockService, build_startblock_payload_v1
 from .status_service import StatusService
 from .stream_service import StreamService
@@ -19,7 +21,9 @@ __all__ = [
     "GatewayService",
     "HostWifiService",
     "OTAService",
+    "OTAWorkflowService",
     "PresetsService",
+    "SpecialsService",
     "StartblockService",
     "StatusService",
     "StreamService",

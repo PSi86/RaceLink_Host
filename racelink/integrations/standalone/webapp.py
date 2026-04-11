@@ -9,11 +9,11 @@ from flask import Flask
 
 from ...app import RaceLinkApp
 from ...core import NullSink, NullSource
+from ...domain import RL_DeviceGroup
 from ...services import HostWifiService, OTAService, PresetsService
 from ...state import get_runtime_state_repository
 from ...web import register_rl_blueprint
 from ....controller import RaceLink_LoRa
-from ....data import RL_DeviceGroup
 from .config import StandaloneConfig, StandaloneOptionStore
 
 logger = logging.getLogger(__name__)
@@ -87,12 +87,17 @@ def create_standalone_app(config: StandaloneConfig | None = None) -> tuple[Flask
         transport=getattr(controller, "lora", None),
         state_repository=state_repository,
         services={
+            "config": controller.config_service,
+            "control": controller.control_service,
             "gateway": controller.gateway_service,
             "discovery": controller.discovery_service,
             "host_wifi": host_wifi_service,
             "ota": ota_service,
             "presets": presets_service,
+            "startblock": controller.startblock_service,
             "status": controller.status_service,
+            "stream": controller.stream_service,
+            "sync": controller.sync_service,
         },
         integrations={"standalone": rhapi, "flask_app": app},
         event_source=NullSource(),

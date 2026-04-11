@@ -9,7 +9,7 @@ from data_export import DataExporter
 from data_import import DataImporter
 from RHUI import UIField, UIFieldType
 
-from ....racelink.state.persistence import dump_records
+from ...state.persistence import dump_records
 
 logger = logging.getLogger(__name__)
 

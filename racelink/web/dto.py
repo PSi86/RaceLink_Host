@@ -4,18 +4,11 @@ from __future__ import annotations
 
 from typing import Iterable
 
-try:
-    from ..domain import (
-        get_dev_type_info,
-        get_special_keys_for_caps,
-        is_wled_dev_type,
-    )
-except Exception:  # pragma: no cover
-    from racelink.domain import (  # type: ignore
-        get_dev_type_info,
-        get_special_keys_for_caps,
-        is_wled_dev_type,
-    )
+from ..domain import (
+    get_dev_type_info,
+    get_special_keys_for_caps,
+    is_wled_dev_type,
+)
 
 
 def serialize_device(dev):

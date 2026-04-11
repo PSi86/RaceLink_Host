@@ -7,7 +7,7 @@ from datetime import datetime
 
 from RHUI import UIField, UIFieldType, UIFieldSelectOption
 
-from ....data import RL_DeviceGroup, get_dev_type_info, get_specials_config
+from ...domain import RL_DeviceGroup, get_dev_type_info, get_specials_config
 from .actions import RotorHazardActionsMixin
 from .dataio import RotorHazardDataIOMixin
 from .source import RotorHazardSource

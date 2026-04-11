@@ -4,8 +4,8 @@ from __future__ import annotations
 
 try:
     from .. import lora_proto_auto as LPA
-except Exception:  # pragma: no cover
-    import lora_proto_auto as LPA
+except Exception as exc:  # pragma: no cover
+    raise ImportError("RaceLink protocol mirror missing: expected racelink.lora_proto_auto") from exc
 
 
 PacketRule = LPA.PacketRule

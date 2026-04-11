@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate lora_proto_auto.py from the shared C++ header lora_proto.h.
+"""Generate racelink/lora_proto_auto.py from the shared C++ header lora_proto.h.
 
 Why this exists:
 - Master + Node share lora_proto.h as the protocol source of truth.
@@ -17,7 +17,7 @@ Constraints:
   It assumes __attribute__((packed)) for the payload structs.
 
 Usage:
-  ./gen_lora_proto_py.py                     # reads ./lora_proto.h, writes ./lora_proto_auto.py
+  ./gen_lora_proto_py.py                     # reads ./lora_proto.h, writes ./racelink/lora_proto_auto.py
   ./gen_lora_proto_py.py --in path --out path
 
 """
@@ -97,9 +97,28 @@ _C_TYPE_SIZES = {
 }
 
 
-def _extract_packed_structs(h: str) -> Dict[str, int]:
-    """Return {StructName: size_bytes} for packed structs."""
-    out: Dict[str, int] = {}
+def _parse_struct_field(struct_name: str, stmt: str) -> Tuple[str, str, int]:
+    fm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)(\s*\[\s*(\d+)\s*\])?$", stmt)
+    if not fm:
+        fm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*\]$", stmt)
+        if not fm:
+            raise ValueError(f"Unsupported struct field syntax in {struct_name}: {stmt!r}")
+        ctype = fm.group(1)
+        field_name = fm.group(2)
+        arr_n = int(fm.group(3))
+    else:
+        ctype = fm.group(1)
+        field_name = fm.group(2)
+        arr_n = int(fm.group(4)) if fm.group(4) else 1
+
+    if ctype not in _C_TYPE_SIZES:
+        raise ValueError(f"Unsupported C type in packed struct {struct_name}: {ctype}")
+    return field_name, ctype, arr_n
+
+
+def _extract_packed_struct_defs(h: str) -> Dict[str, List[Tuple[str, str, int]]]:
+    """Return packed struct field layouts as {StructName: [(field, ctype, array_len), ...]}."""
+    out: Dict[str, List[Tuple[str, str, int]]] = {}
 
     # Capture packed structs: struct __attribute__((packed)) Name { ... };
     for m in re.finditer(
@@ -109,33 +128,23 @@ def _extract_packed_structs(h: str) -> Dict[str, int]:
     ):
         name = m.group(1)
         body = _strip_comments(m.group(2))
-
-        size = 0
+        fields: List[Tuple[str, str, int]] = []
         # Split into statements by ';'
         for stmt in body.split(";"):
             stmt = stmt.strip()
             if not stmt:
                 continue
+            fields.append(_parse_struct_field(name, stmt))
 
-            # Match fields like: uint8_t foo;  or  uint8_t mac6[6]
-            fm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)(\s*\[\s*(\d+)\s*\])?$", stmt)
-            if not fm:
-                # Allow e.g. 'uint8_t sender[3]' with extra spaces
-                fm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*\]$", stmt)
-                if not fm:
-                    raise ValueError(f"Unsupported struct field syntax in {name}: {stmt!r}")
-                ctype = fm.group(1)
-                arr_n = int(fm.group(3))
-            else:
-                ctype = fm.group(1)
-                arr_n = int(fm.group(4)) if fm.group(4) else 1
+        out[name] = fields
 
-            if ctype not in _C_TYPE_SIZES:
-                raise ValueError(f"Unsupported C type in packed struct {name}: {ctype}")
-            size += _C_TYPE_SIZES[ctype] * arr_n
+    return out
 
-        out[name] = size
 
+def _struct_sizes_from_defs(struct_defs: Dict[str, List[Tuple[str, str, int]]]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for name, fields in struct_defs.items():
+        out[name] = sum(_C_TYPE_SIZES[ctype] * arr_n for _, ctype, arr_n in fields)
     return out
 
 
@@ -301,8 +310,9 @@ def generate(header_path: pathlib.Path, out_path: pathlib.Path) -> None:
     constants.update(_extract_enum(h, "RespPolicy"))
     constants.update(_extract_enum(h, "AckStatus"))
 
-    # packed struct sizes
-    struct_sizes = _extract_packed_structs(h)
+    # packed struct layouts + sizes
+    struct_defs = _extract_packed_struct_defs(h)
+    struct_sizes = _struct_sizes_from_defs(struct_defs)
 
     # rules
     rules = _extract_rules(h, constants=constants, struct_sizes=struct_sizes)
@@ -334,6 +344,16 @@ def generate(header_path: pathlib.Path, out_path: pathlib.Path) -> None:
     lines.append("# Packed struct sizes (bytes)")
     for sn in sorted(struct_sizes.keys()):
         lines.append(f"SZ_{sn} = {struct_sizes[sn]}")
+    lines.append("")
+
+    lines.append("# Packed struct field layouts extracted from lora_proto.h")
+    lines.append("STRUCT_FIELDS = {")
+    for sn in sorted(struct_defs.keys()):
+        lines.append(f"    {sn!r}: [")
+        for field_name, ctype, arr_n in struct_defs[sn]:
+            lines.append(f"        ({field_name!r}, {ctype!r}, {arr_n}),")
+        lines.append("    ],")
+    lines.append("}")
     lines.append("")
 
     # PacketRule
@@ -381,7 +401,7 @@ def generate(header_path: pathlib.Path, out_path: pathlib.Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_path", default="lora_proto.h", help="path to lora_proto.h")
-    ap.add_argument("--out", dest="out_path", default="lora_proto_auto.py", help="output python module")
+    ap.add_argument("--out", dest="out_path", default="racelink/lora_proto_auto.py", help="output python module")
     args = ap.parse_args()
 
     header_path = pathlib.Path(args.in_path)

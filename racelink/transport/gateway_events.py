@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 try:
-    import lora_proto_auto as LPA
+    from .. import lora_proto_auto as LPA
 
     _HAVE_AUTO = True
-except Exception:
-    _HAVE_AUTO = False
+except Exception as exc:
+    raise ImportError("RaceLink protocol mirror missing: expected racelink.lora_proto_auto") from exc
 
 
 class LP:
