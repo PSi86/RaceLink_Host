@@ -535,7 +535,7 @@ class RaceLink_LoRa:
         return self.gateway_service.pending_window_closed(ev)
 
     def getDeviceFromAddress(self, addr: str) -> Optional[RL_Device]:
-        """MAC als String ohne Trennzeichen: 12 (voll) oder 6 (last3)."""
+        """MAC as a hex string without separators: 12 chars (full) or 6 chars (last 3 bytes)."""
         if not addr:
             return None
         s = str(addr).strip().upper()

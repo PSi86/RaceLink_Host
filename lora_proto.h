@@ -176,7 +176,7 @@ inline RespDecision decide_response(uint8_t in_type, uint8_t in_body_len) {
 
 // -------------------- Pack/Unpack helpers --------------------
 inline void put3(uint8_t dst[3], const uint8_t src[3]) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; }
-inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: auch weitere helper aus lora_link_core.h hierher oder alle helper nach lora_link_core.h verschieben?
+inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: add more helpers from lora_link_core.h here, or move all helpers into lora_link_core.h.
 
 inline bool parseHeader(const uint8_t* buf, uint8_t len, Header7& h) {
   if (len < sizeof(Header7)) return false;
@@ -189,7 +189,7 @@ inline bool parseHeader(const uint8_t* buf, uint8_t len, Header7& h) {
 template<typename PayloadT>
 inline bool parseBody(const uint8_t* buf, uint8_t len, PayloadT& out) {
   const uint8_t need = (uint8_t)(sizeof(Header7) + sizeof(PayloadT));
-  if (len != need) return false;                      // exakter Match ist hier safer
+  if (len != need) return false;                      // an exact match is safer here
   const uint8_t* body = buf + sizeof(Header7);
   memcpy(&out, body, sizeof(PayloadT));               // direkter memcpy reicht (PayloadT packed!)
   return true;
