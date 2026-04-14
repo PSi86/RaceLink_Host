@@ -79,7 +79,7 @@ RaceLink_Host/
 └─ README.md
 ```
 
-The current README of the repository describes the following package layout:
+The package layout:
 
 - `racelink/app.py` – central application container and dependency wiring anchor
 - `racelink/core/` – cross-cutting contracts such as app events plus source/sink interfaces
@@ -115,7 +115,7 @@ The host tracks devices and runtime state through:
 - `racelink/state/` for repositories and persistence helpers
 
 ### Service layer
-The business logic is grouped under `racelink/services/`. According to the current repository README, this includes services for:
+The business logic is grouped under `racelink/services/`, this includes services for:
 
 - gateway orchestration
 - discovery
@@ -151,7 +151,7 @@ The supported Python mirror path is:
 racelink_proto.h -> gen_racelink_proto_py.py -> racelink/racelink_proto_auto.py
 ```
 
-The current README also states that the generator mirrors:
+The generator mirrors:
 
 - constants
 - response rules
@@ -164,7 +164,7 @@ At the same time, handwritten Python-side builders and decoders still exist, so 
 
 ## Root surface and compatibility notes
 
-The current refactored README states that the repository root now exposes only the RotorHazard plugin entry in `__init__.py`, and that internal imports are expected to use canonical package paths under `racelink/*`.
+The repository root now exposes only the RotorHazard plugin entry in `__init__.py`, and that internal imports are expected to use canonical package paths under `racelink/*`.
 
 It also notes that:
 
@@ -182,7 +182,7 @@ RotorHazard remains the primary supported integration path.
 This makes RaceLink_Host particularly suitable for use cases where wireless devices such as WLED-based nodes, startblocks, or custom node types need to interact with race-management data and workflows.
 
 ### Standalone
-A standalone integration path exists as an additional minimal mode. According to the current README, it is not yet feature-complete.
+A standalone integration path exists as an additional minimal mode. Status: Under development.
 
 ### Polling
 The repository also contains prepared polling source and HTTP sink scaffolds for more generic external integration scenarios.
@@ -202,7 +202,7 @@ Before running or extending the host software, make sure you have:
 
 ## Running checks
 
-The current repository README documents the following test command:
+Use the following test command:
 
 ```bash
 py -3 -m unittest discover -s tests -v
