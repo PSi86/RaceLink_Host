@@ -4,4 +4,8 @@ __pycache__/
 *.pyd
 .vscode/
 .DS_Store
+<<<<<<< HEAD
 *.code-workspace
+=======
+*.code-workspace
+>>>>>>> b61e07cef3c7b61fee5c1c093d7e34e2900949ae
