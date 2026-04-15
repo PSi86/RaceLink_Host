@@ -3,33 +3,63 @@ from __future__ import annotations
 import logging
 from typing import Optional, Union
 
-from .racelink.domain import (
-    RL_Device,
-    RL_DeviceGroup,
-    RL_FLAG_HAS_BRI,
-    RL_FLAG_POWER_ON,
-    build_specials_state,
-    create_device,
-)
-from .racelink.services import (
-    ConfigService,
-    ControlService,
-    DiscoveryService,
-    GatewayService,
-    StartblockService,
-    StatusService,
-    StreamService,
-    SyncService,
-)
-from .racelink.state import get_runtime_state_repository
-from .racelink.state.persistence import dump_records, load_records
-
-from .racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
+try:
+    from racelink.domain import (
+        RL_Device,
+        RL_DeviceGroup,
+        RL_FLAG_HAS_BRI,
+        RL_FLAG_POWER_ON,
+        build_specials_state,
+        create_device,
+    )
+    from racelink.services import (
+        ConfigService,
+        ControlService,
+        DiscoveryService,
+        GatewayService,
+        StartblockService,
+        StatusService,
+        StreamService,
+        SyncService,
+    )
+    from racelink.state import get_runtime_state_repository
+    from racelink.state.persistence import dump_records, load_records
+    from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
+except ImportError:  # pragma: no cover - compatibility path for package-style plugin loading
+    from .racelink.domain import (
+        RL_Device,
+        RL_DeviceGroup,
+        RL_FLAG_HAS_BRI,
+        RL_FLAG_POWER_ON,
+        build_specials_state,
+        create_device,
+    )
+    from .racelink.services import (
+        ConfigService,
+        ControlService,
+        DiscoveryService,
+        GatewayService,
+        StartblockService,
+        StatusService,
+        StreamService,
+        SyncService,
+    )
+    from .racelink.state import get_runtime_state_repository
+    from .racelink.state.persistence import dump_records, load_records
+    from .racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
 
 logger = logging.getLogger(__name__)
 
 
 class RaceLink_Host:
+    """Host controller with a small compatibility surface for outer integrations.
+
+    RotorHazard-specific UI/action/import-export behavior is delegated through
+    ``rh_adapter``. The long-term plugin split should depend on host-owned
+    runtime factories in ``racelink.app`` plus web registration in
+    ``racelink.web`` instead of importing deeper internals directly.
+    """
+
     def __init__(self, rhapi, name, label, state_repository=None):
         self._rhapi = rhapi
         self.name = name
@@ -79,6 +109,27 @@ class RaceLink_Host:
         self.stream_service = StreamService(self, self.gateway_service)
         self.startblock_service = StartblockService(self, self.stream_service)
         self.sync_service = SyncService(self, self.gateway_service)
+
+    def _option(self, key: str, default=None):
+        return self._rhapi.db.option(key, default)
+
+    def _option_set(self, key: str, value) -> None:
+        self._rhapi.db.option_set(key, value)
+
+    def _translate(self, text: str) -> str:
+        return self._rhapi.__(text)
+
+    def _notify(self, message: str) -> None:
+        ui = getattr(self._rhapi, "ui", None)
+        notify = getattr(ui, "message_notify", None) if ui else None
+        if callable(notify):
+            notify(message)
+
+    def _broadcast_ui(self, panel: str) -> None:
+        ui = getattr(self._rhapi, "ui", None)
+        broadcaster = getattr(ui, "broadcast_ui", None) if ui else None
+        if callable(broadcaster):
+            broadcaster(panel)
 
     def _call_rh_adapter(self, method_name: str, *args, default=None, **kwargs):
         adapter = getattr(self, "rh_adapter", None)
@@ -159,26 +210,26 @@ class RaceLink_Host:
     def save_to_db(self, args):
         logger.debug("RL: Writing current states to Database")
         config_str_devices = dump_records(self.device_repository.list())
-        self._rhapi.db.option_set("rl_device_config", config_str_devices)
+        self._option_set("rl_device_config", config_str_devices)
 
         if len(self.group_repository.list()) >= len(self.backup_group_repository.list()):
             config_str_groups = dump_records(self.group_repository.list())
         else:
             config_str_groups = dump_records(self.backup_group_repository.list())
-        self._rhapi.db.option_set("rl_groups_config", config_str_groups)
+        self._option_set("rl_groups_config", config_str_groups)
 
     def load_from_db(self):
         logger.debug("RL: Applying config from Database")
-        config_str_devices = self._rhapi.db.option("rl_device_config", None)
-        config_str_groups = self._rhapi.db.option("rl_groups_config", None)
+        config_str_devices = self._option("rl_device_config", None)
+        config_str_groups = self._option("rl_groups_config", None)
 
         if config_str_devices is None:
             config_str_devices = dump_records(self.backup_device_repository.list())
-            self._rhapi.db.option_set("rl_device_config", config_str_devices)
+            self._option_set("rl_device_config", config_str_devices)
 
         if config_str_devices == "":
             config_str_devices = dump_records([])
-            self._rhapi.db.option_set("rl_device_config", config_str_devices)
+            self._option_set("rl_device_config", config_str_devices)
 
         config_list_devices = load_records(
             config_str_devices,
@@ -231,7 +282,7 @@ class RaceLink_Host:
 
         if config_str_groups is None or config_str_groups == "":
             config_str_groups = dump_records(self.backup_group_repository.list())
-            self._rhapi.db.option_set("rl_groups_config", config_str_groups)
+            self._option_set("rl_groups_config", config_str_groups)
 
         config_list_groups = load_records(
             config_str_groups,
@@ -266,12 +317,12 @@ class RaceLink_Host:
         self.register_settings()
         self.register_quickset_ui()
         self.registerActions()
-        self._rhapi.ui.broadcast_ui("settings")
-        self._rhapi.ui.broadcast_ui("run")
+        self._broadcast_ui("settings")
+        self._broadcast_ui("run")
 
     def discoverPort(self, args):
         """Initialize the active gateway transport."""
-        port = self._rhapi.db.option("psi_comms_port", None)
+        port = self._option("psi_comms_port", None)
         try:
             self._transport_hooks_installed = False
             self.transport = GatewaySerialTransport(port=port, on_event=None)
@@ -285,17 +336,17 @@ class RaceLink_Host:
                 if mac:
                     logger.info("RaceLink Communicator ready on %s with MAC: %s", used, mac)
                     if "manual" in args:
-                        self._rhapi.ui.message_notify(self._rhapi.__("RaceLink Communicator ready on {} with MAC: {}").format(used, mac))
+                        self._notify(self._translate("RaceLink Communicator ready on {} with MAC: {}").format(used, mac))
                 return
             self.ready = False
             logger.warning("No RaceLink Communicator module discovered or configured")
             if "manual" in args:
-                self._rhapi.ui.message_notify(self._rhapi.__("No RaceLink Communicator module discovered or configured"))
+                self._notify(self._translate("No RaceLink Communicator module discovered or configured"))
         except Exception as ex:
             self.ready = False
             logger.error("Gateway transport init failed: %s", ex)
             if "manual" in args:
-                self._rhapi.ui.message_notify(self._rhapi.__("Failed to initialize communicator: {}").format(str(ex)))
+                self._notify(self._translate("Failed to initialize communicator: {}").format(str(ex)))
 
     def onRaceStart(self, _args):
         logger.warning("RaceLink Race Start Event")
@@ -321,7 +372,7 @@ class RaceLink_Host:
                 msg = "Device Discovery finished with {} devices found and added to GroupId: {}".format(found, addToGroup)
             else:
                 msg = "Device Discovery finished with {} devices found.".format(found)
-            self._rhapi.ui.message_notify(msg)
+            self._notify(msg)
         return found
 
     def getStatus(self, groupFilter=255, targetDevice=None):

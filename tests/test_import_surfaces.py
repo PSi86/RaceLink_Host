@@ -115,6 +115,51 @@ def _ensure_rotorhazard_import_stubs():
         sys.modules["flask"] = flask
 
 
+def _ensure_flask_stub():
+    flask = sys.modules.get("flask")
+    if flask is None:
+        flask = types.ModuleType("flask")
+        sys.modules["flask"] = flask
+
+    class Flask:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.blueprints = {}
+
+        def register_blueprint(self, blueprint):
+            self.blueprints[blueprint.name] = blueprint
+
+        def route(self, *_args, **_kwargs):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def run(self, *args, **kwargs):
+            return None
+
+    class Blueprint:
+        def __init__(self, name, *args, **kwargs):
+            self.name = name
+            self.args = args
+            self.kwargs = kwargs
+
+        def route(self, *args, **kwargs):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+    flask.Flask = Flask
+    flask.Blueprint = Blueprint
+    flask.templating = types.SimpleNamespace(render_template=lambda *args, **kwargs: {})
+    flask.request = types.SimpleNamespace(args={}, json=None, form={}, get_json=lambda silent=True: {})
+    flask.jsonify = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
+    flask.Response = type("Response", (), {})
+    flask.stream_with_context = lambda fn: fn
+
+
 def _load_root_plugin():
     module_name = "gatecontrol_root_plugin_test"
     if module_name in sys.modules:
@@ -156,6 +201,26 @@ class ImportSurfaceTests(unittest.TestCase):
         plugin_module = importlib.import_module(f"{root_plugin.__name__}.racelink.integrations.rotorhazard.plugin")
 
         self.assertTrue(hasattr(plugin_module, "initialize"))
+
+    def test_top_level_controller_module_is_importable(self):
+        _ensure_serial_stub()
+        module = importlib.import_module("controller")
+
+        self.assertTrue(hasattr(module, "RaceLink_Host"))
+
+    def test_host_runtime_factory_is_importable(self):
+        _ensure_serial_stub()
+        module = importlib.import_module("racelink.app")
+
+        self.assertTrue(callable(module.create_runtime))
+
+    def test_standalone_surface_imports_without_rotorhazard_modules(self):
+        _ensure_serial_stub()
+        _ensure_flask_stub()
+        module = importlib.import_module("racelink.integrations.standalone")
+
+        self.assertTrue(callable(module.create_standalone_app))
+        self.assertTrue(callable(module.build_standalone_runtime))
 
 
 if __name__ == "__main__":

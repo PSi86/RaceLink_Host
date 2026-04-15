@@ -1,5 +1,9 @@
-"""Created by Peter Simandl "PSi86" in 2026.
-Works with Rotorhazard 4.0.
+"""Compatibility shim for the legacy RotorHazard plugin entrypoint.
+
+The actual RotorHazard integration lives under
+``racelink.integrations.rotorhazard``. This root module remains only so the
+current RH plugin loader can import ``initialize`` without knowing host package
+internals.
 """
 
 def initialize(rhapi):

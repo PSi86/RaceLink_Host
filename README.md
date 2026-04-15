@@ -2,6 +2,8 @@
 
 Host software for the **RaceLink** wireless control system.
 
+RaceLink_Host is also prepared as an installable Python package so other projects can add it as a dependency and import it via `racelink`.
+
 This repository contains the host-side software of the RaceLink ecosystem. It is the central software component that communicates with the **RaceLink Gateway** over USB, orchestrates wireless nodes, manages runtime state, and exposes higher-level integrations and web interfaces.
 
 In a typical setup:
@@ -179,10 +181,14 @@ It also notes that:
 ### RotorHazard
 RotorHazard remains the primary supported integration path.
 
+The existing RotorHazard integration code remains in this repository for compatibility, while the integration packaging is being split into a dedicated repository.
+
 This makes RaceLink_Host particularly suitable for use cases where wireless devices such as WLED-based nodes, startblocks, or custom node types need to interact with race-management data and workflows.
 
 ### Standalone
 A standalone integration path exists as an additional minimal mode. Status: Under development.
+
+The same RaceLink web UI is mounted in standalone Flask and can be mounted into RotorHazard's Flask host through the shared registration entry in `racelink.web`.
 
 ### Polling
 The repository also contains prepared polling source and HTTP sink scaffolds for more generic external integration scenarios.
@@ -206,6 +212,12 @@ Use the following test command:
 
 ```bash
 py -3 -m unittest discover -s tests -v
+```
+
+For local package installation checks:
+
+```bash
+py -3 -m pip install --no-deps --no-build-isolation .
 ```
 
 Architecture boundary checks are included in the same test run.

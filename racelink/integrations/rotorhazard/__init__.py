@@ -1,6 +1,12 @@
-"""RotorHazard integration package for RaceLink."""
+"""RotorHazard integration package for RaceLink.
 
-__all__ = ["initialize"]
+This package is intentionally kept at the repository edge so it can later move
+to the dedicated plugin repository with minimal host-side changes.
+"""
+
+__all__ = [
+    "initialize",
+]
 
 
 def __getattr__(name):

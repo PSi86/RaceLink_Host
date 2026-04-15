@@ -1,12 +1,15 @@
-"""RaceLink application container.
-
-RL-003 introduces a central place for dependency wiring without changing the
-active runtime behavior yet.
-"""
+"""RaceLink application container and stable host-owned runtime entrypoints."""
 
 from __future__ import annotations
 
 from .core import NullSink, NullSource
+from .services import HostWifiService, OTAService, PresetsService
+from .state import get_runtime_state_repository
+
+__all__ = [
+    "RaceLinkApp",
+    "create_runtime",
+]
 
 
 class RaceLinkApp:
@@ -43,3 +46,72 @@ class RaceLinkApp:
     @property
     def group_repository(self):
         return self.state_repository.groups if self.state_repository else None
+
+
+def create_runtime(
+    host_api,
+    *,
+    name: str = "RaceLink_Host",
+    label: str = "RaceLink",
+    state_repository=None,
+    controller=None,
+    controller_class=None,
+    event_source=None,
+    data_sink=None,
+    integrations=None,
+    presets_apply_options=None,
+    extra_services=None,
+):
+    """Build the standard RaceLink host runtime for any outer integration.
+
+    This is the stable host-side factory that external integrations, including
+    the future RotorHazard plugin repository, are allowed to import.
+    """
+
+    runtime_state = state_repository or get_runtime_state_repository()
+
+    if controller is None:
+        runtime_controller_class = controller_class
+        if runtime_controller_class is None:
+            from controller import RaceLink_Host as runtime_controller_class
+
+        controller = runtime_controller_class(
+            host_api,
+            name,
+            label,
+            state_repository=runtime_state,
+        )
+
+    presets_service = PresetsService(
+        option_getter=host_api.db.option,
+        option_setter=host_api.db.option_set,
+        apply_options=presets_apply_options,
+    )
+    host_wifi_service = HostWifiService()
+    ota_service = OTAService(host_wifi_service=host_wifi_service, presets_service=presets_service)
+
+    services = {
+        "config": controller.config_service,
+        "control": controller.control_service,
+        "gateway": controller.gateway_service,
+        "discovery": controller.discovery_service,
+        "host_wifi": host_wifi_service,
+        "ota": ota_service,
+        "presets": presets_service,
+        "startblock": controller.startblock_service,
+        "status": controller.status_service,
+        "stream": controller.stream_service,
+        "sync": controller.sync_service,
+    }
+    if extra_services:
+        services.update(extra_services)
+
+    return RaceLinkApp(
+        controller=controller,
+        transport=getattr(controller, "transport", None),
+        state_repository=runtime_state,
+        services=services,
+        integrations=dict(integrations or {}),
+        event_source=event_source or NullSource(),
+        data_sink=data_sink or NullSink(),
+    )

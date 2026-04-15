@@ -12,8 +12,8 @@ from ...core import NullSink, NullSource
 from ...domain import RL_DeviceGroup
 from ...services import HostWifiService, OTAService, PresetsService
 from ...state import get_runtime_state_repository
-from ...web import register_rl_blueprint
-from ....controller import RaceLink_Host
+from ...web import RaceLinkWebRuntime, register_racelink_web
+from controller import RaceLink_Host
 from .config import StandaloneConfig, StandaloneOptionStore
 
 logger = logging.getLogger(__name__)
@@ -104,14 +104,18 @@ def create_standalone_app(config: StandaloneConfig | None = None) -> tuple[Flask
         data_sink=NullSink(),
     )
 
-    register_rl_blueprint(
-        rhapi,
+    web_runtime = RaceLinkWebRuntime(
         rl_instance=rl_app.rl_instance,
         state_repository=state_repository,
+        rl_devicelist=None,
+        rl_grouplist=None,
         services=rl_app.services,
         RL_DeviceGroup=RL_DeviceGroup,
         logger=logger,
+        option_getter=rhapi.db.option,
+        translator=rhapi.__,
     )
+    register_racelink_web(app, web_runtime, url_prefix="/racelink")
 
     @app.route("/")
     def index():

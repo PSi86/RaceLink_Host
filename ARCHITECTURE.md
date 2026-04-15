@@ -20,7 +20,8 @@ The long-term architecture is introduced as a package scaffold under
 `racelink/`:
 
 - `racelink/app.py`
-  Active application container and dependency wiring entrypoint.
+  Active application container plus the stable host-owned runtime factory used
+  by outer integrations.
 - `racelink/core/`
   Cross-cutting runtime abstractions, events, source/sink contracts, and
   application-level contracts.
@@ -42,8 +43,8 @@ The long-term architecture is introduced as a package scaffold under
 - `racelink/integrations/polling/`
   Polling/web-source and sink adapters for future non-RotorHazard operation.
 - `racelink/web/`
-  Flask blueprint composition, API modules, SSE handling, DTOs, and task
-  orchestration.
+  Shared RaceLink WebUI registration, Flask blueprint composition, API
+  modules, SSE handling, DTOs, and task orchestration.
 
 ## Layer Responsibilities
 
@@ -58,9 +59,15 @@ The long-term architecture is introduced as a package scaffold under
 - `services` implement business workflows against protocol, transport, and
   repositories.
 - `integrations/*` adapt environment-specific systems into the core.
+- `racelink.app.create_runtime(...)` and `racelink.web.register_racelink_web(...)`
+  form the intended host-owned import edge for future external plugin
+  repositories.
 - `web` adapts HTTP/SSE traffic to services without embedding business logic.
   Specials metadata lives in `domain/specials.py`, but the web layer reads it
   through `SpecialsService` so routes do not depend directly on domain helpers.
+  The RaceLink WebUI keeps `pages/` and `static/` as RaceLink-owned assets and
+  mounts that same UI in both standalone Flask and RotorHazard-hosted Flask
+  contexts through a shared web registration entrypoint.
 - `app.py` is now the single dependency-wiring container; remaining cleanup is
   mostly about reducing legacy controller surface and moving heavy route
   workflows out of `web/api.py`.
@@ -126,6 +133,9 @@ expected to hold, without trying to lint every architectural nuance.
   business logic.
 - `integrations/rotorhazard` may import core/services/web modules, but core
   layers must not import RotorHazard-specific modules.
+- The repository root `__init__.py` is only a temporary compatibility shim for
+  the current RotorHazard plugin loader and is expected to move with the plugin
+  split later.
 - `integrations/standalone` and `integrations/polling` follow the same adapter
   direction: inward to the core, never the other way around.
 - RotorHazard adapters may still read domain-level specials metadata directly

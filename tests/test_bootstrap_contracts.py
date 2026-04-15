@@ -7,38 +7,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN_PATH = ROOT / "racelink" / "integrations" / "rotorhazard" / "plugin.py"
 CONTROLLER_PATH = ROOT / "controller.py"
 API_PATH = ROOT / "racelink" / "web" / "api.py"
+STANDALONE_WEBAPP_PATH = ROOT / "racelink" / "integrations" / "standalone" / "webapp.py"
 
 
 class BootstrapContractTests(unittest.TestCase):
-    def test_rotorhazard_plugin_wires_expected_services(self):
-        tree = ast.parse(PLUGIN_PATH.read_text(encoding="utf-8"), filename=str(PLUGIN_PATH))
-        service_keys = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if getattr(node.func, "id", None) != "RaceLinkApp":
-                continue
-            for kw in node.keywords:
-                if kw.arg != "services" or not isinstance(kw.value, ast.Dict):
-                    continue
-                for key_node in kw.value.keys:
-                    if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
-                        service_keys.add(key_node.value)
-
-        expected = {
-            "config",
-            "control",
-            "discovery",
-            "gateway",
-            "host_wifi",
-            "ota",
-            "presets",
-            "startblock",
-            "status",
-            "stream",
-            "sync",
-        }
-        self.assertTrue(expected.issubset(service_keys), service_keys)
+    def test_rotorhazard_plugin_uses_host_runtime_factory(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("create_runtime(", source)
+        self.assertIn("presets_apply_options=rh_adapter.apply_presets_options", source)
+        self.assertIn("integrations={\"rotorhazard\": rhapi", source)
+        self.assertNotIn("RaceLinkApp(", source)
 
     def test_controller_no_longer_contains_dead_startblock_paths(self):
         source = CONTROLLER_PATH.read_text(encoding="utf-8")
@@ -54,6 +32,12 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertIn("specials_service.resolve_action", source)
         self.assertNotIn("host_wifi_service.connect_profile(", source)
         self.assertNotIn("ota_service.wait_for_expected_node(", source)
+
+    def test_standalone_webapp_uses_shared_web_registration_entry(self):
+        source = STANDALONE_WEBAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("register_racelink_web", source)
+        self.assertIn("RaceLinkWebRuntime", source)
+        self.assertNotIn("register_rl_blueprint(", source)
 
 
 if __name__ == "__main__":

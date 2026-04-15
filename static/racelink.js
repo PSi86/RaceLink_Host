@@ -1,6 +1,22 @@
 (function(){
   const $ = (sel, ctx=document) => ctx.querySelector(sel);
   const $$ = (sel, ctx=document) => Array.from(ctx.querySelectorAll(sel));
+  const RL_BASE_PATH = (document.body?.dataset?.rlBasePath || "/racelink").replace(/\/$/, "");
+
+  function withBasePath(path){
+    if(!path) return RL_BASE_PATH || "/";
+    if(/^https?:\/\//i.test(path)) return path;
+    let normalized = String(path).trim();
+    if(normalized === "/racelink"){
+      normalized = "/";
+    } else if(normalized.startsWith("/racelink/")){
+      normalized = normalized.slice("/racelink".length);
+    }
+    if(!normalized.startsWith("/")){
+      normalized = `/${normalized}`;
+    }
+    return RL_BASE_PATH ? `${RL_BASE_PATH}${normalized}` : normalized;
+  }
 
   const fmt = {
     num: v => (v===null || v===undefined || isNaN(v)) ? "" : String(v),
@@ -82,13 +98,13 @@
   };
 
   async function apiGet(url){
-    const res = await fetch(url, {credentials:"same-origin"});
+    const res = await fetch(withBasePath(url), {credentials:"same-origin"});
     const j = await res.json().catch(()=>({ok:false,error:"Bad JSON"}));
     j.__status = res.status;
     return j;
   }
   async function apiPost(url, body){
-    const res = await fetch(url, {
+    const res = await fetch(withBasePath(url), {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body||{}),
@@ -99,7 +115,7 @@
     return j;
   }
   async function apiUpload(url, formData){
-    const res = await fetch(url, {
+    const res = await fetch(withBasePath(url), {
       method: "POST",
       body: formData,
       credentials: "same-origin"
@@ -1052,7 +1068,7 @@ async function openSpecialsDialog(mac){
   // SSE connection
   function connectEvents(){
     try{
-      const es = new EventSource("/racelink/api/events", {withCredentials:true});
+      const es = new EventSource(withBasePath("/api/events"), {withCredentials:true});
       es.addEventListener("master", (e)=>{ try{ updateMaster(JSON.parse(e.data)); }catch{} });
       es.addEventListener("task", (e)=>{ try{ updateTask(JSON.parse(e.data)); }catch{} });
       es.addEventListener("refresh", async (e)=>{

@@ -8,14 +8,13 @@ import logging
 
 from eventmanager import Evt
 
-from ...app import RaceLinkApp
+from ...app import create_runtime
 from ...core import NullSink
 from ...domain import RL_DeviceGroup
-from ...services import HostWifiService, OTAService, PresetsService
 from ...state import get_runtime_state_repository
 from ...web import register_rl_blueprint
 from .ui import RotorHazardUIAdapter
-from ....controller import RaceLink_Host
+from controller import RaceLink_Host
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +27,8 @@ def initialize(rhapi):
 
     state_repository = get_runtime_state_repository()
 
+    # Keep RotorHazard wiring local to this package so it can move out to the
+    # plugin repository without dragging broader host internals with it.
     controller = RaceLink_Host(
         rhapi,
         "RaceLink_Host",
@@ -37,30 +38,11 @@ def initialize(rhapi):
     rh_adapter = RotorHazardUIAdapter(controller, rhapi)
     controller.rh_adapter = rh_adapter
     controller.rh_source = rh_adapter.source
-    presets_service = PresetsService(
-        option_getter=rhapi.db.option,
-        option_setter=rhapi.db.option_set,
-        apply_options=rh_adapter.apply_presets_options,
-    )
-    host_wifi_service = HostWifiService()
-    ota_service = OTAService(host_wifi_service=host_wifi_service, presets_service=presets_service)
-    rl_app = RaceLinkApp(
-        controller=controller,
-        transport=getattr(controller, "transport", None),
+    rl_app = create_runtime(
+        rhapi,
         state_repository=state_repository,
-        services={
-            "config": controller.config_service,
-            "control": controller.control_service,
-            "gateway": controller.gateway_service,
-            "discovery": controller.discovery_service,
-            "host_wifi": host_wifi_service,
-            "ota": ota_service,
-            "presets": presets_service,
-            "startblock": controller.startblock_service,
-            "status": controller.status_service,
-            "stream": controller.stream_service,
-            "sync": controller.sync_service,
-        },
+        controller=controller,
+        presets_apply_options=rh_adapter.apply_presets_options,
         integrations={"rotorhazard": rhapi, "rotorhazard_ui": rh_adapter, "rotorhazard_source": rh_adapter.source},
         event_source=rh_adapter.source,
         data_sink=NullSink(),
