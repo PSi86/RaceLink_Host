@@ -465,11 +465,6 @@ class GatewayService:
                         dev_type = ev.get("caps", 0)
                         dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=f"WLED {mac12}")
                         self.controller.device_repository.append(dev)
-                        try:
-                            if hasattr(self.controller, "createUiDevList"):
-                                self.controller.uiDeviceList = self.controller.createUiDevList()
-                        except Exception:
-                            pass
 
                     dev.update_from_identify(
                         ev.get("version"),

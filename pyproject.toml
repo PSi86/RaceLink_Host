@@ -17,7 +17,7 @@ dependencies = [
   "Flask>=3.0,<4",
   "pyserial>=3.5,<4",
 ]
-keywords = ["racelink", "rotorhazard", "wireless", "gateway", "wled"]
+keywords = ["racelink", "wireless", "gateway", "wled"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",

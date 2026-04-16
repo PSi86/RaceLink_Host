@@ -52,13 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 class RaceLink_Host:
-    """Host controller with a small compatibility surface for outer integrations.
-
-    RotorHazard-specific UI/action/import-export behavior is delegated through
-    ``rh_adapter``. The long-term plugin split should depend on host-owned
-    runtime factories in ``racelink.app`` plus web registration in
-    ``racelink.web`` instead of importing deeper internals directly.
-    """
+    """Host controller coordinating runtime state, transport, and core services."""
 
     def __init__(self, rhapi, name, label, state_repository=None):
         self._rhapi = rhapi
@@ -67,14 +61,8 @@ class RaceLink_Host:
         self.state_repository = state_repository or get_runtime_state_repository()
         self.transport = None
         self.ready = False
-        self.action_reg_fn = None
         self.deviceCfgValid = False
         self.groupCfgValid = False
-        self.uiDeviceList = None
-        self.uiGroupList = None
-        self.uiDiscoveryGroupList = None
-        self.rh_adapter = None
-        self.rh_source = None
 
         # Transport-level pending expectation (for online/offline determination).
         self._pending_expect = None  # dict with keys: dev, rule, opcode7, sender_last3, ts
@@ -131,13 +119,6 @@ class RaceLink_Host:
         if callable(broadcaster):
             broadcaster(panel)
 
-    def _call_rh_adapter(self, method_name: str, *args, default=None, **kwargs):
-        adapter = getattr(self, "rh_adapter", None)
-        method = getattr(adapter, method_name, None) if adapter else None
-        if callable(method):
-            return method(*args, **kwargs)
-        return default
-
     @property
     def device_repository(self):
         return self.state_repository.devices
@@ -153,55 +134,6 @@ class RaceLink_Host:
     @property
     def backup_group_repository(self):
         return self.state_repository.backup_groups
-
-    def register_settings(self):
-        return self._call_rh_adapter("register_settings")
-
-    def createUiDevList(self):
-        return self._call_rh_adapter("createUiDevList", default=[])
-
-    def rl_createUiDevList(self, dev_types=None, capabilities=None, outputDevices=True, outputGroups=True):
-        return self._call_rh_adapter(
-            "rl_createUiDevList",
-            dev_types=dev_types,
-            capabilities=capabilities,
-            outputDevices=outputDevices,
-            outputGroups=outputGroups,
-            default={"devices": [], "groups": []},
-        )
-
-    def createUiGroupList(self, exclude_static=False):
-        return self._call_rh_adapter("createUiGroupList", exclude_static=exclude_static, default=[])
-
-    def register_quickset_ui(self):
-        return self._call_rh_adapter("register_quickset_ui")
-
-    def registerActions(self, args=None):
-        return self._call_rh_adapter("registerActions", args, default=None)
-
-    def register_rl_dataimporter(self, args):
-        return self._call_rh_adapter("register_rl_dataimporter", args, default=None)
-
-    def register_rl_dataexporter(self, args):
-        return self._call_rh_adapter("register_rl_dataexporter", args, default=None)
-
-    def nodeSwitch(self, action, args=None):
-        return self._call_rh_adapter("nodeSwitch", action, args, default=None)
-
-    def groupSwitch(self, action, args=None):
-        return self._call_rh_adapter("groupSwitch", action, args, default=None)
-
-    def discoveryAction(self, args):
-        return self._call_rh_adapter("discoveryAction", args, default=None)
-
-    def rl_write_json(self, data):
-        return self._call_rh_adapter("rl_write_json", data, default={"data": "{}", "encoding": "application/json", "ext": "json"})
-
-    def rl_config_json_output(self, rhapi=None):
-        return self._call_rh_adapter("rl_config_json_output", rhapi, default={})
-
-    def rl_import_json(self, importer_class, rhapi, source, args):
-        return self._call_rh_adapter("rl_import_json", importer_class, rhapi, source, args, default=False)
 
     def onStartup(self, _args):
         self.load_from_db()
@@ -310,15 +242,6 @@ class RaceLink_Host:
                     group.static_group = 1
                     group.dev_type = 0
         self.group_repository.replace_all(loaded_groups)
-
-        self.uiDeviceList = self.createUiDevList()
-        self.uiGroupList = self.createUiGroupList()
-        self.uiDiscoveryGroupList = self.createUiGroupList(True)
-        self.register_settings()
-        self.register_quickset_ui()
-        self.registerActions()
-        self._broadcast_ui("settings")
-        self._broadcast_ui("run")
 
     def discoverPort(self, args):
         """Initialize the active gateway transport."""

@@ -7,11 +7,9 @@ from types import SimpleNamespace
 
 from flask import Flask
 
-from ...app import RaceLinkApp
+from ...app import RaceLinkApp, create_runtime
 from ...core import NullSink, NullSource
 from ...domain import RL_DeviceGroup
-from ...services import HostWifiService, OTAService, PresetsService
-from ...state import get_runtime_state_repository
 from ...web import RaceLinkWebRuntime, register_racelink_web
 from controller import RaceLink_Host
 from .config import StandaloneConfig, StandaloneOptionStore
@@ -45,8 +43,8 @@ class _StandaloneFieldsShim:
         return None
 
 
-class StandaloneRhApiShim:
-    """Small RotorHazard-shaped shim so the existing controller/web code can run standalone."""
+class StandaloneHostApiShim:
+    """Small host-API shim so the shared controller and web code can run standalone."""
 
     def __init__(self, app: Flask, config: StandaloneConfig):
         self.app = app
@@ -64,45 +62,20 @@ class StandaloneRhApiShim:
 def create_standalone_app(config: StandaloneConfig | None = None) -> tuple[Flask, RaceLinkApp]:
     cfg = config or StandaloneConfig.load()
     app = Flask("racelink_standalone")
-    rhapi = StandaloneRhApiShim(app, cfg)
-    state_repository = get_runtime_state_repository()
+    host_api = StandaloneHostApiShim(app, cfg)
+    event_source = NullSource()
+    data_sink = NullSink()
+    host_api.event_source = event_source
+    host_api.data_sink = data_sink
 
-    controller = RaceLink_Host(
-        rhapi,
-        "RaceLink_Host",
-        "RaceLink",
-        state_repository=state_repository,
+    rl_app = create_runtime(
+        host_api,
+        controller_class=RaceLink_Host,
+        integrations={"standalone": host_api, "flask_app": app},
+        event_source=event_source,
+        data_sink=data_sink,
     )
-    controller.rh_source = NullSource()
-
-    presets_service = PresetsService(
-        option_getter=rhapi.db.option,
-        option_setter=rhapi.db.option_set,
-    )
-    host_wifi_service = HostWifiService()
-    ota_service = OTAService(host_wifi_service=host_wifi_service, presets_service=presets_service)
-
-    rl_app = RaceLinkApp(
-        controller=controller,
-        transport=getattr(controller, "transport", None),
-        state_repository=state_repository,
-        services={
-            "config": controller.config_service,
-            "control": controller.control_service,
-            "gateway": controller.gateway_service,
-            "discovery": controller.discovery_service,
-            "host_wifi": host_wifi_service,
-            "ota": ota_service,
-            "presets": presets_service,
-            "startblock": controller.startblock_service,
-            "status": controller.status_service,
-            "stream": controller.stream_service,
-            "sync": controller.sync_service,
-        },
-        integrations={"standalone": rhapi, "flask_app": app},
-        event_source=NullSource(),
-        data_sink=NullSink(),
-    )
+    state_repository = rl_app.state_repository
 
     web_runtime = RaceLinkWebRuntime(
         rl_instance=rl_app.rl_instance,
@@ -112,8 +85,8 @@ def create_standalone_app(config: StandaloneConfig | None = None) -> tuple[Flask
         services=rl_app.services,
         RL_DeviceGroup=RL_DeviceGroup,
         logger=logger,
-        option_getter=rhapi.db.option,
-        translator=rhapi.__,
+        option_getter=host_api.db.option,
+        translator=host_api.__,
     )
     register_racelink_web(app, web_runtime, url_prefix="/racelink")
 

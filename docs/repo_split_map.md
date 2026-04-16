@@ -1,44 +1,35 @@
 # Repository Split Map
 
-This document marks the current RotorHazard-facing files that can move into the
-future plugin repository without changing the host-owned runtime boundary.
+This map records the RotorHazard split after the adapter removal from `RaceLink_Host`.
 
-## Stable Host-Owned Import Edge
+## Host-Owned Import Edge
 
-These entrypoints should stay in `RaceLink_Host` and are the supported import
-surface for the future plugin repository:
+These entry points stay in `RaceLink_Host` and are the supported surface for external adapters:
 
 - `racelink.app:create_runtime`
 - `racelink.web:register_racelink_web`
 - `racelink.web:RaceLinkWebRuntime`
 
-The plugin repo should avoid reaching deeper into host internals than these
-entrypoints unless a later refactor explicitly promotes another API.
+## Already Moved Out Of Host
 
-## Planned Move Map
+The following paths used to live in this repository and now belong in the separate `RaceLink_RH-plugin` repository:
 
-| Current Path | Target Path In Plugin Repo | Notes |
+| Previous Host Path | Target In Plugin Repo | Notes |
 | --- | --- | --- |
-| `__init__.py` | plugin repo root `__init__.py` | Keep as the RH loader shim in the plugin repo. |
-| `racelink/integrations/rotorhazard/__init__.py` | `racelink_rh_plugin/integrations/rotorhazard/__init__.py` | Package edge for the extracted RH integration. |
-| `racelink/integrations/rotorhazard/plugin.py` | `racelink_rh_plugin/integrations/rotorhazard/plugin.py` | Should keep importing `create_runtime(...)` and `register_racelink_web(...)` from the host package. |
-| `racelink/integrations/rotorhazard/ui.py` | `racelink_rh_plugin/integrations/rotorhazard/ui.py` | RotorHazard UI adapter only. |
-| `racelink/integrations/rotorhazard/actions.py` | `racelink_rh_plugin/integrations/rotorhazard/actions.py` | RotorHazard action registration only. |
-| `racelink/integrations/rotorhazard/dataio.py` | `racelink_rh_plugin/integrations/rotorhazard/dataio.py` | RotorHazard import/export adapter only. |
-| `racelink/integrations/rotorhazard/source.py` | `racelink_rh_plugin/integrations/rotorhazard/source.py` | RotorHazard event/data source adapter only. |
+| `__init__.py` | plugin repo root `__init__.py` | RotorHazard loader shim now belongs with the plugin. |
+| `racelink/integrations/rotorhazard/__init__.py` | `racelink_rh_plugin/integrations/rotorhazard/__init__.py` | Plugin package edge. |
+| `racelink/integrations/rotorhazard/plugin.py` | `racelink_rh_plugin/integrations/rotorhazard/plugin.py` | Adapter bootstrap for RH. |
+| `racelink/integrations/rotorhazard/ui.py` | `racelink_rh_plugin/integrations/rotorhazard/ui.py` | RotorHazard UI adapter. |
+| `racelink/integrations/rotorhazard/actions.py` | `racelink_rh_plugin/integrations/rotorhazard/actions.py` | RH action registration. |
+| `racelink/integrations/rotorhazard/dataio.py` | `racelink_rh_plugin/integrations/rotorhazard/dataio.py` | RH import and export adapter. |
+| `racelink/integrations/rotorhazard/source.py` | `racelink_rh_plugin/integrations/rotorhazard/source.py` | RH event source adapter. |
 
-## Host Files That Stay Put
+## Files That Stay In Host
 
-These files remain in `RaceLink_Host` and should not be moved with the plugin:
-
-| Current Path | Why It Stays In Host |
+| Host Path | Why It Stays |
 | --- | --- |
-| `racelink/app.py` | Owns the stable runtime factory and shared service wiring. |
-| `racelink/web/**` | Owns the shared RaceLink WebUI registration and host-mounted HTTP/SSE surface. |
-| `controller.py` | Still owns compatibility behavior and communicator lifecycle for the host runtime. |
-
-## RH-Touchpoint Notes
-
-- `controller.py` still contains RH-shaped compatibility methods such as `register_settings`, `registerActions`, and import/export forwarding. These are delegated through `rh_adapter` and are the main remaining host-side RH touchpoints.
-- The current plugin bootstrap still constructs `RaceLink_Host` directly because that compatibility controller remains the active runtime anchor.
-- No files are deleted yet; this map is only for preparing the later extraction.
+| `racelink/app.py` | Owns the host runtime factory and service wiring. |
+| `racelink/web/**` | Owns the shared RaceLink WebUI registration, API, SSE, and task state. |
+| `racelink/integrations/standalone/**` | Hosts the standalone Flask mode. |
+| `pages/**` and `static/**` | Shared RaceLink WebUI assets for all hosting modes. |
+| `controller.py` | Host controller and runtime coordinator. |

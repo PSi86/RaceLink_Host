@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from racelink.domain import RL_Device, RL_Dev_Type
 from racelink.services.startblock_service import StartblockService
@@ -38,7 +39,7 @@ class FakeSource:
 
 class FakeController:
     def __init__(self, devices=None):
-        self.rh_source = FakeSource()
+        self._rhapi = SimpleNamespace(event_source=FakeSource())
         self.saved = []
         self.send_config_calls = []
         self._devices = devices or []
