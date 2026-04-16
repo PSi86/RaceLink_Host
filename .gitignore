@@ -9,8 +9,6 @@ __pycache__/
 # Local Codex/debug packaging artifacts
 .pkgtest/
 .piptmp/
-.pi_files/
-.pi_files_2/
 .wheelcheck/
 .wheel-test/
 tmp*/
