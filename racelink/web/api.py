@@ -22,17 +22,17 @@ def register_api_routes(bp, ctx):
     )
 
 
-    @bp.route("/racelink/api/devices", methods=["GET"])
+    @bp.route("/api/devices", methods=["GET"])
     def api_devices():
         with ctx.rl_lock:
             rows = [serialize_device(device) for device in ctx.devices()]
         return jsonify({"ok": True, "devices": rows})
 
-    @bp.route("/racelink/api/specials", methods=["GET"])
+    @bp.route("/api/specials", methods=["GET"])
     def api_specials():
         return jsonify({"ok": True, "specials": specials_service.get_serialized_config()})
 
-    @bp.route("/racelink/api/groups", methods=["GET"])
+    @bp.route("/api/groups", methods=["GET"])
     def api_groups():
         with ctx.rl_lock:
             counts = group_counts(ctx.devices())
@@ -56,19 +56,19 @@ def register_api_routes(bp, ctx):
                 })
         return jsonify({"ok": True, "groups": rows})
 
-    @bp.route("/racelink/api/master", methods=["GET"])
+    @bp.route("/api/master", methods=["GET"])
     def api_master():
         return jsonify({"ok": True, "master": ctx.sse.master.snapshot(), "task": ctx.tasks.snapshot()})
 
-    @bp.route("/racelink/api/task", methods=["GET"])
+    @bp.route("/api/task", methods=["GET"])
     def api_task():
         return jsonify({"ok": True, "task": ctx.tasks.snapshot()})
 
-    @bp.route("/racelink/api/options", methods=["GET"])
+    @bp.route("/api/options", methods=["GET"])
     def api_options():
         return jsonify({"ok": True, "effects": effect_select_options(context={"rl_instance": ctx.rl_instance})})
 
-    @bp.route("/racelink/api/discover", methods=["POST"])
+    @bp.route("/api/discover", methods=["POST"])
     def api_discover():
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
         if ctx.tasks.is_running():
@@ -102,7 +102,7 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
-    @bp.route("/racelink/api/status", methods=["POST"])
+    @bp.route("/api/status", methods=["POST"])
     def api_status():
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
         if ctx.tasks.is_running():
@@ -133,7 +133,7 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
-    @bp.route("/racelink/api/devices/update-meta", methods=["POST"])
+    @bp.route("/api/devices/update-meta", methods=["POST"])
     def api_devices_update_meta():
         body = request.get_json(silent=True) or {}
         macs = body.get("macs") or []
@@ -166,7 +166,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups", "devices"]})
         return jsonify({"ok": True, "changed": changed})
 
-    @bp.route("/racelink/api/groups/create", methods=["POST"])
+    @bp.route("/api/groups/create", methods=["POST"])
     def api_groups_create():
         body = request.get_json(silent=True) or {}
         name = str(body.get("name", "")).strip()
@@ -186,7 +186,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups"]})
         return jsonify({"ok": True, "id": gid})
 
-    @bp.route("/racelink/api/groups/rename", methods=["POST"])
+    @bp.route("/api/groups/rename", methods=["POST"])
     def api_groups_rename():
         body = request.get_json(silent=True) or {}
         gid = int(body.get("id"))
@@ -205,7 +205,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups"]})
         return jsonify({"ok": True})
 
-    @bp.route("/racelink/api/groups/delete", methods=["POST"])
+    @bp.route("/api/groups/delete", methods=["POST"])
     def api_groups_delete():
         body = request.get_json(silent=True) or {}
         gid = int(body.get("id"))
@@ -229,7 +229,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups"]})
         return jsonify({"ok": True})
 
-    @bp.route("/racelink/api/groups/force", methods=["POST"])
+    @bp.route("/api/groups/force", methods=["POST"])
     def api_groups_force():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -241,7 +241,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups", "devices"]})
         return jsonify({"ok": True})
 
-    @bp.route("/racelink/api/save", methods=["POST"])
+    @bp.route("/api/save", methods=["POST"])
     def api_save():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -251,7 +251,7 @@ def register_api_routes(bp, ctx):
             return jsonify({"ok": False, "error": str(ex)}), 500
         return jsonify({"ok": True})
 
-    @bp.route("/racelink/api/reload", methods=["POST"])
+    @bp.route("/api/reload", methods=["POST"])
     def api_reload():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -262,7 +262,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.broadcast("refresh", {"what": ["groups", "devices"]})
         return jsonify({"ok": True})
 
-    @bp.route("/racelink/api/config", methods=["POST"])
+    @bp.route("/api/config", methods=["POST"])
     def api_config():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -305,7 +305,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.master.set(state="TX", tx_pending=True, last_event="CONFIG_SENT")
         return jsonify({"ok": True, "sent": 1, "recv3": recv3.hex().upper(), "option": option, "data0": data0, "data1": data1, "data2": data2, "data3": data3})
 
-    @bp.route("/racelink/api/specials/config", methods=["POST"])
+    @bp.route("/api/specials/config", methods=["POST"])
     def api_specials_config():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -370,7 +370,7 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
-    @bp.route("/racelink/api/specials/action", methods=["POST"])
+    @bp.route("/api/specials/action", methods=["POST"])
     def api_specials_action():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -425,11 +425,11 @@ def register_api_routes(bp, ctx):
         ctx.sse.master.set(state="TX", tx_pending=True, last_event="SPECIAL_SENT")
         return jsonify({"ok": True, "result": result, "function": fn_key, "params": params_coerced})
 
-    @bp.route("/racelink/api/specials/get", methods=["POST"])
+    @bp.route("/api/specials/get", methods=["POST"])
     def api_specials_get():
         return jsonify({"ok": False, "error": "not implemented"}), 501
 
-    @bp.route("/racelink/api/devices/control", methods=["POST"])
+    @bp.route("/api/devices/control", methods=["POST"])
     def api_devices_control():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -475,7 +475,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.master.set(state="TX", tx_pending=True, last_event="CONTROL_SENT")
         return jsonify({"ok": True, "changed": changed})
 
-    @bp.route("/racelink/api/fw/upload", methods=["POST"])
+    @bp.route("/api/fw/upload", methods=["POST"])
     def api_fw_upload():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -485,7 +485,7 @@ def register_api_routes(bp, ctx):
         except Exception as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
 
-    @bp.route("/racelink/api/presets/upload", methods=["POST"])
+    @bp.route("/api/presets/upload", methods=["POST"])
     def api_presets_upload():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -496,7 +496,7 @@ def register_api_routes(bp, ctx):
         except Exception as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
 
-    @bp.route("/racelink/api/presets/list", methods=["GET"])
+    @bp.route("/api/presets/list", methods=["GET"])
     def api_presets_list():
         files = presets_service.list_files()
         current = presets_service.get_current_name()
@@ -506,7 +506,7 @@ def register_api_routes(bp, ctx):
             current = files[0]["name"]
         return jsonify({"ok": True, "files": files, "current": current})
 
-    @bp.route("/racelink/api/presets/select", methods=["POST"])
+    @bp.route("/api/presets/select", methods=["POST"])
     def api_presets_select():
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -520,15 +520,15 @@ def register_api_routes(bp, ctx):
         presets_service.set_current_name(name)
         return jsonify({"ok": True, "current": name})
 
-    @bp.route("/racelink/api/fw/uploads", methods=["GET"])
+    @bp.route("/api/fw/uploads", methods=["GET"])
     def api_fw_uploads():
         return jsonify({"ok": True, "files": ota_service.list_uploads()})
 
-    @bp.route("/racelink/api/wifi/interfaces", methods=["GET"])
+    @bp.route("/api/wifi/interfaces", methods=["GET"])
     def api_wifi_interfaces():
         return jsonify({"ok": True, "ifaces": host_wifi_service.wifi_interfaces()})
 
-    @bp.route("/racelink/api/presets/download", methods=["POST"])
+    @bp.route("/api/presets/download", methods=["POST"])
     def api_presets_download():
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
         if ctx.tasks.is_running():
@@ -560,7 +560,7 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
-    @bp.route("/racelink/api/fw/start", methods=["POST"])
+    @bp.route("/api/fw/start", methods=["POST"])
     def api_fw_start():
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
         if ctx.tasks.is_running():

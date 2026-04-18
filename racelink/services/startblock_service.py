@@ -126,7 +126,8 @@ class StartblockService:
         ]
 
     def get_current_heat_slot_list(self):
-        source = getattr(self.controller, "rh_source", None)
+        runtime = getattr(self.controller, "_rhapi", None)
+        source = getattr(runtime, "event_source", None)
         if source:
             return source.get_current_heat_slot_list()
         return []

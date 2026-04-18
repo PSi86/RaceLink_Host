@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>RaceLink</title>
-  <link rel="stylesheet" href="/racelink/static/racelink.css">
+  <link rel="stylesheet" href="{{ rl_static_path }}/racelink.css">
 </head>
-<body>
+<body data-rl-base-path="{{ rl_base_path }}">
   <header class="rl-header">
     <h1>RaceLink</h1>
     <div class="rl-actions">
@@ -194,7 +194,7 @@
   <dialog id="dlgPresets">
     <form method="dialog" class="rl-form">
       <h3>WLED Presets</h3>
-      <p class="muted">Upload and select the presets.json file used for RotorHazard UI synchronization.</p>
+      <p class="muted">Upload and select the presets.json file used by the shared RaceLink WebUI.</p>
 
       <div class="row">
         <label>Upload presets.json:</label>
@@ -265,6 +265,6 @@
   </dialog>
 
 
-  <script src="/racelink/static/racelink.js"></script>
+  <script src="{{ rl_static_path }}/racelink.js"></script>
 </body>
 </html>

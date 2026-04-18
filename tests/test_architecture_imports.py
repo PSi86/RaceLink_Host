@@ -113,6 +113,10 @@ class ArchitectureImportTests(unittest.TestCase):
             ),
         )
 
+    def test_rotorhazard_package_is_absent(self):
+        self.assertFalse((ROOT / "racelink" / "integrations" / "rotorhazard" / "__init__.py").exists())
+        self.assertFalse((ROOT / "__init__.py").exists())
+
     def test_removed_root_shims_do_not_exist(self):
         for name in ("data.py", "racelink_proto_auto.py", "racelink_transport.py", "racelink_webui.py", "ui.py"):
             self.assertFalse((ROOT / name).exists(), msg=f"{name} should have been removed")

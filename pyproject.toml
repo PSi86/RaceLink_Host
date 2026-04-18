@@ -1,0 +1,39 @@
+[build-system]
+requires = []
+build-backend = "racelink._build_backend"
+backend-path = ["."]
+
+[project]
+name = "racelink-host"
+dynamic = ["version"]
+description = "Host-side software for the RaceLink wireless control system."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Peter Simandl" }
+]
+dependencies = [
+  "Flask>=3.0,<4",
+  "pyserial>=3.5,<4",
+]
+keywords = ["racelink", "wireless", "gateway", "wled"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: Flask",
+]
+
+[project.urls]
+Repository = "https://github.com/PSi86/RaceLink_Host"
+
+[project.scripts]
+racelink-standalone = "racelink.integrations.standalone.webapp:run_standalone"
+racelink-host-version = "racelink._version:print_version"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

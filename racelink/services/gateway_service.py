@@ -420,7 +420,7 @@ class GatewayService:
                     self.controller._last_error_notify_ts = now
                     try:
                         self.controller._rhapi.ui.message_notify(
-                            self.controller._rhapi.__("RaceLink Communicator disconnected: {}").format(reason)
+                            self.controller._rhapi.__("RaceLink Gateway disconnected: {}").format(reason)
                         )
                     except Exception:
                         logger.exception("RaceLink: failed to notify UI about disconnect")
@@ -465,11 +465,6 @@ class GatewayService:
                         dev_type = ev.get("caps", 0)
                         dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=f"WLED {mac12}")
                         self.controller.device_repository.append(dev)
-                        try:
-                            if hasattr(self.controller, "createUiDevList"):
-                                self.controller.uiDeviceList = self.controller.createUiDevList()
-                        except Exception:
-                            pass
 
                     dev.update_from_identify(
                         ev.get("version"),

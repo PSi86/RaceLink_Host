@@ -119,7 +119,7 @@ class WebApiRouteTests(unittest.TestCase):
         return self.bp.routes[(path, ("GET",))]
 
     def test_specials_route_returns_specials_payload(self):
-        payload = self._route("/racelink/api/specials")()
+        payload = self._route("/api/specials")()
 
         self.assertTrue(payload["ok"])
         self.assertIn("specials", payload)
@@ -127,9 +127,9 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("STARTBLOCK", payload["specials"])
 
     def test_neighboring_get_routes_execute_without_missing_symbols(self):
-        devices = self._route("/racelink/api/devices")()
-        groups = self._route("/racelink/api/groups")()
-        options = self._route("/racelink/api/options")()
+        devices = self._route("/api/devices")()
+        groups = self._route("/api/groups")()
+        options = self._route("/api/options")()
 
         self.assertTrue(devices["ok"])
         self.assertEqual(len(devices["devices"]), 2)

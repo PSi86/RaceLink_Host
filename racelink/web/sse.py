@@ -232,7 +232,7 @@ class SSEBridge:
     def register_routes(self, bp, task_manager, rl_instance):
         self.attach_task_manager(task_manager)
 
-        @bp.route("/racelink/api/events")
+        @bp.route("/api/events")
         def api_events():
             self.ensure_transport_hooked(rl_instance)
 
