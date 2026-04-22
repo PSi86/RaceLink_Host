@@ -19,7 +19,8 @@ class StatusService:
         return getattr(self.controller, "transport", None)
 
     def get_status(self, *, group_filter=255, target_device=None) -> dict:
-        if not self.transport:
+        transport = self.transport
+        if transport is None:
             logger.warning("getStatus: communicator not ready")
             return {"updated": 0, "responders": set(), "got_closed": False}
 
@@ -62,12 +63,12 @@ class StatusService:
             return False
 
         try:
-            self.transport.drain_events(0.0)
+            transport.drain_events(0.0)
         except Exception:
-            pass
+            logger.debug("RaceLink: drain_events before get_status raised", exc_info=True)
 
         _collected, got_closed = self.gateway_service.wait_rx_window(
-            lambda: self.transport.send_get_status(recv3=recv3, group_id=group_id, flags=0),
+            lambda: transport.send_get_status(recv3=recv3, group_id=group_id, flags=0),
             collect_pred=_collect,
             fail_safe_s=8.0,
         )

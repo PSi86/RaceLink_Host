@@ -39,7 +39,7 @@ class FakeSource:
 
 class FakeController:
     def __init__(self, devices=None):
-        self._rhapi = SimpleNamespace(event_source=FakeSource())
+        self._host_api = SimpleNamespace(event_source=FakeSource())
         self.saved = []
         self.send_config_calls = []
         self._devices = devices or []

@@ -5,6 +5,7 @@ import time
 from typing import Optional, Union
 
 try:
+    from racelink.core import HostApi
     from racelink.domain import (
         RL_Device,
         RL_DeviceGroup,
@@ -34,6 +35,7 @@ try:
     )
     from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
 except ImportError:  # pragma: no cover - compatibility path for package-style plugin loading
+    from .racelink.core import HostApi
     from .racelink.domain import (
         RL_Device,
         RL_DeviceGroup,
@@ -69,8 +71,18 @@ logger = logging.getLogger(__name__)
 class RaceLink_Host:
     """Host controller coordinating runtime state, transport, and core services."""
 
-    def __init__(self, rhapi, name, label, state_repository=None):
-        self._rhapi = rhapi
+    def __init__(
+        self,
+        host_api: "HostApi",
+        name: str,
+        label: str,
+        state_repository=None,
+    ):
+        # The embedding host (RotorHazard plugin or standalone shim) must
+        # satisfy the ``HostApi`` Protocol from ``racelink.core.host_api``.
+        # The attribute is exposed as ``_host_api`` so plugin-specific names
+        # do not leak into the Host codebase.
+        self._host_api = host_api
         self.name = name
         self.label = label
         self.state_repository = state_repository or get_runtime_state_repository()
@@ -124,22 +136,22 @@ class RaceLink_Host:
         self.sync_service = SyncService(self, self.gateway_service)
 
     def _option(self, key: str, default=None):
-        return self._rhapi.db.option(key, default)
+        return self._host_api.db.option(key, default)
 
     def _option_set(self, key: str, value) -> None:
-        self._rhapi.db.option_set(key, value)
+        self._host_api.db.option_set(key, value)
 
     def _translate(self, text: str) -> str:
-        return self._rhapi.__(text)
+        return self._host_api.__(text)
 
     def _notify(self, message: str) -> None:
-        ui = getattr(self._rhapi, "ui", None)
+        ui = getattr(self._host_api, "ui", None)
         notify = getattr(ui, "message_notify", None) if ui else None
         if callable(notify):
             notify(message)
 
     def _broadcast_ui(self, panel: str) -> None:
-        ui = getattr(self._rhapi, "ui", None)
+        ui = getattr(self._host_api, "ui", None)
         broadcaster = getattr(ui, "broadcast_ui", None) if ui else None
         if callable(broadcaster):
             broadcaster(panel)
@@ -197,9 +209,10 @@ class RaceLink_Host:
             schema_version=CURRENT_SCHEMA_VERSION,
         )
         self._option_set("rl_state_v1", config_str_state)
-        if callable(getattr(self, "on_persistence_changed", None)):
+        on_changed = getattr(self, "on_persistence_changed", None)
+        if callable(on_changed):
             try:
-                self.on_persistence_changed()
+                on_changed()
             except Exception:
                 logger.exception("RaceLink: on_persistence_changed callback failed")
 
@@ -350,9 +363,10 @@ class RaceLink_Host:
         else:
             # save_to_db fires this naturally; make sure it also fires for a
             # plain load so plugins can refresh panels (plan P2-2).
-            if callable(getattr(self, "on_persistence_changed", None)):
+            on_changed = getattr(self, "on_persistence_changed", None)
+            if callable(on_changed):
                 try:
-                    self.on_persistence_changed()
+                    on_changed()
                 except Exception:
                     logger.exception("RaceLink: on_persistence_changed callback failed")
 
@@ -489,7 +503,8 @@ class RaceLink_Host:
         return int(result.get("updated", 0) or 0)
 
     def setNodeGroupId(self, targetDevice: RL_Device, forceSet: bool = False, wait_for_ack: bool = True) -> bool:
-        if not getattr(self, "transport", None):
+        transport = getattr(self, "transport", None)
+        if transport is None:
             logger.warning("setNodeGroupId: communicator not ready")
             return False
 
@@ -503,7 +518,7 @@ class RaceLink_Host:
             targetDevice.ack_clear()
 
         def _send():
-            self.transport.send_set_group(recv3, group_id)
+            transport.send_set_group(recv3, group_id)
 
         if not wait_for_ack or is_broadcast:
             _send()

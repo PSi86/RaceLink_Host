@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Optional
 
 from ..domain import create_device, get_dev_type_info
 from ..protocol import opcode_name as protocol_opcode_name
@@ -100,7 +101,8 @@ class GatewayService:
         return collected, got_closed
 
     def send_config(self, option, data0=0, data1=0, data2=0, data3=0, recv3=b"\xFF\xFF\xFF", wait_for_ack: bool = False, timeout_s: float = 6.0):
-        if not self.transport:
+        transport = self.transport
+        if transport is None:
             logger.warning("sendConfig: communicator not ready")
             return False if wait_for_ack else None
 
@@ -116,7 +118,7 @@ class GatewayService:
                 dev.ack_clear()
 
         def _send():
-            self.transport.send_config(
+            transport.send_config(
                 recv3=recv3,
                 option=int(option) & 0xFF,
                 data0=int(data0) & 0xFF,
@@ -143,8 +145,9 @@ class GatewayService:
             return
         self.transport.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
 
-    def send_stream(self, payload: bytes, groupId=None, device=None, retries: int = 2, timeout_s: float = 8.0) -> dict[str, int]:
-        if not self.transport:
+    def send_stream(self, payload: bytes, groupId: Optional[int] = None, device=None, retries: int = 2, timeout_s: float = 8.0) -> dict[str, int]:
+        transport = self.transport
+        if transport is None:
             logger.warning("sendStream: communicator not ready")
             return {}
 
@@ -161,7 +164,9 @@ class GatewayService:
             raise ValueError("sendStream requires groupId or device")
 
         if device is None:
-            targets = [dev for dev in self.controller.device_repository.list() if int(getattr(dev, "groupId", 0) or 0) == int(groupId)]
+            assert groupId is not None  # narrowed by the guard above
+            group_filter = int(groupId)
+            targets = [dev for dev in self.controller.device_repository.list() if int(getattr(dev, "groupId", 0) or 0) == group_filter]
         else:
             targets = [device]
 
@@ -176,7 +181,7 @@ class GatewayService:
             return {"expected": expected, "acked": 0}
 
         try:
-            self.transport.drain_events(0.0)
+            transport.drain_events(0.0)
         except Exception:
             logger.debug("RaceLink: drain_events before send_stream raised", exc_info=True)
 
@@ -201,7 +206,7 @@ class GatewayService:
 
         for attempt in range(max(0, int(retries)) + 1):
             self.wait_rx_window(
-                lambda: self.transport.send_stream(recv3=recv3, payload=data),
+                lambda: transport.send_stream(recv3=recv3, payload=data),
                 collect_pred=_collect,
                 fail_safe_s=timeout_s,
             )
@@ -446,9 +451,16 @@ class GatewayService:
                 if (now - self.controller._last_error_notify_ts) > 2:
                     self.controller._last_error_notify_ts = now
                     try:
-                        self.controller._rhapi.ui.message_notify(
-                            self.controller._rhapi.__("RaceLink Gateway disconnected: {}").format(reason)
-                        )
+                        host_api = getattr(self.controller, "_host_api", None)
+                        ui = getattr(host_api, "ui", None) if host_api is not None else None
+                        notify = getattr(ui, "message_notify", None) if ui is not None else None
+                        translator = getattr(host_api, "__", None) if host_api is not None else None
+                        if callable(notify):
+                            template = "RaceLink Gateway disconnected: {}"
+                            if callable(translator):
+                                translated = translator(template)
+                                template = translated if isinstance(translated, str) else template
+                            notify(template.format(reason))
                     except Exception:
                         logger.exception("RaceLink: failed to notify UI about disconnect")
                 self.schedule_reconnect(reason)
