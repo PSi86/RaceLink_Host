@@ -10,6 +10,54 @@ from .dto import group_counts, serialize_device
 from .request_helpers import parse_recv3_from_addr, parse_wifi_options
 
 
+def _apply_device_meta_updates(
+    ctx,
+    *,
+    macs: list,
+    new_group,
+    new_name,
+) -> int:
+    """Apply rename + regroup updates under the state lock (plan P2-4).
+
+    Extracted from ``api_devices_update_meta`` so the business logic can be
+    unit-tested without a Flask request context.
+    """
+    changed = 0
+    with ctx.rl_lock:
+        for mac in macs:
+            dev = ctx.rl_instance.getDeviceFromAddress(mac)
+            if not dev:
+                continue
+            if new_name and isinstance(new_name, str) and len(macs) == 1:
+                dev.name = new_name
+                changed += 1
+            if new_group is not None:
+                try:
+                    dev.groupId = int(new_group)
+                    ctx.rl_instance.setNodeGroupId(dev)
+                    changed += 1
+                except Exception as ex:
+                    ctx.log(f"RaceLink: setNodeGroupId failed for {mac}: {ex}")
+    return changed
+
+
+def _gateway_status(ctx) -> dict:
+    """Return a UI-friendly gateway readiness snapshot (plan P1-1)."""
+    rl = ctx.rl_instance
+    getter = getattr(rl, "gateway_status", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            # Fall through to the synthetic snapshot below rather than 500-ing.
+            pass
+    return {
+        "ready": bool(getattr(rl, "ready", False)),
+        "last_error": None,
+        "failure_count": 0,
+    }
+
+
 def register_api_routes(bp, ctx):
     host_wifi_service = ctx.services["host_wifi"]
     ota_service = ctx.services["ota"]
@@ -58,7 +106,27 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/master", methods=["GET"])
     def api_master():
-        return jsonify({"ok": True, "master": ctx.sse.master.snapshot(), "task": ctx.tasks.snapshot()})
+        gateway = _gateway_status(ctx)
+        return jsonify({
+            "ok": True,
+            "master": ctx.sse.master.snapshot(),
+            "task": ctx.tasks.snapshot(),
+            "gateway": gateway,
+        })
+
+    @bp.route("/api/gateway", methods=["GET"])
+    def api_gateway_status():
+        return jsonify({"ok": True, "gateway": _gateway_status(ctx)})
+
+    @bp.route("/api/gateway/retry", methods=["POST"])
+    def api_gateway_retry():
+        rl = ctx.rl_instance
+        retry = getattr(rl, "retry_gateway", None)
+        if callable(retry):
+            status = retry()
+        else:  # pragma: no cover - legacy host without retry helper
+            status = _gateway_status(ctx)
+        return jsonify({"ok": bool(status.get("ready")), "gateway": status})
 
     @bp.route("/api/task", methods=["GET"])
     def api_task():
@@ -140,28 +208,20 @@ def register_api_routes(bp, ctx):
         new_group = body.get("groupId", None)
         new_name = body.get("name", None)
 
-        changed = 0
         if new_group is not None:
             ctx.sse.ensure_transport_hooked(ctx.rl_instance)
-        with ctx.rl_lock:
-            for mac in macs:
-                dev = ctx.rl_instance.getDeviceFromAddress(mac)
-                if not dev:
-                    continue
-                if new_name and isinstance(new_name, str) and len(macs) == 1:
-                    dev.name = new_name
-                    changed += 1
-                if new_group is not None:
-                    try:
-                        dev.groupId = int(new_group)
-                        ctx.rl_instance.setNodeGroupId(dev)
-                        changed += 1
-                    except Exception as ex:
-                        ctx.log(f"RaceLink: setNodeGroupId failed for {mac}: {ex}")
+
+        changed = _apply_device_meta_updates(
+            ctx,
+            macs=macs,
+            new_group=new_group,
+            new_name=new_name,
+        )
+
         try:
             ctx.rl_instance.save_to_db({"manual": True})
         except Exception:
-            pass
+            ctx.log("RaceLink: save_to_db after update-meta failed")
 
         ctx.sse.broadcast("refresh", {"what": ["groups", "devices"]})
         return jsonify({"ok": True, "changed": changed})

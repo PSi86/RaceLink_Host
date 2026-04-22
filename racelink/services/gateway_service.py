@@ -15,13 +15,38 @@ from ..transport.gateway_events import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WIND
 logger = logging.getLogger(__name__)
 
 
+class _NullLock:
+    """Fallback context manager used when no state lock is available."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
 class GatewayService:
     def __init__(self, controller):
         self.controller = controller
+        self._auto_reassign_cooldown_s = 2.0
+        self._auto_reassign_recent: dict[str, float] = {}
+        self._auto_reassign_lock = threading.Lock()
 
     @property
     def transport(self):
         return getattr(self.controller, "transport", None)
+
+    def _state_lock(self):
+        """Return the state-repository mutation lock, or a no-op fallback.
+
+        Callers use this as a context manager to serialize device/group
+        mutations that race with web-thread reads (plan P1-4).
+        """
+        repo = getattr(self.controller, "state_repository", None)
+        lock = getattr(repo, "lock", None) if repo is not None else None
+        if lock is None:
+            return _NullLock()
+        return lock
 
     def send_and_wait_for_reply(self, recv3: bytes, opcode7: int, send_fn, timeout_s: float = 8.0) -> tuple[list[dict], bool]:
         if not self.transport:
@@ -153,7 +178,7 @@ class GatewayService:
         try:
             self.transport.drain_events(0.0)
         except Exception:
-            pass
+            logger.debug("RaceLink: drain_events before send_stream raised", exc_info=True)
 
         acked = set()
 
@@ -210,7 +235,7 @@ class GatewayService:
                     if collect_pred and collect_pred(ev):
                         collected.append(ev)
                 except Exception:
-                    pass
+                    logger.exception("RaceLink: reply-collector callback raised")
 
             transport.add_listener(_cb)
             try:
@@ -220,7 +245,7 @@ class GatewayService:
                 try:
                     transport.remove_listener(_cb)
                 except Exception:
-                    pass
+                    logger.debug("RaceLink: remove_listener failed during cleanup", exc_info=True)
             return collected, got_closed
 
         send_fn()
@@ -306,25 +331,26 @@ class GatewayService:
     def handle_ack_event(self, ev: dict) -> None:
         try:
             sender3_hex = self.controller._to_hex_str(ev.get("sender3"))
-            dev = self.controller.getDeviceFromAddress(sender3_hex) if sender3_hex else None
-            if not dev:
-                return
+            with self._state_lock():
+                dev = self.controller.getDeviceFromAddress(sender3_hex) if sender3_hex else None
+                if not dev:
+                    return
 
-            ack_of = ev.get("ack_of")
-            ack_status = ev.get("ack_status")
-            ack_seq = ev.get("ack_seq")
-            host_rssi = ev.get("host_rssi")
-            host_snr = ev.get("host_snr")
+                ack_of = ev.get("ack_of")
+                ack_status = ev.get("ack_status")
+                ack_seq = ev.get("ack_seq")
+                host_rssi = ev.get("host_rssi")
+                host_snr = ev.get("host_snr")
 
-            if ack_of is None or ack_status is None:
-                return
+                if ack_of is None or ack_status is None:
+                    return
 
-            dev.ack_update(int(ack_of), int(ack_status), ack_seq, host_rssi, host_snr)
+                dev.ack_update(int(ack_of), int(ack_status), ack_seq, host_rssi, host_snr)
 
-            if int(ack_of) == int(LP.OPC_CONFIG) and int(ack_status) == 0:
-                pending = self.controller._pending_config.pop(sender3_hex, None)
-                if pending:
-                    self.controller._apply_config_update(dev, pending.get("option", 0), pending.get("data0", 0))
+                if int(ack_of) == int(LP.OPC_CONFIG) and int(ack_status) == 0:
+                    pending = self.controller._pending_config.pop(sender3_hex, None)
+                    if pending:
+                        self.controller._apply_config_update(dev, pending.get("option", 0), pending.get("data0", 0))
 
         except Exception:
             logger.exception("ACK handling failed")
@@ -346,12 +372,12 @@ class GatewayService:
                     try:
                         self.on_transport_event(ev)
                     except Exception:
-                        pass
+                        logger.exception("RaceLink: gateway service transport handler raised")
                     if prev:
                         try:
                             prev(ev)
                         except Exception:
-                            pass
+                            logger.exception("RaceLink: downstream on_event handler raised")
 
                 transport.on_event = _mux
         except Exception:
@@ -444,41 +470,134 @@ class GatewayService:
                 self.handle_ack_event(ev)
             elif int(opc) == int(LP.OPC_STATUS) and ev.get("reply") == "STATUS_REPLY":
                 sender3_hex = self.controller._to_hex_str(ev.get("sender3"))
-                dev = self.controller.getDeviceFromAddress(sender3_hex) if sender3_hex else None
-                if dev:
-                    dev.update_from_status(
-                        ev.get("flags"),
-                        ev.get("configByte"),
-                        ev.get("presetId"),
-                        ev.get("brightness"),
-                        ev.get("vbat_mV"),
-                        ev.get("node_rssi"),
-                        ev.get("node_snr"),
-                        ev.get("host_rssi"),
-                        ev.get("host_snr"),
-                    )
+                with self._state_lock():
+                    dev = self.controller.getDeviceFromAddress(sender3_hex) if sender3_hex else None
+                    if dev:
+                        dev.update_from_status(
+                            ev.get("flags"),
+                            ev.get("configByte"),
+                            ev.get("presetId"),
+                            ev.get("brightness"),
+                            ev.get("vbat_mV"),
+                            ev.get("node_rssi"),
+                            ev.get("node_snr"),
+                            ev.get("host_rssi"),
+                            ev.get("host_snr"),
+                        )
             elif int(opc) == int(LP.OPC_DEVICES) and ev.get("reply") == "IDENTIFY_REPLY":
                 mac6 = ev.get("mac6")
                 if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
                     mac12 = bytes(mac6).hex().upper()
-                    dev = self.controller.getDeviceFromAddress(mac12)
-                    if not dev:
-                        dev_type = ev.get("caps", 0)
-                        dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=f"WLED {mac12}")
-                        self.controller.device_repository.append(dev)
+                    with self._state_lock():
+                        dev = self.controller.getDeviceFromAddress(mac12)
+                        is_known_device = dev is not None
+                        if not dev:
+                            dev_type = ev.get("caps", 0)
+                            dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=f"WLED {mac12}")
+                            self.controller.device_repository.append(dev)
 
-                    dev.update_from_identify(
-                        ev.get("version"),
-                        ev.get("caps"),
-                        ev.get("groupId"),
-                        mac6,
-                        ev.get("host_rssi"),
-                        ev.get("host_snr"),
-                    )
+                        dev.update_from_identify(
+                            ev.get("version"),
+                            ev.get("caps"),
+                            ev.get("groupId"),
+                            mac6,
+                            ev.get("host_rssi"),
+                            ev.get("host_snr"),
+                        )
+                    self._restore_known_device_group(dev, reported_group=ev.get("groupId"), is_known_device=is_known_device)
 
             self.pending_try_match(ev)
         except Exception:
             logger.exception("RaceLink: RX hook failed")
+
+    def _restore_known_device_group(self, dev, *, reported_group, is_known_device: bool) -> None:
+        if not is_known_device or not dev:
+            return
+
+        try:
+            node_group = int(reported_group or 0) & 0xFF
+        except Exception:
+            node_group = 0
+
+        if node_group != 0:
+            return
+
+        if self._is_discovery_active():
+            return
+
+        try:
+            stored_group = int(getattr(dev, "groupId", 0) or 0) & 0xFF
+        except Exception:
+            logger.debug("RaceLink: unreadable stored groupId on %r", getattr(dev, "addr", "?"), exc_info=True)
+            stored_group = 0
+
+        try:
+            group_count = len(self.controller.group_repository.list())
+        except Exception:
+            logger.debug("RaceLink: group_repository length unavailable", exc_info=True)
+            group_count = 0
+
+        if stored_group >= group_count:
+            stored_group = 0
+            try:
+                dev.groupId = 0
+            except Exception:
+                logger.debug("RaceLink: could not reset invalid groupId on %r", getattr(dev, "addr", "?"), exc_info=True)
+
+        if stored_group == node_group:
+            return
+
+        mac = str(getattr(dev, "addr", "") or "").upper()
+        if not mac:
+            return
+        if self._auto_reassign_suppressed(mac):
+            return
+
+        # Plan P2-6: commit to the canonical keyword-only signature. Failure
+        # is surfaced via the existing pending_expect machinery -- the TX hook
+        # records the expected ACK and ``pending_window_closed`` marks the
+        # device offline if it never arrives.
+        try:
+            self.controller.setNodeGroupId(dev, forceSet=True, wait_for_ack=False)
+            self._mark_auto_reassign(mac)
+        except Exception:
+            logger.exception(
+                "RaceLink: failed to restore stored group %s for %s",
+                stored_group,
+                getattr(dev, "addr", "?"),
+            )
+
+    def _is_discovery_active(self) -> bool:
+        checker = getattr(self.controller, "is_discovery_active", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _auto_reassign_suppressed(self, mac: str) -> bool:
+        now = time.time()
+        with self._auto_reassign_lock:
+            self._prune_auto_reassign_cache_locked(now)
+            last_ts = float(self._auto_reassign_recent.get(mac, 0.0) or 0.0)
+        return (now - last_ts) < float(self._auto_reassign_cooldown_s)
+
+    def _mark_auto_reassign(self, mac: str) -> None:
+        with self._auto_reassign_lock:
+            self._auto_reassign_recent[mac] = time.time()
+
+    def _prune_auto_reassign_cache(self, now: float | None = None) -> None:
+        """Public variant (kept for backwards compatibility in tests)."""
+        with self._auto_reassign_lock:
+            self._prune_auto_reassign_cache_locked(now)
+
+    def _prune_auto_reassign_cache_locked(self, now: float | None = None) -> None:
+        now_ts = time.time() if now is None else float(now)
+        expiry = max(float(self._auto_reassign_cooldown_s) * 4.0, 5.0)
+        stale = [mac for mac, ts in self._auto_reassign_recent.items() if (now_ts - float(ts or 0.0)) >= expiry]
+        for mac in stale:
+            self._auto_reassign_recent.pop(mac, None)
 
     def schedule_reconnect(self, reason: str) -> None:
         now = time.time()
@@ -494,7 +613,7 @@ class GatewayService:
                     if self.transport:
                         self.transport.close()
                 except Exception:
-                    pass
+                    logger.debug("RaceLink: error closing transport during reconnect", exc_info=True)
                 self.controller.transport = None
                 self.controller.discoverPort({})
             finally:
@@ -520,16 +639,18 @@ class GatewayService:
             if policy == int(protocol_rules.RESP_ACK):
                 if int(ev.get("opc", -1)) == int(LP.OPC_ACK) and int(ev.get("ack_of", -2)) == opcode7:
                     dev = p.get("dev")
-                    if dev:
-                        dev.mark_online()
-                    self.controller._pending_expect = None
+                    with self._state_lock():
+                        if dev:
+                            dev.mark_online()
+                        self.controller._pending_expect = None
             elif policy == int(protocol_rules.RESP_SPECIFIC):
                 rsp_opc = int(response_opcode(opcode7))
                 if int(ev.get("opc", -1)) == rsp_opc:
                     dev = p.get("dev")
-                    if dev:
-                        dev.mark_online()
-                    self.controller._pending_expect = None
+                    with self._state_lock():
+                        if dev:
+                            dev.mark_online()
+                        self.controller._pending_expect = None
         except Exception:
             logger.exception("RaceLink: pending match failed")
 
@@ -543,7 +664,8 @@ class GatewayService:
             rule = p.get("rule")
             opcode7 = int(p.get("opcode7", -1)) & 0x7F
             name = getattr(rule, "name", f"opc=0x{opcode7:02X}")
-            if dev:
-                dev.mark_offline(f"Missing reply ({name})")
+            with self._state_lock():
+                if dev:
+                    dev.mark_offline(f"Missing reply ({name})")
         finally:
             self.controller._pending_expect = None

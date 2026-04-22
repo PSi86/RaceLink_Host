@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
 from flask import Response, stream_with_context
+
+logger = logging.getLogger(__name__)
 
 try:
     from gevent.lock import Semaphore as _RLLock  # type: ignore
@@ -88,12 +91,14 @@ class SSEBridge:
             for q in list(self._clients):
                 try:
                     q.put((event_name, payload), timeout=0.01)
-                except Exception:
+                except Exception as ex:
+                    logger.debug("SSE queue put failed for %r, dropping client: %s", event_name, ex)
                     dead.append(q)
             for q in dead:
                 try:
                     self._clients.remove(q)
-                except Exception:
+                except KeyError:
+                    # Client was already removed by another iteration.
                     pass
 
     def ensure_transport_hooked(self, rl_instance):
@@ -122,12 +127,12 @@ class SSEBridge:
             try:
                 self.on_transport_event(ev)
             except Exception:
-                pass
+                logger.exception("RaceLink: SSE transport handler raised")
             try:
                 if prev and prev is not _mux:
                     prev(ev)
             except Exception:
-                pass
+                logger.exception("RaceLink: previous on_event handler raised")
 
         try:
             transport.on_event = _mux
@@ -204,7 +209,7 @@ class SSEBridge:
                 if isinstance(raw, (bytes, bytearray)):
                     raw = raw.hex().upper()
             except Exception:
-                pass
+                logger.debug("SSE: unable to stringify EV_ERROR payload", exc_info=True)
             self.master.set(state="ERROR", last_event="USB_ERROR", last_error=str(raw))
             if self._task_is_running():
                 self._task_update(last_error=str(raw))
@@ -244,7 +249,7 @@ class SSEBridge:
                 q.put(("master", self.master.snapshot()), timeout=0.01)
                 q.put(("task", task_manager.snapshot()), timeout=0.01)
             except Exception:
-                pass
+                logger.debug("SSE: unable to seed initial client snapshots", exc_info=True)
 
             def _encode(event_name: str, payload) -> str:
                 return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
@@ -272,7 +277,8 @@ class SSEBridge:
                     with self._clients_lock:
                         try:
                             self._clients.remove(q)
-                        except Exception:
+                        except KeyError:
+                            # Client already removed by broadcast() cleanup.
                             pass
 
             headers = {

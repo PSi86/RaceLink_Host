@@ -2,6 +2,7 @@ import unittest
 
 from racelink.domain import RL_Device
 from racelink.services.gateway_service import GatewayService
+from racelink.state.repository import DeviceRepository, GroupRepository
 from racelink.transport import EV_RX_WINDOW_CLOSED, LP
 
 
@@ -11,6 +12,7 @@ class FakeTransport:
         self.tx_listeners = []
         self.sent_config = []
         self.sent_stream = []
+        self.sent_set_group = []
 
     def add_listener(self, cb):
         self.listeners.append(cb)
@@ -28,6 +30,9 @@ class FakeTransport:
     def send_stream(self, **kwargs):
         self.sent_stream.append(kwargs)
 
+    def send_set_group(self, recv3, group_id):
+        self.sent_set_group.append({"recv3": recv3, "group_id": group_id})
+
     def emit(self, ev):
         for cb in list(self.listeners):
             cb(ev)
@@ -44,6 +49,10 @@ class FakeController:
         self._pending_config = {}
         self._transport_hooks_installed = False
         self.applied = []
+        self.group_assignments = []
+        self._device_repository = DeviceRepository([self.dev])
+        self._group_repository = GroupRepository([object(), object(), object(), object()])
+        self.discovery_active = False
 
     def _to_hex_str(self, value):
         if isinstance(value, (bytes, bytearray)):
@@ -61,14 +70,17 @@ class FakeController:
 
     @property
     def device_repository(self):
-        class Repo:
-            def __init__(self, item):
-                self.item = item
+        return self._device_repository
 
-            def list(self):
-                return [self.item]
+    @property
+    def group_repository(self):
+        return self._group_repository
 
-        return Repo(self.dev)
+    def setNodeGroupId(self, dev, forceSet=False, wait_for_ack=True):
+        self.group_assignments.append((dev.addr, dev.groupId, forceSet, wait_for_ack))
+
+    def is_discovery_active(self):
+        return bool(self.discovery_active)
 
 
 class GatewayServiceTests(unittest.TestCase):
@@ -161,6 +173,143 @@ class GatewayServiceTests(unittest.TestCase):
             controller.transport.sent_stream,
             [{"recv3": bytes.fromhex("DDEEFF"), "payload": b"\x01\x02\x03"}],
         )
+
+    def test_identify_reply_restores_stored_group_for_known_device(self):
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+                "host_rssi": -50,
+                "host_snr": 8,
+            }
+        )
+
+        self.assertEqual(controller.dev.groupId, 3)
+        self.assertEqual(controller.group_assignments, [("AABBCCDDEEFF", 3, True, False)])
+
+    def test_identify_reply_with_reported_nonzero_group_does_not_auto_reassign_known_device(self):
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 3,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+
+        self.assertEqual(controller.dev.groupId, 3)
+        self.assertEqual(controller.group_assignments, [])
+
+    def test_identify_reply_adds_unknown_device_with_reported_group_without_assignment(self):
+        controller = FakeController()
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("001122334455"),
+                "groupId": 5,
+                "caps": 2,
+                "version": 4,
+            }
+        )
+
+        new_dev = controller.device_repository.get_by_addr("001122334455")
+        self.assertIsNotNone(new_dev)
+        self.assertEqual(new_dev.groupId, 5)
+        self.assertEqual(controller.group_assignments, [])
+
+    def test_identify_reply_with_group_zero_keeps_unknown_device_unconfigured(self):
+        controller = FakeController()
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("001122334455"),
+                "groupId": 0,
+                "caps": 2,
+                "version": 4,
+            }
+        )
+
+        new_dev = controller.device_repository.get_by_addr("001122334455")
+        self.assertIsNotNone(new_dev)
+        self.assertEqual(new_dev.groupId, 0)
+        self.assertEqual(controller.group_assignments, [])
+
+    def test_identify_reply_group_zero_is_deduplicated_for_known_device(self):
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        ev = {
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+        }
+
+        service.on_transport_event(ev)
+        service.on_transport_event(ev)
+
+        self.assertEqual(controller.group_assignments, [("AABBCCDDEEFF", 3, True, False)])
+
+    def test_identify_reply_group_zero_is_paused_during_discovery_task(self):
+        controller = FakeController()
+        controller.dev.groupId = 3
+        controller.discovery_active = True
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+
+        self.assertEqual(controller.group_assignments, [])
+
+    def test_identify_reply_group_zero_skips_invalid_stored_group(self):
+        controller = FakeController()
+        controller.dev.groupId = 9
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+
+        self.assertEqual(controller.dev.groupId, 0)
+        self.assertEqual(controller.group_assignments, [])
 
 
 if __name__ == "__main__":

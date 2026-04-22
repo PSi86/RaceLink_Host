@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Union
 
 try:
@@ -23,7 +24,14 @@ try:
         SyncService,
     )
     from racelink.state import get_runtime_state_repository
-    from racelink.state.persistence import dump_records, load_records
+    from racelink.state.migrations import migrate_state
+    from racelink.state.persistence import (
+        CURRENT_SCHEMA_VERSION,
+        dump_records,
+        dump_state,
+        load_records,
+        load_state,
+    )
     from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
 except ImportError:  # pragma: no cover - compatibility path for package-style plugin loading
     from .racelink.domain import (
@@ -45,7 +53,14 @@ except ImportError:  # pragma: no cover - compatibility path for package-style p
         SyncService,
     )
     from .racelink.state import get_runtime_state_repository
-    from .racelink.state.persistence import dump_records, load_records
+    from .racelink.state.migrations import migrate_state
+    from .racelink.state.persistence import (
+        CURRENT_SCHEMA_VERSION,
+        dump_records,
+        dump_state,
+        load_records,
+        load_state,
+    )
     from .racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
 
 logger = logging.getLogger(__name__)
@@ -69,9 +84,19 @@ class RaceLink_Host:
 
         self._transport_hooks_installed = False
         self._pending_config = {}
+        self._task_manager = None
         self._reconnect_in_progress = False
         self._last_reconnect_ts = 0.0
         self._last_error_notify_ts = 0.0
+        # Plan P1-1: persistent gateway-failure state surfaced via /api/master
+        # even when no user was driving the connection attempt.
+        self.last_gateway_error: dict | None = None
+        self._gateway_failure_count: int = 0
+        # Plan P2-2: plugins register a callback to refresh their panels after
+        # state is persisted instead of monkey-patching load/save_to_db.
+        self.on_persistence_changed = None
+        # Plan P1-2: dispose transport cleanly when the host plugin unloads.
+        self._shutdown_called: bool = False
         # Basic colors: 1-9; Basic effects: 10-19; Special Effects (WLED only): 20-100
         self.uiEffectList = [
             {"value": "01", "label": "Red"},
@@ -119,6 +144,21 @@ class RaceLink_Host:
         if callable(broadcaster):
             broadcaster(panel)
 
+    def attach_task_manager(self, task_manager) -> None:
+        self._task_manager = task_manager
+
+    def is_discovery_active(self) -> bool:
+        task_manager = getattr(self, "_task_manager", None)
+        if task_manager is None:
+            return False
+        try:
+            snap = task_manager.snapshot()
+        except Exception:
+            return False
+        if not snap:
+            return False
+        return bool(snap.get("state") == "running" and snap.get("name") == "discover")
+
     @property
     def device_repository(self):
         return self.state_repository.devices
@@ -140,32 +180,97 @@ class RaceLink_Host:
         self.discoverPort({})
 
     def save_to_db(self, args):
-        logger.debug("RL: Writing current states to Database")
-        config_str_devices = dump_records(self.device_repository.list())
-        self._option_set("rl_device_config", config_str_devices)
+        """Persist devices + groups atomically under a single combined key.
 
-        if len(self.group_repository.list()) >= len(self.backup_group_repository.list()):
-            config_str_groups = dump_records(self.group_repository.list())
-        else:
-            config_str_groups = dump_records(self.backup_group_repository.list())
-        self._option_set("rl_groups_config", config_str_groups)
+        Writing both payloads together eliminates the partial-state hazard we
+        used to have with separate ``rl_device_config`` / ``rl_groups_config``
+        writes (see plan P1-5). The legacy keys are left untouched so an
+        operator can roll back to an older Host build without losing data.
+        """
+        logger.debug("RL: Writing current states to Database (combined)")
+        groups_to_dump = self.group_repository.list()
+        if len(groups_to_dump) < len(self.backup_group_repository.list()):
+            groups_to_dump = self.backup_group_repository.list()
+        config_str_state = dump_state(
+            self.device_repository.list(),
+            groups_to_dump,
+            schema_version=CURRENT_SCHEMA_VERSION,
+        )
+        self._option_set("rl_state_v1", config_str_state)
+        if callable(getattr(self, "on_persistence_changed", None)):
+            try:
+                self.on_persistence_changed()
+            except Exception:
+                logger.exception("RaceLink: on_persistence_changed callback failed")
+
+    def _load_from_legacy_keys(self):
+        """Fall back to the pre-P1-5 per-key storage."""
+        config_str_devices = self._option("rl_device_config", None)
+        config_str_groups = self._option("rl_groups_config", None)
+        if config_str_devices is None and config_str_groups is None:
+            return None, None, True  # untouched; initialize from backups
+        devices = load_records(
+            config_str_devices,
+            default=[obj.__dict__ for obj in self.backup_device_repository.list()],
+            source="rl_device_config",
+        )
+        groups = load_records(
+            config_str_groups,
+            default=[obj.__dict__ for obj in self.backup_group_repository.list()],
+            source="rl_groups_config",
+        )
+        return devices, groups, False
 
     def load_from_db(self):
         logger.debug("RL: Applying config from Database")
-        config_str_devices = self._option("rl_device_config", None)
-        config_str_groups = self._option("rl_groups_config", None)
 
-        if config_str_devices is None:
-            config_str_devices = dump_records(self.backup_device_repository.list())
-            self._option_set("rl_device_config", config_str_devices)
+        combined_raw = self._option("rl_state_v1", None)
+        config_list_devices: list[dict]
+        config_list_groups: list[dict]
+        needs_migration_save = False
 
-        if config_str_devices == "":
-            config_str_devices = dump_records([])
-            self._option_set("rl_device_config", config_str_devices)
+        if combined_raw in (None, ""):
+            legacy_devices, legacy_groups, fresh_install = self._load_from_legacy_keys()
+            if fresh_install:
+                # No record at all -> initialize from backup defaults.
+                config_list_devices = [obj.__dict__ for obj in self.backup_device_repository.list()]
+                config_list_groups = [obj.__dict__ for obj in self.backup_group_repository.list()]
+            else:
+                config_list_devices = legacy_devices or []
+                config_list_groups = legacy_groups or []
+            needs_migration_save = True
+            loaded_version = 0
+        else:
+            config_list_devices, config_list_groups, loaded_version = load_state(
+                combined_raw,
+                default_devices=[obj.__dict__ for obj in self.backup_device_repository.list()],
+                default_groups=[obj.__dict__ for obj in self.backup_group_repository.list()],
+                source="rl_state_v1",
+            )
+            if loaded_version == 0:
+                # Combined key existed but was malformed; try legacy as a rescue.
+                legacy_devices, legacy_groups, fresh_install = self._load_from_legacy_keys()
+                if not fresh_install:
+                    logger.warning(
+                        "RaceLink: combined state unreadable; recovered from legacy keys"
+                    )
+                    config_list_devices = legacy_devices or []
+                    config_list_groups = legacy_groups or []
+                needs_migration_save = True
 
-        config_list_devices = load_records(
-            config_str_devices,
-            default=[obj.__dict__ for obj in self.backup_device_repository.list()],
+        config_list_devices, config_list_groups, loaded_version = migrate_state(
+            list(config_list_devices),
+            list(config_list_groups),
+            from_version=loaded_version,
+        )
+        if loaded_version < CURRENT_SCHEMA_VERSION:
+            needs_migration_save = True
+
+        logger.debug(
+            "RL: Loaded %d devices and %d groups (schema_version=%s)",
+            len(config_list_devices),
+            len(config_list_groups),
+            loaded_version,
         )
         loaded_devices = []
 
@@ -212,16 +317,10 @@ class RaceLink_Host:
                 continue
         self.device_repository.replace_all(loaded_devices)
 
-        if config_str_groups is None or config_str_groups == "":
-            config_str_groups = dump_records(self.backup_group_repository.list())
-            self._option_set("rl_groups_config", config_str_groups)
+        if not config_list_groups:
+            config_list_groups = [obj.__dict__ for obj in self.backup_group_repository.list()]
 
-        config_list_groups = load_records(
-            config_str_groups,
-            default=[obj.__dict__ for obj in self.backup_group_repository.list()],
-        )
         loaded_groups = []
-
         for group in config_list_groups:
             logger.debug(group)
             group_dev_type = group.get("dev_type", group.get("device_type", 0))
@@ -243,8 +342,30 @@ class RaceLink_Host:
                     group.dev_type = 0
         self.group_repository.replace_all(loaded_groups)
 
+        if needs_migration_save:
+            try:
+                self.save_to_db({})
+            except Exception:
+                logger.exception("RaceLink: failed to persist migrated state")
+        else:
+            # save_to_db fires this naturally; make sure it also fires for a
+            # plain load so plugins can refresh panels (plan P2-2).
+            if callable(getattr(self, "on_persistence_changed", None)):
+                try:
+                    self.on_persistence_changed()
+                except Exception:
+                    logger.exception("RaceLink: on_persistence_changed callback failed")
+
     def discoverPort(self, args):
-        """Initialize the active gateway transport."""
+        """Initialize the active gateway transport.
+
+        Plan P1-1: The ``"manual" in args`` gate on the toast-style notification
+        is preserved intentionally -- programmatic retries should not spam the
+        RotorHazard UI with notifications. Persistent failure state
+        (``ready``, ``last_gateway_error``) is tracked in all cases so the UI
+        can render a red banner without needing toasts.
+        """
+        origin = "manual" if "manual" in args else "programmatic"
         port = self._option("psi_comms_port", None)
         try:
             self._transport_hooks_installed = False
@@ -253,6 +374,7 @@ class RaceLink_Host:
             if ok:
                 self.transport.start()
                 self.ready = True
+                self._clear_gateway_error()
                 self._install_transport_hooks()
                 used = self.transport.port or "unknown"
                 mac = getattr(self.transport, "ident_mac", None)
@@ -261,15 +383,78 @@ class RaceLink_Host:
                     if "manual" in args:
                         self._notify(self._translate("RaceLink Gateway ready on {} with MAC: {}").format(used, mac))
                 return
-            self.ready = False
-            logger.warning("No RaceLink Gateway module discovered or configured")
+            reason = "No RaceLink Gateway module discovered or configured"
+            self._record_gateway_error(reason=reason, origin=origin)
             if "manual" in args:
-                self._notify(self._translate("No RaceLink Gateway module discovered or configured"))
+                self._notify(self._translate(reason))
         except Exception as ex:
-            self.ready = False
-            logger.error("Gateway transport init failed: %s", ex)
+            self._record_gateway_error(reason=str(ex), origin=origin)
             if "manual" in args:
                 self._notify(self._translate("Failed to initialize communicator: {}").format(str(ex)))
+
+    def _record_gateway_error(self, *, reason: str, origin: str) -> None:
+        self.ready = False
+        self._gateway_failure_count += 1
+        self.last_gateway_error = {
+            "ts": time.time(),
+            "reason": str(reason),
+            "origin": origin,
+            "failure_count": int(self._gateway_failure_count),
+        }
+        # Escalate to ERROR once failures become sustained so the RotorHazard
+        # log is not flooded when a dongle is merely unplugged at boot.
+        if self._gateway_failure_count >= 3:
+            logger.error("Gateway transport unavailable (origin=%s, attempt=%s): %s", origin, self._gateway_failure_count, reason)
+        else:
+            logger.warning("Gateway transport unavailable (origin=%s, attempt=%s): %s", origin, self._gateway_failure_count, reason)
+
+    def _clear_gateway_error(self) -> None:
+        self.last_gateway_error = None
+        self._gateway_failure_count = 0
+
+    def gateway_status(self) -> dict:
+        """Return a JSON-serialisable gateway-readiness snapshot (plan P1-1)."""
+        return {
+            "ready": bool(self.ready),
+            "last_error": dict(self.last_gateway_error) if self.last_gateway_error else None,
+            "failure_count": int(self._gateway_failure_count),
+        }
+
+    def retry_gateway(self) -> dict:
+        """User-driven retry; uses the manual-origin path so toasts still fire."""
+        self.discoverPort({"manual"})
+        return self.gateway_status()
+
+    def shutdown(self) -> None:
+        """Release the serial transport and flush persisted state (plan P1-2).
+
+        Safe to call multiple times. Intended for plugin-unload / process-exit.
+        """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        transport = self.transport
+        self.transport = None
+        if transport is not None:
+            try:
+                close = getattr(transport, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.exception("RaceLink: error closing transport during shutdown")
+        task_manager = getattr(self, "_task_manager", None)
+        if task_manager is not None:
+            try:
+                cancel = getattr(task_manager, "cancel", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:
+                logger.exception("RaceLink: error cancelling task manager during shutdown")
+        try:
+            self.save_to_db({})
+        except Exception:
+            logger.exception("RaceLink: error persisting state during shutdown")
+        self.ready = False
 
     def onRaceStart(self, _args):
         logger.warning("RaceLink Race Start Event")
@@ -290,12 +475,13 @@ class RaceLink_Host:
             add_to_group=addToGroup,
         )
         found = int(result.get("found", 0) or 0)
-        if hasattr(self, "_rhapi") and hasattr(self._rhapi, "ui"):
-            if addToGroup > 0 and addToGroup < 255:
-                msg = "Device Discovery finished with {} devices found and added to GroupId: {}".format(found, addToGroup)
-            else:
-                msg = "Device Discovery finished with {} devices found.".format(found)
-            self._notify(msg)
+        # Plan P2-8: `_notify` already handles the "no ui" case, so the local
+        # hasattr guards are redundant -- drop them.
+        if 0 < addToGroup < 255:
+            msg = "Device Discovery finished with {} devices found and added to GroupId: {}".format(found, addToGroup)
+        else:
+            msg = "Device Discovery finished with {} devices found.".format(found)
+        self._notify(msg)
         return found
 
     def getStatus(self, groupFilter=255, targetDevice=None):
