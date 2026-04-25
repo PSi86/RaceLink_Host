@@ -544,11 +544,11 @@ class GatewayService:
 
         if opc == int(LP.OPC_STATUS) and ev.get("reply") == "STATUS_REPLY":
             logger.debug(
-                "STATUS from %s: flags=0x%02X cfg=0x%02X preset=%s bri=%s vbat=%s rssi=%s snr=%s host_rssi=%s host_snr=%s",
+                "STATUS from %s: flags=0x%02X cfg=0x%02X effect=%s bri=%s vbat=%s rssi=%s snr=%s host_rssi=%s host_snr=%s",
                 sender3_hex,
                 int(ev.get("flags", 0) or 0) & 0xFF,
                 int(ev.get("configByte", 0) or 0) & 0xFF,
-                ev.get("presetId"),
+                ev.get("effectId"),
                 ev.get("brightness"),
                 ev.get("vbat_mV"),
                 ev.get("node_rssi"),
@@ -768,7 +768,7 @@ class GatewayService:
                         dev.update_from_status(
                             ev.get("flags"),
                             ev.get("configByte"),
-                            ev.get("presetId"),
+                            ev.get("effectId"),
                             ev.get("brightness"),
                             ev.get("vbat_mV"),
                             ev.get("node_rssi"),

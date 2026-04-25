@@ -14,9 +14,9 @@ from .gateway_events import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WINDOW_OPEN, EV
 from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
     build_config_body,
-    build_control_adv_body,
     build_control_body,
     build_get_devices_body,
+    build_preset_body,
     build_set_group_body,
     build_sync_body,
 )
@@ -268,21 +268,23 @@ class GatewaySerialTransport:
         body = build_set_group_body(group_id)
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SET_GROUP), recv3, body)
 
-    def send_control(self, recv3: bytes, group_id: int, flags: int, preset_id: int, brightness: int):
-        body = build_control_body(group_id=group_id, flags=flags, preset_id=preset_id, brightness=brightness)
-        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONTROL), recv3, body)
+    def send_preset(self, recv3: bytes, group_id: int, flags: int, preset_id: int, brightness: int):
+        """Send an OPC_PRESET packet (4 B fixed, pre-rename: OPC_CONTROL)."""
+        body = build_preset_body(group_id=group_id, flags=flags, preset_id=preset_id, brightness=brightness)
+        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_PRESET), recv3, body)
 
-    def send_control_adv(self, recv3: bytes, group_id: int, flags: int, **params):
-        """Send an OPC_CONTROL_ADV packet (variable-length body, 3..21 B).
+    def send_control(self, recv3: bytes, group_id: int, flags: int, **params):
+        """Send an OPC_CONTROL packet (variable-length body, 3..21 B).
 
-        Forwards all kwargs to ``build_control_adv_body``; see that builder for
+        Forwards all kwargs to ``build_control_body``; see that builder for
         the accepted field names (brightness, mode, speed, intensity, custom1,
         custom2, custom3, check1/2/3, palette, color1/2/3). Body length varies
         with which fields are provided and is framed via the generic
         ``_send_m2n`` path, which already handles variable-length bodies.
+        (Pre-rename: ``send_control_adv`` / OPC_CONTROL_ADV.)
         """
-        body = build_control_adv_body(group_id=group_id, flags=flags, **params)
-        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONTROL_ADV), recv3, body)
+        body = build_control_body(group_id=group_id, flags=flags, **params)
+        self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONTROL), recv3, body)
 
     def send_config(self, recv3: bytes = b"\xFF\xFF\xFF", option: int = 0, data0: int = 0, data1: int = 0, data2: int = 0, data3: int = 0):
         body = build_config_body(option=option, data0=data0, data1=data1, data2=data2, data3=data3)
@@ -300,9 +302,16 @@ class GatewaySerialTransport:
         """
         self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_STREAM), recv3, bytes(payload or b""))
 
-    def send_wled_control(self, recv3: bytes, group_id: int, state: int, effect: int, brightness: int):
+    def send_wled_preset(self, recv3: bytes, group_id: int, state: int, preset_id: int, brightness: int):
+        """Legacy transport helper: send a WLED preset with a simple on/off state flag.
+
+        ``preset_id`` (pre-rename: ``effect``) is the WLED preset number written
+        into ``P_Preset.presetId``. The old name was misleading: OPC_PRESET
+        carries a preset id, not a WLED effect-mode index — those live on
+        OPC_CONTROL.
+        """
         flags = 0x01 if int(state) else 0x00
-        self.send_control(recv3, group_id, flags, int(effect), int(brightness))
+        self.send_preset(recv3, group_id, flags, int(preset_id), int(brightness))
 
     def send_get_status(self, recv3=b"\xFF\xFF\xFF", group_id=0, flags=0):
         body = struct.pack("<BB", group_id & 0xFF, flags & 0xFF)

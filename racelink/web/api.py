@@ -6,8 +6,21 @@ import time
 
 from flask import jsonify, request
 
-from ..domain import effect_select_options, state_scope
+from ..domain import (
+    rl_preset_select_options,
+    serialize_rl_preset_editor_schema,
+    state_scope,
+    wled_preset_select_options,
+)
+from ..domain.flags import USER_FLAG_KEYS
 from ..services import OTAWorkflowService, SpecialsService
+from ..services.scenes_service import (
+    KIND_RL_PRESET,
+    KIND_STARTBLOCK,
+    KIND_WLED_CONTROL,
+    KIND_WLED_PRESET,
+    get_action_kinds_metadata,
+)
 from .dto import group_counts, serialize_device
 from .request_helpers import parse_recv3_from_addr, parse_wifi_options
 
@@ -161,6 +174,9 @@ def register_api_routes(bp, ctx):
     host_wifi_service = ctx.services["host_wifi"]
     ota_service = ctx.services["ota"]
     presets_service = ctx.services["presets"]
+    rl_presets_service = ctx.services.get("rl_presets")
+    scenes_service = ctx.services.get("scenes")
+    scene_runner_service = ctx.services.get("scene_runner")
     specials_service = SpecialsService(rl_instance=ctx.rl_instance)
     ota_workflows = OTAWorkflowService(
         host_wifi_service=host_wifi_service,
@@ -248,7 +264,7 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/options", methods=["GET"])
     def api_options():
-        return jsonify({"ok": True, "effects": effect_select_options(context={"rl_instance": ctx.rl_instance})})
+        return jsonify({"ok": True, "presets": wled_preset_select_options(context={"rl_instance": ctx.rl_instance})})
 
     @bp.route("/api/discover", methods=["POST"])
     def api_discover():
@@ -693,6 +709,267 @@ def register_api_routes(bp, ctx):
             return jsonify({"ok": False, "error": "failed to parse presets.json"}), 400
         presets_service.set_current_name(name)
         return jsonify({"ok": True, "current": name})
+
+    # ------------------------------------------------------------------
+    # Phase B: RaceLink-native presets (OPC_CONTROL_ADV parameter snapshots)
+    # ------------------------------------------------------------------
+
+    def _rl_presets_unavailable():
+        return jsonify({"ok": False, "error": "rl_presets service not available"}), 503
+
+    @bp.route("/api/rl-presets", methods=["GET"])
+    def api_rl_presets_list():
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        return jsonify({"ok": True, "presets": rl_presets_service.list()})
+
+    @bp.route("/api/rl-presets/schema", methods=["GET"])
+    def api_rl_presets_schema():
+        """Return the 14-field editor schema with generators resolved.
+
+        Phase D: the Specials ``wled_control`` action now only carries the
+        preset-picker form; the full editor lives in ``dlgRlPresets`` and
+        needs its own schema source (``RL_PRESET_EDITOR_SCHEMA``).
+        """
+        schema = serialize_rl_preset_editor_schema(
+            context={"rl_instance": ctx.rl_instance}
+        )
+        return jsonify({"ok": True, "schema": schema})
+
+    @bp.route("/api/rl-presets", methods=["POST"])
+    def api_rl_presets_create():
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        body = request.get_json(silent=True) or {}
+        label = body.get("label")
+        if not isinstance(label, str) or not label.strip():
+            return jsonify({"ok": False, "error": "label is required"}), 400
+        try:
+            preset = rl_presets_service.create(
+                label=label,
+                params=body.get("params"),
+                flags=body.get("flags"),
+                key=body.get("key"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        return jsonify({"ok": True, "preset": preset})
+
+    @bp.route("/api/rl-presets/<key>", methods=["GET"])
+    def api_rl_presets_get(key):
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        preset = rl_presets_service.get(key)
+        if preset is None:
+            return jsonify({"ok": False, "error": "preset not found"}), 404
+        return jsonify({"ok": True, "preset": preset})
+
+    @bp.route("/api/rl-presets/<key>", methods=["PUT"])
+    def api_rl_presets_update(key):
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        body = request.get_json(silent=True) or {}
+        try:
+            preset = rl_presets_service.update(
+                key,
+                label=body.get("label"),
+                params=body.get("params"),
+                flags=body.get("flags"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        if preset is None:
+            return jsonify({"ok": False, "error": "preset not found"}), 404
+        return jsonify({"ok": True, "preset": preset})
+
+    @bp.route("/api/rl-presets/<key>", methods=["DELETE"])
+    def api_rl_presets_delete(key):
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        if not rl_presets_service.delete(key):
+            return jsonify({"ok": False, "error": "preset not found"}), 404
+        return jsonify({"ok": True})
+
+    @bp.route("/api/rl-presets/<key>/duplicate", methods=["POST"])
+    def api_rl_presets_duplicate(key):
+        if rl_presets_service is None:
+            return _rl_presets_unavailable()
+        body = request.get_json(silent=True) or {}
+        new_label = body.get("label")
+        try:
+            preset = rl_presets_service.duplicate(key, new_label=new_label)
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        if preset is None:
+            return jsonify({"ok": False, "error": "preset not found"}), 404
+        return jsonify({"ok": True, "preset": preset})
+
+    # ------------------------------------------------------------------
+    # Scenes — CRUD + run + editor-schema
+    # ------------------------------------------------------------------
+
+    def _scenes_unavailable():
+        return jsonify({"ok": False, "error": "scenes service not available"}), 503
+
+    def _runner_unavailable():
+        return jsonify({"ok": False, "error": "scene runner not available"}), 503
+
+    @bp.route("/api/scenes", methods=["GET"])
+    def api_scenes_list():
+        if scenes_service is None:
+            return _scenes_unavailable()
+        return jsonify({"ok": True, "scenes": scenes_service.list()})
+
+    @bp.route("/api/scenes/editor-schema", methods=["GET"])
+    def api_scenes_editor_schema():
+        """Return the per-kind action editor schema for the WebUI.
+
+        Live state (preset option lists) is resolved at request time from the
+        RL-preset and WLED-preset services so the editor sees current values.
+        """
+        sl_ctx = {"rl_instance": ctx.rl_instance}
+        # Per-kind UI hints. Reuses the ``select / slider / toggle`` widget
+        # vocabulary already established by RL_PRESET_EDITOR_SCHEMA.
+        ui_per_kind = {
+            KIND_RL_PRESET: {
+                "presetId": {
+                    "widget": "select",
+                    "options": rl_preset_select_options(context=sl_ctx),
+                },
+                "brightness": {"widget": "slider", "min": 0, "max": 255},
+            },
+            KIND_WLED_PRESET: {
+                "presetId": {
+                    "widget": "select",
+                    "options": wled_preset_select_options(context=sl_ctx),
+                },
+                "brightness": {"widget": "slider", "min": 0, "max": 255},
+            },
+            KIND_WLED_CONTROL: {
+                "presetId": {
+                    "widget": "select",
+                    "options": rl_preset_select_options(context=sl_ctx),
+                },
+                "brightness": {"widget": "slider", "min": 0, "max": 255},
+            },
+            KIND_STARTBLOCK: {
+                "fn_key": {"widget": "select", "options": [
+                    {"value": "startblock_control", "label": "Startblock Control"},
+                ]},
+            },
+            "delay": {"duration_ms": {"widget": "slider", "min": 0, "max": 60000}},
+            "sync": {},
+        }
+        kinds_out = []
+        for entry in get_action_kinds_metadata():
+            out = dict(entry)
+            out["ui"] = ui_per_kind.get(entry["kind"], {})
+            kinds_out.append(out)
+        return jsonify({
+            "ok": True,
+            "kinds": kinds_out,
+            "flag_keys": list(USER_FLAG_KEYS),
+        })
+
+    @bp.route("/api/scenes/<key>", methods=["GET"])
+    def api_scenes_get(key):
+        if scenes_service is None:
+            return _scenes_unavailable()
+        scene = scenes_service.get(key)
+        if scene is None:
+            return jsonify({"ok": False, "error": "scene not found"}), 404
+        return jsonify({"ok": True, "scene": scene})
+
+    @bp.route("/api/scenes", methods=["POST"])
+    def api_scenes_create():
+        if scenes_service is None:
+            return _scenes_unavailable()
+        body = request.get_json(silent=True) or {}
+        label = body.get("label")
+        if not isinstance(label, str) or not label.strip():
+            return jsonify({"ok": False, "error": "label is required"}), 400
+        try:
+            scene = scenes_service.create(
+                label=label,
+                actions=body.get("actions"),
+                key=body.get("key"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        _sse_refresh(ctx, {state_scope.SCENES})
+        return jsonify({"ok": True, "scene": scene})
+
+    @bp.route("/api/scenes/<key>", methods=["PUT"])
+    def api_scenes_update(key):
+        if scenes_service is None:
+            return _scenes_unavailable()
+        body = request.get_json(silent=True) or {}
+        try:
+            scene = scenes_service.update(
+                key,
+                label=body.get("label"),
+                actions=body.get("actions"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        if scene is None:
+            return jsonify({"ok": False, "error": "scene not found"}), 404
+        _sse_refresh(ctx, {state_scope.SCENES})
+        return jsonify({"ok": True, "scene": scene})
+
+    @bp.route("/api/scenes/<key>", methods=["DELETE"])
+    def api_scenes_delete(key):
+        if scenes_service is None:
+            return _scenes_unavailable()
+        if not scenes_service.delete(key):
+            return jsonify({"ok": False, "error": "scene not found"}), 404
+        _sse_refresh(ctx, {state_scope.SCENES})
+        return jsonify({"ok": True})
+
+    @bp.route("/api/scenes/<key>/duplicate", methods=["POST"])
+    def api_scenes_duplicate(key):
+        if scenes_service is None:
+            return _scenes_unavailable()
+        body = request.get_json(silent=True) or {}
+        new_label = body.get("label")
+        try:
+            scene = scenes_service.duplicate(key, new_label=new_label)
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        if scene is None:
+            return jsonify({"ok": False, "error": "scene not found"}), 404
+        _sse_refresh(ctx, {state_scope.SCENES})
+        return jsonify({"ok": True, "scene": scene})
+
+    @bp.route("/api/scenes/<key>/run", methods=["POST"])
+    def api_scenes_run(key):
+        """Run a scene synchronously and return the per-action result.
+
+        v1: synchronous request. The HTTP response holds open until the
+        runner finishes. ``delay`` actions are capped at 60 s each by the
+        service validator, and total scenes are bounded at 20 actions, so
+        worst-case wall time is 20 minutes — but realistic scenes finish in
+        seconds.
+
+        R7: per-action progress is emitted on the SSE bus (topic
+        ``scene_progress``) before each action starts and after it returns.
+        The bus is a separate connection from this request so broadcasting
+        during the synchronous run does not block the response. The
+        consumer (scenes.js) updates per-row borders live; the post-run
+        result strip still comes from the JSON payload returned here.
+        """
+        if scenes_service is None:
+            return _scenes_unavailable()
+        if scene_runner_service is None:
+            return _runner_unavailable()
+
+        def _emit_progress(payload):
+            ctx.sse.broadcast("scene_progress", payload)
+
+        result = scene_runner_service.run(key, progress_cb=_emit_progress)
+        if not result.ok and result.error == "scene_not_found":
+            return jsonify(result.to_dict()), 404
+        return jsonify({"ok": result.ok, "result": result.to_dict()})
 
     @bp.route("/api/fw/uploads", methods=["GET"])
     def api_fw_uploads():

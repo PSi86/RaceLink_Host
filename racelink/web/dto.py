@@ -25,6 +25,7 @@ def serialize_device(dev):
         "flags": int(getattr(dev, "flags", 0) or 0),
         "configByte": int(getattr(dev, "configByte", 0) or 0),
         "presetId": int(getattr(dev, "presetId", 0) or 0),
+        "effectId": int(getattr(dev, "effectId", 0) or 0),
         "brightness": int(getattr(dev, "brightness", 0) or 0),
         "specials": dict(getattr(dev, "specials", {}) or {}),
         "voltage_mV": int(getattr(dev, "voltage_mV", 0) or 0),

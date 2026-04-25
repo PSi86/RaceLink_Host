@@ -60,11 +60,16 @@ def parse_fx_metadata(raw: str) -> Tuple[str, Dict[str, dict]]:
     means "used, keep the generic UI label" and leaves ``label`` as ``None``.
     """
 
-    # Default: no slot is used (applies when the raw string has no "@" spec,
-    # e.g. "Solid"). The WebUI can still show generic controls if it wants to.
     slots: Dict[str, dict] = {name: {"used": False, "label": None} for name in _ALL_SLOT_FIELDS}
 
     if "@" not in raw:
+        # WLED convention: effects without an explicit ``@`` metadata string
+        # still react to the default controls — at minimum the three color
+        # slots and the palette. "Solid" is the canonical example: it needs
+        # Color 1 to render. Sliders/toggles stay ``used=False`` because they
+        # require explicit labels to have any meaning in the UI.
+        for default_used in ("color1", "color2", "color3", "palette"):
+            slots[default_used] = {"used": True, "label": None}
         return raw.strip(), slots
 
     name, _, spec = raw.partition("@")

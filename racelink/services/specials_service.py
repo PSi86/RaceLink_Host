@@ -139,7 +139,8 @@ class SpecialsService:
                 coerced[var] = self._coerce_toggle(raw_val)
                 continue
 
-            # Default: numeric slider/select/legacy
+            # Default: numeric slider/select/legacy -- select preset lists hold
+            # int ids only (Phase C: RL-native presets follow a separate path).
             try:
                 value_int = int(raw_val)
             except Exception as ex:

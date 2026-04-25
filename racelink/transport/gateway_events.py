@@ -17,11 +17,11 @@ class LP:
     OPC_DEVICES = 0x01
     OPC_SET_GROUP = 0x02
     OPC_STATUS = 0x03
-    OPC_CONTROL = 0x04
+    OPC_PRESET = 0x04
     OPC_CONFIG = 0x05
     OPC_SYNC = 0x06
     OPC_STREAM = 0x07
-    OPC_CONTROL_ADV = 0x08
+    OPC_CONTROL = 0x08
     OPC_ACK = 0x7E
 
     @staticmethod
@@ -36,11 +36,11 @@ if _HAVE_AUTO:
         LP.OPC_DEVICES = getattr(RLPA, "OPC_DEVICES", LP.OPC_DEVICES)
         LP.OPC_SET_GROUP = getattr(RLPA, "OPC_SET_GROUP", LP.OPC_SET_GROUP)
         LP.OPC_STATUS = getattr(RLPA, "OPC_STATUS", LP.OPC_STATUS)
-        LP.OPC_CONTROL = getattr(RLPA, "OPC_CONTROL", getattr(RLPA, "OPC_WLED_CONTROL", LP.OPC_CONTROL))
+        LP.OPC_PRESET = getattr(RLPA, "OPC_PRESET", LP.OPC_PRESET)
         LP.OPC_CONFIG = getattr(RLPA, "OPC_CONFIG", LP.OPC_CONFIG)
         LP.OPC_SYNC = getattr(RLPA, "OPC_SYNC", LP.OPC_SYNC)
         LP.OPC_STREAM = getattr(RLPA, "OPC_STREAM", LP.OPC_STREAM)
-        LP.OPC_CONTROL_ADV = getattr(RLPA, "OPC_CONTROL_ADV", LP.OPC_CONTROL_ADV)
+        LP.OPC_CONTROL = getattr(RLPA, "OPC_CONTROL", LP.OPC_CONTROL)
         LP.OPC_ACK = getattr(RLPA, "OPC_ACK", LP.OPC_ACK)
 
         make_type = getattr(RLPA, "make_type", LP.make_type)

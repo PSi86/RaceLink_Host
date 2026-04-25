@@ -172,8 +172,10 @@ class RaceLink_Host:
         self.on_gateway_status_changed = None
         # Plan P1-2: dispose transport cleanly when the host plugin unloads.
         self._shutdown_called: bool = False
+        # WLED preset list (numeric ids -> labels). Pre-rename: ``uiEffectList``
+        # — the entries are preset ids, not WLED effect-mode indices.
         # Basic colors: 1-9; Basic effects: 10-19; Special Effects (WLED only): 20-100
-        self.uiEffectList = [
+        self.uiPresetList = [
             {"value": "01", "label": "Red"},
             {"value": "02", "label": "Green"},
             {"value": "03", "label": "Blue"},
@@ -836,21 +838,60 @@ class RaceLink_Host:
                 continue
 
     def sendRaceLink(self, targetDevice, flags=None, presetId=None, brightness=None):
-        """Compatibility entrypoint forwarding device control to ControlService."""
-        return self.control_service.send_device_control(targetDevice, flags, presetId, brightness)
+        """Compatibility entrypoint forwarding a fixed preset-id send to the
+        control service (OPC_PRESET). Low-level shim kept for legacy callers."""
+        return self.control_service.send_device_preset(targetDevice, flags, presetId, brightness)
 
-    def sendGroupControl(self, gcGroupId, gcFlags, gcPresetId, gcBrightness):
-        """Compatibility entrypoint forwarding group control to ControlService."""
-        return self.control_service.send_group_control(gcGroupId, gcFlags, gcPresetId, gcBrightness)
+    def sendGroupPreset(self, gcGroupId, gcFlags, gcPresetId, gcBrightness):
+        """Broadcast a preset id to a group (OPC_PRESET)."""
+        return self.control_service.send_group_preset(gcGroupId, gcFlags, gcPresetId, gcBrightness)
+
+    def sendWledPreset(self, *, targetDevice=None, targetGroup=None, params=None):
+        """Apply a classical WLED preset (OPC_PRESET). Pre-rename: ``sendWledControl``."""
+        return self.control_service.send_wled_preset(
+            targetDevice=targetDevice, targetGroup=targetGroup, params=params,
+        )
 
     def sendWledControl(self, *, targetDevice=None, targetGroup=None, params=None):
-        """Compatibility entrypoint forwarding WLED actions to ControlService."""
-        return self.control_service.send_wled_control(targetDevice=targetDevice, targetGroup=targetGroup, params=params)
+        """Apply a RaceLink-native preset (OPC_CONTROL) by its stable int id.
 
-    def sendWledControlAdvanced(self, *, targetDevice=None, targetGroup=None, params=None):
-        """Dispatch WLED_Advanced (OPC_CONTROL_ADV) via ControlService."""
-        return self.control_service.send_wled_control_advanced(
-            targetDevice=targetDevice, targetGroup=targetGroup, params=params
+        Phase D: this is the Specials/WebUI entry point for the "WLED Control"
+        action. ``params`` carries only ``{presetId, brightness}`` — full
+        14-parameter editing lives in the RL-preset editor, not here. The raw
+        direct-parameter send stays available on ``ControlService`` for
+        internal callers (``send_rl_preset_by_id`` uses it to dispatch
+        OPC_CONTROL with the resolved snapshot).
+        """
+        params = params or {}
+        preset_id = int(params.get("presetId", 0))
+        brightness = params.get("brightness")
+        return self.control_service.send_rl_preset_by_id(
+            preset_id,
+            targetDevice=targetDevice,
+            targetGroup=targetGroup,
+            brightness_override=int(brightness) if brightness is not None else None,
+        )
+
+    def sendRlPresetById(
+        self,
+        preset_id,
+        *,
+        targetDevice=None,
+        targetGroup=None,
+        brightness_override=None,
+    ):
+        """Apply a RL-preset snapshot (stable int id) via ControlService.
+
+        RotorHazard quickset / default group action entry point. The service
+        loads the persisted params through ``rl_presets_service`` and sends
+        ``OPC_CONTROL``. WLED presets keep their own path via
+        :meth:`sendWledPreset`.
+        """
+        return self.control_service.send_rl_preset_by_id(
+            preset_id,
+            targetDevice=targetDevice,
+            targetGroup=targetGroup,
+            brightness_override=brightness_override,
         )
 
     def sendStartblockConfig(self, *, targetDevice=None, targetGroup=None, params=None):
@@ -860,6 +901,23 @@ class RaceLink_Host:
             target_group=targetGroup,
             params=params,
         )
+
+    def runScene(self, scene_key, *, progress_cb=None):
+        """Run a scene by key. Wired by ``RaceLinkApp`` factory; falls back to
+        an explicit error result when the runner is not yet attached so the RH
+        plugin's ``RaceLink Scene`` ActionEffect degrades gracefully on a
+        partially-initialised controller.
+
+        ``progress_cb`` (kwarg-only) forwards to the runner so the WebUI's
+        synchronous ``/api/scenes/<key>/run`` route can broadcast SSE
+        progress events. The RH plugin's ``applyScene`` path doesn't pass
+        the kwarg, so its behaviour is unchanged.
+        """
+        runner = getattr(self, "scene_runner_service", None)
+        if runner is None:
+            from racelink.services.scene_runner_service import SceneRunResult
+            return SceneRunResult(scene_key=str(scene_key), ok=False, error="runner_not_wired")
+        return runner.run(str(scene_key), progress_cb=progress_cb)
 
     def _is_startblock_device(self, dev: RL_Device) -> bool:
         """Compatibility helper kept for legacy callers during controller slimming."""

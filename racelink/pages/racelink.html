@@ -15,6 +15,8 @@
       <button id="btnStatusAll">Get Status (All)</button>
       <button id="btnFwUpdate">Firmware Update</button>
       <button id="btnWledPresets">WLED Presets</button>
+      <button id="btnRlPresets">RL Presets</button>
+      <a href="{{ rl_base_path }}/scenes" class="rl-nav-link">Scenes</a>
       <button id="btnForce">Set all Groups</button>
       <button id="btnSave">Save</button>
       <button id="btnReload">Reload</button>
@@ -280,6 +282,35 @@
       </div>
 
       <p id="specialHint" class="muted"></p>
+    </form>
+  </dialog>
+
+  <!-- Scene Manager moved out of this page to /racelink/scenes (R5). The
+       header "Scenes" link above navigates there. -->
+
+  <!-- RaceLink preset editor (persistent OPC_CONTROL_ADV snapshots). -->
+  <dialog id="dlgRlPresets">
+    <form method="dialog" class="rl-form rl-presets-form">
+      <h3>RaceLink Presets</h3>
+      <p class="muted">Persistente Effekt-Snapshots. Werden von RotorHazard per Preset-ID angewendet und als <code>OPC_CONTROL_ADV</code> gesendet.</p>
+
+      <div class="rl-presets-layout">
+        <aside class="rl-presets-sidebar">
+          <div class="rl-presets-toolbar">
+            <button id="btnRlPresetNew" type="button">+ New</button>
+          </div>
+          <ul id="rlPresetList" class="rl-presets-list"></ul>
+        </aside>
+        <section id="rlPresetEditor" class="rl-presets-editor">
+          <p class="muted">Wähle links ein Preset oder erstelle ein neues.</p>
+        </section>
+      </div>
+
+      <div class="rl-dialog-actions">
+        <button value="cancel">Close</button>
+      </div>
+
+      <p id="rlPresetsHint" class="muted"></p>
     </form>
   </dialog>
 

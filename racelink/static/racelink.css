@@ -70,6 +70,76 @@ dialog::backdrop{ background:rgba(0,0,0,.4); }
 .rl-toggle-wrap input[type=checkbox]{ width:18px; height:18px; accent-color:#5b8cff; }
 .rl-special-input input[type=color]{ width:100%; height:32px; background:#1a1a23; border:1px solid #2a2a32; border-radius:8px; padding:2px; cursor:pointer; }
 
+/* Phase B: RL-Preset editor dialog
+   Override default ``dialog { width: min(520px, 96vw); }`` from the top of
+   this file — the inner form cannot widen the dialog element itself. */
+#dlgRlPresets{ width: min(960px, 96vw); max-width: none; max-height: 90vh; }
+.rl-presets-form{ width: 100%; }
+.rl-presets-layout{ display:grid; grid-template-columns: minmax(180px, 240px) 1fr; gap:12px; margin:8px 0; }
+.rl-presets-sidebar{ border:1px solid #2a2a32; border-radius:8px; padding:8px; background:#16161d; }
+.rl-presets-toolbar{ display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
+.rl-presets-list{ list-style:none; padding:0; margin:0; max-height:60vh; overflow-y:auto; }
+.rl-presets-list li{ padding:6px 8px; border-radius:6px; cursor:pointer; font-size:13px; }
+.rl-presets-list li:hover{ background:#1f1f28; }
+.rl-presets-list li.active{ background:#2a2d40; color:#cfe0ff; }
+.rl-presets-list li.muted{ cursor:default; }
+.rl-presets-editor{ border:1px solid #2a2a32; border-radius:8px; padding:10px; background:#16161d; min-height:300px; }
+
+/* Scene Manager — own page (/racelink/scenes) layout. R6: drop the 1200px
+   max-width clamp left over from the dialog era; the page now fills the
+   viewport minus the standard ``.rl-main`` gutter. The inner two-column
+   grid (.rl-presets-layout) absorbs the extra width via ``minmax(180px,
+   240px) 1fr`` — sidebar stays compact, editor body grows. */
+.rl-scenes-main{ grid-template-columns: 1fr; }
+.rl-scenes-page{ width: 100%; }
+.rl-scenes-actions{ display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+.rl-nav-link{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 10px; border-radius:8px; cursor:pointer;
+  background:#232330; border:1px solid #2a2a32; color:var(--text);
+  text-decoration:none; font-size:14px;
+}
+.rl-nav-link:hover{ border-color:#3b3b44; color:#cfe0ff; }
+.rl-scene-action-row{
+  border:1px solid #2a2a32; border-radius:8px; padding:8px;
+  background:#1a1a23; display:grid;
+  grid-template-columns: 28px minmax(140px, 200px) 1fr auto; gap:8px;
+  align-items:start;
+}
+.rl-scene-action-row.degraded{ border-color:#5a2a2a; background:#221314; }
+.rl-scene-action-row.running{ border-color:var(--accent); }
+.rl-scene-action-row.ok{ border-color:#2d553f; }
+.rl-scene-action-row.error{ border-color:#5a2a2a; }
+.rl-scene-action-index{ color:var(--muted); font-variant-numeric:tabular-nums; padding-top:6px; }
+.rl-scene-action-kind{ display:flex; flex-direction:column; gap:6px; }
+.rl-scene-action-kind label{ font-size:12px; color:var(--muted); }
+.rl-scene-action-body{ display:flex; flex-direction:column; gap:6px; }
+.rl-scene-action-controls{ display:flex; flex-direction:column; gap:4px; align-items:stretch; }
+.rl-scene-action-controls button{ font-size:12px; padding:4px 8px; }
+.rl-scene-target{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.rl-scene-target label.inline{ font-size:12px; color:var(--muted); }
+.rl-scene-vars{ display:flex; flex-wrap:wrap; gap:8px; }
+.rl-scene-flags{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.rl-scene-flags > span.muted{ font-size:12px; }
+.rl-scene-add-row{ display:flex; gap:8px; align-items:center; margin-top:4px; }
+.rl-scene-meta{
+  display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+  margin:8px 0; padding-bottom:8px; border-bottom:1px dashed #2a2a32;
+}
+.rl-scene-meta label{ font-size:12px; color:var(--muted); }
+.rl-scene-progress{
+  display:flex; gap:4px; flex-wrap:wrap; padding:6px 0;
+  font-size:12px; color:var(--muted);
+}
+.rl-scene-progress .pip{
+  width:18px; height:18px; border-radius:4px; border:1px solid #2a2a32;
+  display:inline-flex; align-items:center; justify-content:center;
+  font-size:10px; background:#1a1a23;
+}
+.rl-scene-progress .pip.ok{ background:#102017; border-color:#2d553f; color:#b6f5cf; }
+.rl-scene-progress .pip.error{ background:#221314; border-color:#5a2a2a; color:#ffd8d8; }
+.rl-scene-progress .pip.degraded{ background:#1f1a14; border-color:#5a4a2a; color:#ffe0a8; }
+
 /* Plan P1-1: persistent gateway-down banner */
 .rl-banner{
   display:flex; align-items:center; gap:12px;

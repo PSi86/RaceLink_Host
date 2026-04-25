@@ -3,26 +3,26 @@ import unittest
 from racelink import racelink_proto_auto as RLPA
 from racelink.protocol import addressing, codec, packets, rules
 from racelink.protocol.packets import (
-    RL_ADV_E_COLOR1,
-    RL_ADV_E_COLOR2,
-    RL_ADV_E_COLOR3,
-    RL_ADV_E_PALETTE,
-    RL_ADV_F_BRIGHTNESS,
-    RL_ADV_F_CUSTOM1,
-    RL_ADV_F_CUSTOM2,
-    RL_ADV_F_CUSTOM3_CHECKS,
-    RL_ADV_F_EXT,
-    RL_ADV_F_INTENSITY,
-    RL_ADV_F_MODE,
-    RL_ADV_F_SPEED,
-    build_control_adv_body,
+    RL_CTRL_E_COLOR1,
+    RL_CTRL_E_COLOR2,
+    RL_CTRL_E_COLOR3,
+    RL_CTRL_E_PALETTE,
+    RL_CTRL_F_BRIGHTNESS,
+    RL_CTRL_F_CUSTOM1,
+    RL_CTRL_F_CUSTOM2,
+    RL_CTRL_F_CUSTOM3_CHECKS,
+    RL_CTRL_F_EXT,
+    RL_CTRL_F_INTENSITY,
+    RL_CTRL_F_MODE,
+    RL_CTRL_F_SPEED,
+    build_control_body,
 )
 
 
 def _parse_control_adv(body: bytes) -> dict:
     """Reference parser mirroring the layout documented in racelink_proto.h.
 
-    Used only by tests to validate round-trip of build_control_adv_body.
+    Used only by tests to validate round-trip of build_control_body.
     """
     i = 0
     group_id = body[i]; i += 1
@@ -30,31 +30,31 @@ def _parse_control_adv(body: bytes) -> dict:
     field_mask = body[i]; i += 1
     out: dict = {"groupId": group_id, "flags": flags, "fieldMask": field_mask}
 
-    if field_mask & RL_ADV_F_BRIGHTNESS:
+    if field_mask & RL_CTRL_F_BRIGHTNESS:
         out["brightness"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_MODE:
+    if field_mask & RL_CTRL_F_MODE:
         out["mode"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_SPEED:
+    if field_mask & RL_CTRL_F_SPEED:
         out["speed"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_INTENSITY:
+    if field_mask & RL_CTRL_F_INTENSITY:
         out["intensity"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_CUSTOM1:
+    if field_mask & RL_CTRL_F_CUSTOM1:
         out["custom1"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_CUSTOM2:
+    if field_mask & RL_CTRL_F_CUSTOM2:
         out["custom2"] = body[i]; i += 1
-    if field_mask & RL_ADV_F_CUSTOM3_CHECKS:
+    if field_mask & RL_CTRL_F_CUSTOM3_CHECKS:
         packed = body[i]; i += 1
         out["custom3"] = packed & 0x1F
         out["check1"] = bool(packed & 0x20)
         out["check2"] = bool(packed & 0x40)
         out["check3"] = bool(packed & 0x80)
 
-    if field_mask & RL_ADV_F_EXT:
+    if field_mask & RL_CTRL_F_EXT:
         ext_mask = body[i]; i += 1
         out["extMask"] = ext_mask
-        if ext_mask & RL_ADV_E_PALETTE:
+        if ext_mask & RL_CTRL_E_PALETTE:
             out["palette"] = body[i]; i += 1
-        for key, bit in (("color1", RL_ADV_E_COLOR1), ("color2", RL_ADV_E_COLOR2), ("color3", RL_ADV_E_COLOR3)):
+        for key, bit in (("color1", RL_CTRL_E_COLOR1), ("color2", RL_CTRL_E_COLOR2), ("color3", RL_CTRL_E_COLOR3)):
             if ext_mask & bit:
                 out[key] = (body[i], body[i + 1], body[i + 2])
                 i += 3
@@ -73,7 +73,7 @@ class ProtocolTests(unittest.TestCase):
     def test_protocol_packet_builders_and_addressing(self):
         self.assertEqual(packets.build_get_devices_body(2, 3), b"\x02\x03")
         self.assertEqual(packets.build_set_group_body(9), b"\x09")
-        self.assertEqual(packets.build_control_body(1, 2, 3, 4), b"\x01\x02\x03\x04")
+        self.assertEqual(packets.build_preset_body(1, 2, 3, 4), b"\x01\x02\x03\x04")
         self.assertEqual(packets.build_config_body(5, 1, 2, 3, 4), b"\x05\x01\x02\x03\x04")
         self.assertEqual(packets.build_sync_body(0x123456, 0x44), b"\x56\x34\x12\x44")
         self.assertEqual(addressing.to_hex_str("aa:bb:cc:dd:ee:ff"), "AABBCCDDEEFF")
@@ -82,7 +82,7 @@ class ProtocolTests(unittest.TestCase):
     def test_generated_struct_sizes_match_manual_packet_builders(self):
         self.assertEqual(len(packets.build_get_devices_body(1, 2)), RLPA.SZ_P_GetDevices)
         self.assertEqual(len(packets.build_set_group_body(3)), RLPA.SZ_P_SetGroup)
-        self.assertEqual(len(packets.build_control_body(1, 2, 3, 4)), RLPA.SZ_P_Control)
+        self.assertEqual(len(packets.build_preset_body(1, 2, 3, 4)), RLPA.SZ_P_Preset)
         self.assertEqual(len(packets.build_config_body(5, 1, 2, 3, 4)), RLPA.SZ_P_Config)
         self.assertEqual(len(packets.build_sync_body(0x123456, 0x44)), RLPA.SZ_P_Sync)
         self.assertEqual(RLPA.SZ_P_IdentifyReply, 9)
@@ -95,7 +95,7 @@ class ProtocolTests(unittest.TestCase):
             [("groupId", "uint8_t", 1), ("flags", "uint8_t", 1)],
         )
         self.assertEqual(
-            RLPA.STRUCT_FIELDS["P_Control"],
+            RLPA.STRUCT_FIELDS["P_Preset"],
             [("groupId", "uint8_t", 1), ("flags", "uint8_t", 1), ("presetId", "uint8_t", 1), ("brightness", "uint8_t", 1)],
         )
         self.assertEqual(
@@ -111,7 +111,7 @@ class ProtocolTests(unittest.TestCase):
             [
                 ("flags", "uint8_t", 1),
                 ("configByte", "uint8_t", 1),
-                ("presetId", "uint8_t", 1),
+                ("effectId", "uint8_t", 1),
                 ("brightness", "uint8_t", 1),
                 ("vbat_mV", "uint16_t", 1),
                 ("rssi", "int8_t", 1),
@@ -135,7 +135,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(status_event["reply"], "STATUS_REPLY")
         self.assertEqual(status_event["flags"], 0x11)
         self.assertEqual(status_event["configByte"], 0x22)
-        self.assertEqual(status_event["presetId"], 0x33)
+        self.assertEqual(status_event["effectId"], 0x33)
         self.assertEqual(status_event["brightness"], 0x44)
 
     def test_protocol_codec_parses_identify_reply_using_generated_size(self):
@@ -153,12 +153,12 @@ class ProtocolTests(unittest.TestCase):
 
 class ControlAdvBuilderTests(unittest.TestCase):
     def test_body_with_no_fields_is_just_header(self):
-        body = build_control_adv_body(group_id=0x05, flags=0x02)
+        body = build_control_body(group_id=0x05, flags=0x02)
         self.assertEqual(body, b"\x05\x02\x00")
         self.assertEqual(len(body), 3)
 
     def test_full_body_fits_in_body_max_and_round_trips(self):
-        body = build_control_adv_body(
+        body = build_control_body(
             group_id=0x07,
             flags=0x05,
             brightness=200,
@@ -197,33 +197,33 @@ class ControlAdvBuilderTests(unittest.TestCase):
         self.assertEqual(parsed["color3"], (0, 0, 255))
 
     def test_only_mode_change_is_minimal(self):
-        body = build_control_adv_body(group_id=0, flags=0x01, mode=5)
+        body = build_control_body(group_id=0, flags=0x01, mode=5)
         # 3 (header) + 1 (mode)
         self.assertEqual(len(body), 4)
         parsed = _parse_control_adv(body)
-        self.assertEqual(parsed["fieldMask"], RL_ADV_F_MODE)
+        self.assertEqual(parsed["fieldMask"], RL_CTRL_F_MODE)
         self.assertEqual(parsed["mode"], 5)
 
     def test_only_color_sets_ext_flag(self):
-        body = build_control_adv_body(group_id=0, flags=0, color1=(0x12, 0x34, 0x56))
+        body = build_control_body(group_id=0, flags=0, color1=(0x12, 0x34, 0x56))
         parsed = _parse_control_adv(body)
         # fieldMask only has the EXT bit; no main-mask singles.
-        self.assertEqual(parsed["fieldMask"], RL_ADV_F_EXT)
-        self.assertEqual(parsed["extMask"], RL_ADV_E_COLOR1)
+        self.assertEqual(parsed["fieldMask"], RL_CTRL_F_EXT)
+        self.assertEqual(parsed["extMask"], RL_CTRL_E_COLOR1)
         self.assertEqual(parsed["color1"], (0x12, 0x34, 0x56))
 
     def test_checks_only_sets_custom3_checks_byte(self):
-        body = build_control_adv_body(group_id=0, flags=0, check2=True)
+        body = build_control_body(group_id=0, flags=0, check2=True)
         parsed = _parse_control_adv(body)
-        self.assertEqual(parsed["fieldMask"], RL_ADV_F_CUSTOM3_CHECKS)
+        self.assertEqual(parsed["fieldMask"], RL_CTRL_F_CUSTOM3_CHECKS)
         self.assertEqual(parsed["custom3"], 0)
         self.assertFalse(parsed["check1"])
         self.assertTrue(parsed["check2"])
         self.assertFalse(parsed["check3"])
 
     def test_opcode_control_adv_is_registered_and_variable_length(self):
-        self.assertEqual(RLPA.OPC_CONTROL_ADV, 8)
-        rule = RLPA.find_rule(RLPA.OPC_CONTROL_ADV)
+        self.assertEqual(RLPA.OPC_CONTROL, 8)
+        rule = RLPA.find_rule(RLPA.OPC_CONTROL)
         self.assertIsNotNone(rule)
         self.assertEqual(rule.req_len, 0)  # variable length
         self.assertEqual(rule.policy, RLPA.RESP_NONE)
@@ -238,7 +238,7 @@ class WledControlAdvancedServiceTests(unittest.TestCase):
         calls = []
 
         class _FakeTransport:
-            def send_control_adv(self, **kwargs):
+            def send_control(self, **kwargs):
                 calls.append(kwargs)
 
         class _FakeController:
@@ -252,7 +252,7 @@ class WledControlAdvancedServiceTests(unittest.TestCase):
 
         ctrl = _FakeController()
         svc = ControlService(ctrl, None)
-        ok = svc.send_wled_control_advanced(
+        ok = svc.send_wled_control(
             targetDevice=_Dev(),
             params={
                 "mode": 5,

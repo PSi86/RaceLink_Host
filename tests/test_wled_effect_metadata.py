@@ -12,16 +12,34 @@ from racelink.domain.specials import _normalize_select_options
 
 
 class ParseFxMetadataTests(unittest.TestCase):
-    def test_solid_has_no_slot_usage(self):
+    def test_solid_uses_default_color_slots(self):
+        """D3 regression: effects without an '@' in their metadata (``Solid``,
+        ``Oscillate``) must still surface color 1/2/3 + palette in the editor —
+        WLED uses those controls by default."""
         name, slots = parse_fx_metadata("Solid")
         self.assertEqual(name, "Solid")
+        # Sliders/toggles stay unused (no explicit labels).
         for field in (
             "speed", "intensity", "custom1", "custom2", "custom3",
             "check1", "check2", "check3",
-            "color1", "color2", "color3", "palette",
         ):
             self.assertFalse(slots[field]["used"], field)
             self.assertIsNone(slots[field]["label"], field)
+        # Colors + palette default to used.
+        for field in ("color1", "color2", "color3", "palette"):
+            self.assertTrue(slots[field]["used"], field)
+            self.assertIsNone(slots[field]["label"], field)
+
+    def test_oscillate_also_uses_default_color_slots(self):
+        """Second ``@``-less effect in the WLED source; same default coverage."""
+        name, slots = parse_fx_metadata("Oscillate")
+        self.assertEqual(name, "Oscillate")
+        self.assertTrue(slots["color1"]["used"])
+        self.assertTrue(slots["color2"]["used"])
+        self.assertTrue(slots["color3"]["used"])
+        self.assertTrue(slots["palette"]["used"])
+        self.assertFalse(slots["speed"]["used"])
+        self.assertFalse(slots["check1"]["used"])
 
     def test_blink_uses_sx_ix_col1_col2_palette(self):
         # From FX.cpp: "Blink@!,Duty cycle;!,!;!;01"
@@ -132,7 +150,7 @@ class CoerceRespectsAbsentVarsTests(unittest.TestCase):
     def test_missing_vars_are_omitted(self):
         from racelink.services.specials_service import SpecialsService
 
-        svc = SpecialsService(rl_instance=type("RL", (), {"uiEffectList": []})())
+        svc = SpecialsService(rl_instance=type("RL", (), {"uiPresetList": []})())
         fn_info = {
             "vars": ["mode", "speed", "color1", "check1"],
             "ui": {

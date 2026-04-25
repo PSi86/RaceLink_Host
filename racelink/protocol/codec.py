@@ -32,14 +32,16 @@ def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rss
         else:
             ev.update({"reply": "IDENTIFY_REPLY", "body_raw": body})
     elif opc == 0x03:
+        # P_StatusReply byte 2 was renamed presetId -> effectId 2026-04-25
+        # (wire layout unchanged; semantic shift to active segment mode index).
         if len(body) == 8:
-            flags, config_byte, preset_id, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBBHbb", body)
+            flags, config_byte, effect_id, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBBHbb", body)
             ev.update(
                 {
                     "reply": "STATUS_REPLY",
                     "flags": flags,
                     "configByte": config_byte,
-                    "presetId": preset_id,
+                    "effectId": effect_id,
                     "brightness": brightness,
                     "vbat_mV": vbat_mV,
                     "node_rssi": rssi_node,
@@ -47,13 +49,13 @@ def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rss
                 }
             )
         elif len(body) == 7:
-            flags, preset_id, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBHbb", body)
+            flags, effect_id, brightness, vbat_mV, rssi_node, snr_node = struct.unpack("<BBBHbb", body)
             ev.update(
                 {
                     "reply": "STATUS_REPLY",
                     "flags": flags,
                     "configByte": 0,
-                    "presetId": preset_id,
+                    "effectId": effect_id,
                     "brightness": brightness,
                     "vbat_mV": vbat_mV,
                     "node_rssi": rssi_node,

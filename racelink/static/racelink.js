@@ -1,5 +1,53 @@
 (function(){
-  const $ = (sel, ctx=document) => ctx.querySelector(sel);
+  // R5c: page-mode detection. The Devices page (/) renders racelink.html with
+  // ``data-rl-page="devices"`` (the default when the attribute is absent for
+  // back-compat). The Scenes page (/scenes) renders scenes.html with
+  // ``data-rl-page="scenes"`` and a much smaller DOM — the device table,
+  // group sidebar, FW dialog, etc. don't exist there. To keep this JS file
+  // working on both pages without splitting the monolith, the selector
+  // helper below returns a no-op stub for missing elements ON SCENES PAGES
+  // so the top-level ``$("#btnX").addEventListener(...)`` calls degrade
+  // silently. On the Devices page a missing element is still a real bug and
+  // returns ``null`` (current throw-on-null behaviour preserved).
+  const RL_PAGE = (document.body && document.body.dataset && document.body.dataset.rlPage) || "devices";
+  const _NOOP = () => {};
+  const _STUB_CLASSLIST = new Proxy({}, { get: () => _NOOP });
+  const _STUB_STYLE = new Proxy({}, {
+    get: () => "",
+    set: () => true,
+  });
+  const _STUB_DATASET = new Proxy({}, {
+    get: () => undefined,
+    set: () => true,
+  });
+  const _STUB_EL = new Proxy({}, {
+    get(_, prop){
+      if(prop === "addEventListener" || prop === "removeEventListener"
+         || prop === "appendChild" || prop === "removeChild"
+         || prop === "setAttribute" || prop === "removeAttribute"
+         || prop === "focus" || prop === "blur" || prop === "click"
+         || prop === "showModal" || prop === "close" || prop === "open"
+         || prop === "scrollIntoView") return _NOOP;
+      if(prop === "classList") return _STUB_CLASSLIST;
+      if(prop === "style") return _STUB_STYLE;
+      if(prop === "dataset") return _STUB_DATASET;
+      if(prop === "children" || prop === "options" || prop === "files") return [];
+      if(prop === "value" || prop === "textContent" || prop === "innerHTML"
+         || prop === "innerText" || prop === "name") return "";
+      if(prop === "checked" || prop === "disabled" || prop === "hidden") return false;
+      if(prop === "querySelector") return () => _STUB_EL;
+      if(prop === "querySelectorAll") return () => [];
+      // Fallback — undefined is the safest default for anything else.
+      return undefined;
+    },
+    set: () => true,
+  });
+
+  const $ = (sel, ctx=document) => {
+    const el = ctx.querySelector(sel);
+    if(el) return el;
+    return RL_PAGE === "devices" ? null : _STUB_EL;
+  };
   const $$ = (sel, ctx=document) => Array.from(ctx.querySelectorAll(sel));
   const RL_BASE_PATH = (document.body?.dataset?.rlBasePath || "/racelink").replace(/\/$/, "");
 
@@ -41,10 +89,14 @@
     return Number(dev.groupId) === gid;
   }
 
-  // Flag bits (must match firmware; kept local for UI only)
-  const RL_FLAG_POWER_ON    = 0x01;
-  const RL_FLAG_ARM_ON_SYNC = 0x02;
-  const RL_FLAG_HAS_BRI     = 0x04;
+  // Flag bits (must match firmware; kept local for UI only).
+  // Single source of truth: racelink/domain/flags.py.
+  const RL_FLAG_POWER_ON       = 0x01;
+  const RL_FLAG_ARM_ON_SYNC    = 0x02;
+  const RL_FLAG_HAS_BRI        = 0x04;
+  const RL_FLAG_FORCE_TT0      = 0x08;
+  const RL_FLAG_FORCE_REAPPLY  = 0x10;
+  const RL_FLAG_OFFSET_MODE    = 0x20;
 
   const CONFIG_SETTINGS = [
     { bit: 0, label: "MAC filter" },
@@ -92,6 +144,13 @@
     fwUploads: { fwId: null, cfgId: null },
     configDisplay: loadConfigDisplay(),
     presets: { files: [], current: "" },
+    rlPresets: { items: [], selectedKey: null, dirty: false },
+    scenes: {
+      items: [], selectedKey: null, schema: null, lastRunResult: null, draft: null,
+      // R7: live per-action progress during a run.
+      activeRunKey: null,
+      actionStatus: [],
+    },
     specials: {},
     specialDevice: null,
     specialTab: null,
@@ -124,6 +183,19 @@
     j.__status = res.status;
     return j;
   }
+  async function apiJson(url, method, body){
+    const res = await fetch(withBasePath(url), {
+      method,
+      headers: {"Content-Type":"application/json"},
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: "same-origin"
+    });
+    const j = await res.json().catch(()=>({ok:false,error:"Bad JSON"}));
+    j.__status = res.status;
+    return j;
+  }
+  const apiPut = (url, body) => apiJson(url, "PUT", body);
+  const apiDelete = (url) => apiJson(url, "DELETE");
 
 
 
@@ -442,9 +514,11 @@ function renderSpecialTabs(){
       inputMeta.push({ key: varKey, input, uiMeta, widget, wrap: fieldWrap, labelEl: fieldLabel });
     });
 
-    // A12: dynamische effect-spezifische UI für wled_control_advanced.
-    // Wenn die Action ein "mode"-Select mit slots-Metadaten (pro Option) enthält,
-    // passen Labels und Sichtbarkeit aller abhängigen Felder am Mode-Wechsel an.
+    // A12: dynamische effect-spezifische UI (Slot-Filtering + Labels) — im
+    // Preset-Editor (dlgRlPresets) weiterhin aktiv, im Specials-Dialog nach
+    // Phase D nicht mehr genutzt (wled_control hat nur noch {presetId,
+    // brightness}). Der bedingte Block unten greift deshalb nur, wenn die
+    // Function tatsächlich ein ``mode``-Var mit Slot-Metadaten aufweist.
     const modeMeta = inputMeta.find(m => m.key === "mode");
     const modeOptions = modeMeta && modeMeta.uiMeta && Array.isArray(modeMeta.uiMeta.options)
       ? modeMeta.uiMeta.options
@@ -560,6 +634,10 @@ function renderSpecialTabs(){
         $("#specialHint").textContent = "Action sent.";
       }
     });
+
+    // Phase D removed the Save-as-preset shortcut: the Specials-dialog no
+    // longer holds a 14-field parameter editor (that moved to dlgRlPresets).
+    // The only way to create a new RL preset is the editor dialog.
   });
 
   updateSpecialUi();
@@ -601,9 +679,12 @@ async function openSpecialsDialog(mac){
   function flagsLabel(flags){
     const f = Number(flags) & 0xFF;
     const parts = [];
-    if(f & RL_FLAG_POWER_ON) parts.push("PWR");
-    if(f & RL_FLAG_ARM_ON_SYNC) parts.push("ARM");
-    if(f & RL_FLAG_HAS_BRI) parts.push("BRI");
+    if(f & RL_FLAG_POWER_ON)       parts.push("PWR");
+    if(f & RL_FLAG_ARM_ON_SYNC)    parts.push("ARM");
+    if(f & RL_FLAG_HAS_BRI)        parts.push("BRI");
+    if(f & RL_FLAG_FORCE_TT0)      parts.push("TT0");
+    if(f & RL_FLAG_FORCE_REAPPLY)  parts.push("REAP");
+    if(f & RL_FLAG_OFFSET_MODE)    parts.push("OFS");
     const p = parts.length ? parts.join("+") : "-";
     return `0x${fmt.hex2(f)} ${p}`;
   }
@@ -1392,8 +1473,24 @@ async function openSpecialsDialog(mac){
           const what = (p && p.what) ? p.what : ["groups","devices"];
           if(what.includes("groups")) await loadGroups();
           if(what.includes("devices")) await loadDevices();
+          if(what.includes("scenes") && typeof window.__rlScenesRefresh === "function"){
+            window.__rlScenesRefresh();
+          }
         }catch{
           await loadAll();
+        }
+      });
+      // R7: per-action live progress for the Scene Manager. Runs on both
+      // pages — on / the handler is not installed and the event is a no-op.
+      es.addEventListener("scene_progress", (e)=>{
+        try{
+          const p = JSON.parse(e.data);
+          if(typeof window.__rlSceneProgress === "function"){
+            window.__rlSceneProgress(p);
+          }
+        }catch{
+          // ignore malformed payloads — runner-side broadcasts are
+          // structured but a corrupt SSE chunk shouldn't break the page.
         }
       });
       es.onerror = () => {
@@ -1671,8 +1768,18 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
 
   // Startup
   (async ()=>{
-    // Connect SSE first so we still get feedback even if initial REST loads fail
+    // Connect SSE first so we still get feedback even if initial REST loads
+    // fail. SSE runs on both pages so the Scenes page also gets refresh
+    // events for the SCENES topic and master/task pill updates.
     connectEvents();
+
+    // R5c: Devices-only initial load. The Scenes page has no device table /
+    // group sidebar / config-display options to populate, so skip the heavy
+    // loadAll() roundtrip there.
+    if(RL_PAGE !== "devices"){
+      return;
+    }
+
     renderConfigDisplayOptions();
 
     try{
@@ -1690,4 +1797,359 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
       console.error("Master sync failed", e);
     }
   })().catch(console.error);
+
+  // =====================================================================
+  // Phase B: RL-Presets editor (dlgRlPresets)
+  // =====================================================================
+
+  const RL_PRESET_VARS = [
+    "mode", "speed", "intensity",
+    "custom1", "custom2", "custom3",
+    "check1", "check2", "check3",
+    "palette",
+    "color1", "color2", "color3",
+    "brightness",
+  ];
+  const RL_PRESET_FLAGS = ["arm_on_sync", "force_tt0", "force_reapply", "offset_mode"];
+
+  let rlPresetUiSchema = null; // cached from /api/rl-presets/schema
+
+  async function ensureRlPresetUiSchema(){
+    if(rlPresetUiSchema) return rlPresetUiSchema;
+    // Phase D: the editor schema lives on its own endpoint now. The
+    // Specials ``wled_control`` action became a preset picker and no
+    // longer carries the 14 field defs this form needs.
+    const r = await apiGet("/racelink/api/rl-presets/schema");
+    if(!r || !r.ok || !r.schema) return null;
+    rlPresetUiSchema = {
+      vars: r.schema.vars || RL_PRESET_VARS,
+      ui: r.schema.ui || {},
+      flags: Array.isArray(r.schema.flags) ? r.schema.flags : null,
+    };
+    return rlPresetUiSchema;
+  }
+
+  async function loadRlPresets(){
+    const r = await apiGet("/racelink/api/rl-presets");
+    state.rlPresets.items = (r && r.ok && r.presets) ? r.presets : [];
+    return state.rlPresets.items;
+  }
+
+  function rgbTupleToHex(rgb){
+    if(!Array.isArray(rgb) || rgb.length !== 3) return "#000000";
+    const h = v => Number(v & 0xFF).toString(16).padStart(2, "0");
+    return `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}`;
+  }
+
+  function valueForWidget(varKey, schemaUi, presetParams){
+    // Convert the stored (canonical) preset value into a UI-input-friendly form.
+    const v = presetParams ? presetParams[varKey] : undefined;
+    if(v === undefined || v === null){
+      return null;
+    }
+    const widget = schemaUi && schemaUi[varKey] && schemaUi[varKey].widget;
+    if(widget === "color"){
+      return rgbTupleToHex(v);
+    }
+    return v;
+  }
+
+  function buildRlPresetForm(container, schema, preset){
+    container.innerHTML = "";
+    const params = (preset && preset.params) || {};
+    const flags = (preset && preset.flags) || {};
+
+    // --- Label row ------------------------------------------------------
+    const labelRow = document.createElement("div");
+    labelRow.className = "rl-special-fn-row";
+    const labelLabel = document.createElement("label");
+    labelLabel.textContent = "Label";
+    const labelInputWrap = document.createElement("div");
+    labelInputWrap.className = "rl-special-inputs";
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.id = "rlPresetLabelInput";
+    labelInput.value = (preset && preset.label) || "";
+    labelInput.style.width = "100%";
+    labelInputWrap.appendChild(labelInput);
+    labelRow.appendChild(labelLabel);
+    labelRow.appendChild(labelInputWrap);
+    labelRow.appendChild(document.createElement("div"));
+    container.appendChild(labelRow);
+
+    // --- Parameter row (reuse buildSpecialVarInput) ---------------------
+    const row = document.createElement("div");
+    row.className = "rl-special-fn-row";
+    const rowLabel = document.createElement("label");
+    rowLabel.textContent = "Parameters";
+    const inputsWrap = document.createElement("div");
+    inputsWrap.className = "rl-special-inputs";
+    const inputMeta = [];
+    const vars = (schema && schema.vars) || RL_PRESET_VARS;
+    const ui = (schema && schema.ui) || {};
+
+    // Dummy "dev" with preset params so buildSpecialVarInput picks them up.
+    const dev = {};
+    for(const k of vars){
+      const uiMeta = ui[k] || {};
+      const val = valueForWidget(k, ui, params);
+      if(val !== null){ dev[k] = val; }
+    }
+
+    vars.forEach(varKey => {
+      const uiMeta = ui[varKey] || {};
+      const fieldWrap = document.createElement("div");
+      fieldWrap.className = "rl-special-input";
+      fieldWrap.dataset.field = varKey;
+      const fieldLabel = document.createElement("span");
+      fieldLabel.className = "rl-special-input-label";
+      fieldLabel.textContent = varKey;
+      fieldLabel.dataset.defaultLabel = varKey;
+      const { input, widget } = buildSpecialVarInput({
+        varKey, varMeta: {}, uiMeta, dev,
+      });
+      fieldWrap.appendChild(fieldLabel);
+      fieldWrap.appendChild(input);
+      inputsWrap.appendChild(fieldWrap);
+      inputMeta.push({ key: varKey, input, widget, uiMeta, wrap: fieldWrap, labelEl: fieldLabel });
+    });
+
+    row.appendChild(rowLabel);
+    row.appendChild(inputsWrap);
+    row.appendChild(document.createElement("div"));
+    container.appendChild(row);
+
+    // A12 re-wire: mode-select change -> toggle visibility + labels
+    const modeMeta = inputMeta.find(m => m.key === "mode");
+    if(modeMeta && modeMeta.uiMeta && Array.isArray(modeMeta.uiMeta.options)){
+      const optionByValue = new Map(modeMeta.uiMeta.options.map(o => [String(o.value), o]));
+      const apply = () => {
+        const selected = optionByValue.get(String(modeMeta.input.value));
+        const slots = selected && selected.slots ? selected.slots : null;
+        for(const m of inputMeta){
+          if(m.key === "mode") continue;
+          const slot = slots ? slots[m.key] : null;
+          const used = slot ? Boolean(slot.used) : true;
+          m.wrap.style.display = used ? "" : "none";
+          if(m.labelEl){
+            const custom = slot && typeof slot.label === "string" && slot.label ? slot.label : null;
+            m.labelEl.textContent = custom || m.labelEl.dataset.defaultLabel || m.key;
+          }
+        }
+      };
+      modeMeta.input.addEventListener("change", apply);
+      apply();
+    }
+
+    // --- Flags row ------------------------------------------------------
+    const flagRow = document.createElement("div");
+    flagRow.className = "rl-special-fn-row";
+    const flagLabel = document.createElement("label");
+    flagLabel.textContent = "Flags";
+    const flagInputs = document.createElement("div");
+    flagInputs.className = "rl-special-inputs";
+    const flagMeta = [];
+    // Prefer labels from the serialized schema when available -- falls back
+    // to the bare key for older backends that don't yet publish `flags`.
+    const flagsFromSchema = (schema && Array.isArray(schema.flags)) ? schema.flags : null;
+    const flagEntries = flagsFromSchema
+      ? flagsFromSchema.map(f => ({ key: f.key, label: f.label || f.key }))
+      : RL_PRESET_FLAGS.map(fk => ({ key: fk, label: fk }));
+    flagEntries.forEach(({ key: fk, label: flabel }) => {
+      const wrap = document.createElement("label");
+      wrap.className = "rl-toggle-wrap";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = Boolean(flags[fk]);
+      const labelNode = document.createElement("span");
+      labelNode.textContent = flabel;
+      wrap.appendChild(cb);
+      wrap.appendChild(labelNode);
+      flagInputs.appendChild(wrap);
+      flagMeta.push({ key: fk, input: cb });
+    });
+    flagRow.appendChild(flagLabel);
+    flagRow.appendChild(flagInputs);
+    flagRow.appendChild(document.createElement("div"));
+    container.appendChild(flagRow);
+
+    // --- Action bar -----------------------------------------------------
+    const actions = document.createElement("div");
+    actions.className = "rl-special-actions";
+    actions.style.marginTop = "12px";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.id = "rlPresetSaveBtn";
+    saveBtn.textContent = preset && preset.key ? "Save" : "Create";
+    actions.appendChild(saveBtn);
+    if(preset && preset.key){
+      const dupBtn = document.createElement("button");
+      dupBtn.type = "button";
+      dupBtn.textContent = "Duplicate";
+      dupBtn.addEventListener("click", async () => {
+        const newLabel = prompt("Label for duplicate?", `${preset.label} copy`);
+        if(!newLabel) return;
+        const r = await apiPost(`/racelink/api/rl-presets/${preset.key}/duplicate`, {label: newLabel});
+        if(!r.ok){
+          $("#rlPresetsHint").textContent = r.error || "Duplicate failed.";
+          return;
+        }
+        await loadRlPresets();
+        renderRlPresetList();
+        selectRlPreset(r.preset.key);
+      });
+      actions.appendChild(dupBtn);
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", async () => {
+        if(!confirm(`Delete preset "${preset.label}"?`)) return;
+        const r = await apiDelete(`/racelink/api/rl-presets/${preset.key}`);
+        if(!r.ok){
+          $("#rlPresetsHint").textContent = r.error || "Delete failed.";
+          return;
+        }
+        await loadRlPresets();
+        state.rlPresets.selectedKey = null;
+        renderRlPresetList();
+        renderRlPresetEditor(null);
+      });
+      actions.appendChild(delBtn);
+    }
+    container.appendChild(actions);
+
+    saveBtn.addEventListener("click", async () => {
+      // Collect parameter values (inputs visible or hidden are all saved; the
+      // "hidden" semantics only applies at send-time to pick fieldMask bits).
+      const outParams = {};
+      for(const m of inputMeta){
+        if(m.widget === "toggle"){
+          const cb = m.input.rlInput || m.input;
+          outParams[m.key] = Boolean(cb.checked);
+        }else if(m.widget === "slider"){
+          const sl = m.input.rlInput || m.input;
+          const n = Number(sl.value);
+          outParams[m.key] = Number.isFinite(n) ? n : null;
+        }else if(m.widget === "color"){
+          const hex = String(m.input.value || "#000000").replace(/^#/, "");
+          if(/^[0-9a-fA-F]{6}$/.test(hex)){
+            outParams[m.key] = [
+              parseInt(hex.slice(0,2), 16),
+              parseInt(hex.slice(2,4), 16),
+              parseInt(hex.slice(4,6), 16),
+            ];
+          }else{
+            outParams[m.key] = null;
+          }
+        }else{
+          // select / number
+          const v = m.input.value;
+          const n = Number(v);
+          outParams[m.key] = Number.isFinite(n) ? n : v;
+        }
+      }
+      const outFlags = {};
+      for(const f of flagMeta){ outFlags[f.key] = Boolean(f.input.checked); }
+      const label = ($("#rlPresetLabelInput").value || "").trim();
+      if(!label){
+        $("#rlPresetsHint").textContent = "Label is required.";
+        return;
+      }
+      let r;
+      if(preset && preset.key){
+        r = await apiPut(`/racelink/api/rl-presets/${preset.key}`, {label, params: outParams, flags: outFlags});
+      }else{
+        r = await apiPost(`/racelink/api/rl-presets`, {label, params: outParams, flags: outFlags});
+      }
+      if(!r.ok){
+        $("#rlPresetsHint").textContent = r.error || "Save failed.";
+        return;
+      }
+      $("#rlPresetsHint").textContent = `Saved "${r.preset.label}"`;
+      await loadRlPresets();
+      state.rlPresets.selectedKey = r.preset.key;
+      renderRlPresetList();
+      renderRlPresetEditor(r.preset);
+    });
+  }
+
+  function renderRlPresetList(){
+    const listEl = $("#rlPresetList");
+    if(!listEl) return;
+    listEl.innerHTML = "";
+    if(!state.rlPresets.items.length){
+      const empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "(no presets yet)";
+      listEl.appendChild(empty);
+      return;
+    }
+    state.rlPresets.items.forEach(p => {
+      const li = document.createElement("li");
+      li.textContent = p.label || p.key;
+      li.dataset.key = p.key;
+      if(p.key === state.rlPresets.selectedKey){
+        li.classList.add("active");
+      }
+      li.addEventListener("click", () => selectRlPreset(p.key));
+      listEl.appendChild(li);
+    });
+  }
+
+  async function renderRlPresetEditor(preset){
+    const editor = $("#rlPresetEditor");
+    if(!editor) return;
+    const schema = await ensureRlPresetUiSchema();
+    if(!schema){
+      editor.innerHTML = "<p class=\"muted\">Failed to load form schema.</p>";
+      return;
+    }
+    buildRlPresetForm(editor, schema, preset);
+  }
+
+  function selectRlPreset(key){
+    state.rlPresets.selectedKey = key;
+    const preset = state.rlPresets.items.find(p => p.key === key) || null;
+    renderRlPresetList();
+    renderRlPresetEditor(preset);
+  }
+
+  const dlgRlPresets = $("#dlgRlPresets");
+  $("#btnRlPresets").addEventListener("click", async () => {
+    $("#rlPresetsHint").textContent = "";
+    await ensureRlPresetUiSchema();
+    await loadRlPresets();
+    if(!state.rlPresets.selectedKey && state.rlPresets.items.length){
+      state.rlPresets.selectedKey = state.rlPresets.items[0].key;
+    }
+    renderRlPresetList();
+    const selected = state.rlPresets.items.find(p => p.key === state.rlPresets.selectedKey) || null;
+    await renderRlPresetEditor(selected);
+    dlgRlPresets.showModal();
+  });
+
+  $("#btnRlPresetNew").addEventListener("click", async () => {
+    state.rlPresets.selectedKey = null;
+    renderRlPresetList();
+    await renderRlPresetEditor(null);
+    $("#rlPresetsHint").textContent = "New preset — enter label and Create.";
+  });
+
+  // R5c: expose the shared helpers to scenes.js (loaded on /racelink/scenes).
+  // Scenes pages reuse apiGet/apiPost/apiPut/apiDelete and read from the
+  // same ``state`` object. The Devices page uses these directly via the IIFE
+  // closure — exposing them is harmless there.
+  window.RL = {
+    apiGet, apiPost, apiPut, apiDelete,
+    withBasePath,
+    state,
+  };
+
+  // =====================================================================
+  // Scene Manager — moved to scenes.js (R5c). The dlgScenes modal in
+  // racelink.html was deleted in R5f; the editor now lives at its own
+  // /racelink/scenes URL. The SSE refresh handler above already calls
+  // ``window.__rlScenesRefresh()`` which scenes.js installs on page load.
+  // =====================================================================
+
 })();

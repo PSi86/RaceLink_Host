@@ -4,6 +4,9 @@
 
 // RaceLink protocol v2.0 -- shared, header-only protocol for SX1262 / LLCC68 based nodes
 // Packet = Header7 (3B sender + 3B receiver + 1B type) + Body (0..BODY_MAX B, currently 22)
+// Phase-D rename (2026-04-25): OPC_CONTROL / P_Control refer to the variable-length
+// direct-effect packet (0x08). The old fixed-length preset packet (0x04) is now
+// OPC_PRESET / P_Preset. Opcode values are unchanged — byte-wire-compatible.
 // Direction bit (0x80): 0 = Master->Node, 1 = Node->Master
 // Broadcast: receiver3 == FF:FF:FF
 // NOTE: All multi-byte fields are little-endian.
@@ -29,9 +32,9 @@ static const uint8_t PROTO_VER_MINOR = 0;
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
 static const uint8_t DIR_N2M = 0x80;  // Node   -> Master
 // BODY_MAX: max. Body-Länge aller RaceLink-Pakete.
-// Historisch 20; 2026-04-24 auf 22 angehoben für OPC_CONTROL_ADV
-// (erstes variable-length Paket, 3..21 B Body). +1 B Reserve.
-// Fallback auf fixed-length P_ControlAdv: siehe Plan-Doku
+// Historisch 20; 2026-04-24 auf 22 angehoben für OPC_CONTROL (post-rename;
+// pre-rename OPC_CONTROL_ADV — das erste variable-length Paket, 3..21 B Body).
+// +1 B Reserve. Fallback auf fixe Paketgröße: siehe Plan-Doku
 // (plane-f-r-mich-ein-refactored-boole.md, Abschnitt "Fallback zu fixed-length").
 static const uint8_t BODY_MAX = 22;
 
@@ -53,13 +56,16 @@ enum Opcode7 : uint8_t {
   OPC_DEVICES       = 0x01, // GET_DEVICES (M2N) / IDENTIFY_REPLY (N2M)
   OPC_SET_GROUP     = 0x02, // SET_GROUP (M2N)
   OPC_STATUS        = 0x03, // GET_STATUS (M2N) / STATUS_REPLY (N2M)
-  OPC_CONTROL       = 0x04, // CONTROL (M2N)
+  OPC_PRESET        = 0x04, // PRESET (M2N) -- apply a WLED preset id (see P_Preset)
   OPC_CONFIG        = 0x05, // CONFIG (M2N)
   OPC_SYNC          = 0x06, // SYNC Pulse (M2N)
   OPC_STREAM        = 0x07, // STREAM_M2N (M2N)
-  OPC_CONTROL_ADV   = 0x08, // CONTROL_ADV (M2N) -- variable-length body, see P_ControlAdv layout below
+  OPC_CONTROL       = 0x08, // CONTROL (M2N) -- variable-length direct effect params (see layout below)
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
-  // (optional future: 0x05 STATUS_UPDATE N2M unrequested telemetry)
+  // Phase-D rename (2026-04-25): opcode values are invariant, only the
+  // identifiers shifted: OPC_CONTROL -> OPC_PRESET (0x04), OPC_CONTROL_ADV
+  // -> OPC_CONTROL (0x08). Byte-wire-compatible with older gateway/WLED
+  // builds that still use the pre-rename names.
 };
 
 // -------------------- Payloads --------------------
@@ -67,71 +73,77 @@ enum Opcode7 : uint8_t {
 struct __attribute__((packed)) P_GetDevices  { uint8_t groupId; uint8_t flags;        }; // 2B
 struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                       }; // 1B
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
-struct __attribute__((packed)) P_Control     { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B // add palette later?
+struct __attribute__((packed)) P_Preset      { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B (OPC_PRESET; add palette later?)
 struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; uint8_t data1; uint8_t data2; uint8_t data3; }; // 5B
 struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
 
-// -------------------- P_ControlAdv (variable-length, 3..21 B) --------------------
-// Master -> Node, OPC_CONTROL_ADV. First variable-length packet in RaceLink.
+// -------------------- P_Control (variable-length, 3..21 B) --------------------
+// Master -> Node, OPC_CONTROL. Direct effect-parameter packet (pre-rename:
+// OPC_CONTROL_ADV / P_ControlAdv). First variable-length packet in RaceLink.
 // Layout:
 //   Byte 0   : groupId               (always)
-//   Byte 1   : flags                 (always)  -- same RL_FLAG_* as OPC_CONTROL (POWER_ON, ARM_ON_SYNC,
-//                                                 HAS_BRI, FORCE_TT0, FORCE_REAPPLY); bits 5-7 reserved
+//   Byte 1   : flags                 (always)  -- identical semantics/bit layout to OPC_PRESET
+//                                                 (POWER_ON, ARM_ON_SYNC, HAS_BRI, FORCE_TT0,
+//                                                  FORCE_REAPPLY, OFFSET_MODE); bits 6-7 reserved.
+//                                                 Single host-side source of truth: racelink/domain/flags.py.
 //   Byte 2   : fieldMask             (always)  -- which single-byte fields follow, in fixed order:
-//                bit 0 RL_ADV_F_BRIGHTNESS     -> +1 B u8
-//                bit 1 RL_ADV_F_MODE           -> +1 B u8   (WLED effect index)
-//                bit 2 RL_ADV_F_SPEED          -> +1 B u8
-//                bit 3 RL_ADV_F_INTENSITY      -> +1 B u8
-//                bit 4 RL_ADV_F_CUSTOM1        -> +1 B u8
-//                bit 5 RL_ADV_F_CUSTOM2        -> +1 B u8
-//                bit 6 RL_ADV_F_CUSTOM3_CHECKS -> +1 B (bits 0-4 custom3, bits 5-7 check1/2/3)
-//                bit 7 RL_ADV_F_EXT            -> extMask byte + extended payload follows
-//   Byte X   : extMask               (only if RL_ADV_F_EXT set) -- extended fields in fixed order:
-//                bit 0 RL_ADV_E_PALETTE        -> +1 B u8
-//                bit 1 RL_ADV_E_COLOR1         -> +3 B RGB
-//                bit 2 RL_ADV_E_COLOR2         -> +3 B RGB
-//                bit 3 RL_ADV_E_COLOR3         -> +3 B RGB
+//                bit 0 RL_CTRL_F_BRIGHTNESS     -> +1 B u8
+//                bit 1 RL_CTRL_F_MODE           -> +1 B u8   (WLED effect index)
+//                bit 2 RL_CTRL_F_SPEED          -> +1 B u8
+//                bit 3 RL_CTRL_F_INTENSITY      -> +1 B u8
+//                bit 4 RL_CTRL_F_CUSTOM1        -> +1 B u8
+//                bit 5 RL_CTRL_F_CUSTOM2        -> +1 B u8
+//                bit 6 RL_CTRL_F_CUSTOM3_CHECKS -> +1 B (bits 0-4 custom3, bits 5-7 check1/2/3)
+//                bit 7 RL_CTRL_F_EXT            -> extMask byte + extended payload follows
+//   Byte X   : extMask               (only if RL_CTRL_F_EXT set) -- extended fields in fixed order:
+//                bit 0 RL_CTRL_E_PALETTE        -> +1 B u8
+//                bit 1 RL_CTRL_E_COLOR1         -> +3 B RGB
+//                bit 2 RL_CTRL_E_COLOR2         -> +3 B RGB
+//                bit 3 RL_CTRL_E_COLOR3         -> +3 B RGB
 //                bits 4-7 reserved
 // Max body when all fields present: 3 + 7 + 1 + 1 + 9 = 21 bytes  (<= BODY_MAX=22, 1 B reserve).
 // Variable length: RULES[] uses req_len=0 -> decide_response() skips length check.
 // Fallback to fixed-length struct: see project plan doc, section "Fallback zu fixed-length".
 
-static const uint8_t RL_ADV_F_BRIGHTNESS     = 0x01;
-static const uint8_t RL_ADV_F_MODE           = 0x02;
-static const uint8_t RL_ADV_F_SPEED          = 0x04;
-static const uint8_t RL_ADV_F_INTENSITY      = 0x08;
-static const uint8_t RL_ADV_F_CUSTOM1        = 0x10;
-static const uint8_t RL_ADV_F_CUSTOM2        = 0x20;
-static const uint8_t RL_ADV_F_CUSTOM3_CHECKS = 0x40;
-static const uint8_t RL_ADV_F_EXT            = 0x80;
+static const uint8_t RL_CTRL_F_BRIGHTNESS     = 0x01;
+static const uint8_t RL_CTRL_F_MODE           = 0x02;
+static const uint8_t RL_CTRL_F_SPEED          = 0x04;
+static const uint8_t RL_CTRL_F_INTENSITY      = 0x08;
+static const uint8_t RL_CTRL_F_CUSTOM1        = 0x10;
+static const uint8_t RL_CTRL_F_CUSTOM2        = 0x20;
+static const uint8_t RL_CTRL_F_CUSTOM3_CHECKS = 0x40;
+static const uint8_t RL_CTRL_F_EXT            = 0x80;
 
-static const uint8_t RL_ADV_E_PALETTE        = 0x01;
-static const uint8_t RL_ADV_E_COLOR1         = 0x02;
-static const uint8_t RL_ADV_E_COLOR2         = 0x04;
-static const uint8_t RL_ADV_E_COLOR3         = 0x08;
+static const uint8_t RL_CTRL_E_PALETTE        = 0x01;
+static const uint8_t RL_CTRL_E_COLOR1         = 0x02;
+static const uint8_t RL_CTRL_E_COLOR2         = 0x04;
+static const uint8_t RL_CTRL_E_COLOR3         = 0x08;
 
 // Packing of custom3_checks byte
-static const uint8_t RL_ADV_C3_MASK     = 0x1F; // bits 0-4
-static const uint8_t RL_ADV_CHECK1_BIT  = 0x20; // bit 5
-static const uint8_t RL_ADV_CHECK2_BIT  = 0x40; // bit 6
-static const uint8_t RL_ADV_CHECK3_BIT  = 0x80; // bit 7
+static const uint8_t RL_CTRL_C3_MASK     = 0x1F; // bits 0-4
+static const uint8_t RL_CTRL_CHECK1_BIT  = 0x20; // bit 5
+static const uint8_t RL_CTRL_CHECK2_BIT  = 0x40; // bit 6
+static const uint8_t RL_CTRL_CHECK3_BIT  = 0x80; // bit 7
 
-// Worst-case body size for P_ControlAdv (all fields present incl. extMask + all 3 colors).
-static const uint8_t MAX_P_CONTROL_ADV = 21;
-static_assert(MAX_P_CONTROL_ADV <= BODY_MAX, "MAX_P_CONTROL_ADV exceeds BODY_MAX");
+// Worst-case body size for OPC_CONTROL (all fields present incl. extMask + all 3 colors).
+static const uint8_t MAX_P_CONTROL = 21;
+static_assert(MAX_P_CONTROL <= BODY_MAX, "MAX_P_CONTROL exceeds BODY_MAX");
 
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
 struct __attribute__((packed)) P_IdentifyReply { uint8_t fw; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B // fw, caps, groupId, mac6[6] // 9B
 //struct __attribute__((packed)) P_StatusReply   { uint8_t fw_major; uint8_t fw_minor; uint8_t fw_patch; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
-struct __attribute__((packed)) P_StatusReply   { uint8_t flags; uint8_t configByte; uint8_t presetId; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 8B
+// effectId carries the active WLED segment mode index (renamed from presetId
+// 2026-04-25 — wire format unchanged, semantics shift). A future OPC_STATUS_EXT
+// will carry the full DeviceState snapshot (mode/speed/customs/colors/etc.).
+struct __attribute__((packed)) P_StatusReply   { uint8_t flags; uint8_t configByte; uint8_t effectId; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 8B
 
 // ACK (both directions, response only)
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_TYPE=1, ACK_BAD_LEN=2, ACK_UNAUTHORIZED=3, ACK_BUSY=4, ACK_ERROR=5 };
 struct __attribute__((packed)) P_Ack { uint8_t echo_opcode7; uint8_t status; uint8_t seq; }; // seq currently 0
 
-static_assert(sizeof(P_Control) <= BODY_MAX, "P_Control too large");
+static_assert(sizeof(P_Preset) <= BODY_MAX, "P_Preset too large");
 static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
 static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
 static_assert(sizeof(P_Stream) <= BODY_MAX, "P_Stream too large");
@@ -163,12 +175,12 @@ static constexpr PacketRule RULES[] = {
   { OPC_SET_GROUP,  DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_SetGroup>(),    SZ<P_Ack>(),           "SET_GROUP" },
   // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 8B)
   { OPC_STATUS,     DIR_M2N, RESP_SPECIFIC, OPC_STATUS,  SZ<P_GetStatus>(),   SZ<P_StatusReply>(),   "STATUS" },
-  // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
-  { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),     0,                     "CONTROL" },
-  // OPC_CONTROL_ADV: CONTROL_ADV (M2N, variable length 3..21B) -> no response
+  // OPC_PRESET: PRESET (M2N, 4B) -> no response
+  { OPC_PRESET,     DIR_M2N, RESP_NONE,     0,           SZ<P_Preset>(),      0,                     "PRESET" },
+  // OPC_CONTROL: direct effect-parameter packet (M2N, variable length 3..21B) -> no response.
   // req_len = 0 signals variable length; decide_response() at the check below skips the
-  // length comparison when req_len == 0. Body layout is documented above near P_ControlAdv.
-  { OPC_CONTROL_ADV,DIR_M2N, RESP_NONE,     0,           0 /*variable*/,      0,                     "CONTROL_ADV" },
+  // length comparison when req_len == 0. Body layout is documented above near P_Control.
+  { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           0 /*variable*/,      0,                     "CONTROL" },
   // CONFIG (M2N, 5B) -> ACK
   { OPC_CONFIG,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Config>(),      SZ<P_Ack>(),           "CONFIG" },
   // OPC_SYNC: SYNC (M2N, 4B) -> no response

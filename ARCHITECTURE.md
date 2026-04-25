@@ -133,11 +133,11 @@ State mutations travel to the UI layer via two paths: the in-process RotorHazard
 | `DEVICE_MEMBERSHIP` | Device moved to a different group -- affects group counts and any list embedded per group. |
 | `DEVICE_SPECIALS` | A special config byte was written on a single device (startblock slot, etc.). No cross-UI effect on the RH panels. |
 | `GROUPS` | Groups added / renamed / removed -- group-list-backed dropdowns must refresh. |
-| `EFFECTS` | WLED presets file reloaded -- effect-list-backed selects must refresh. |
+| `PRESETS` | WLED presets file or RL preset store reloaded -- preset-list-backed selects must refresh. |
 
 **RotorHazard adapter (`custom_plugins/racelink_rh_plugin/plugin/ui.py`)** reacts as follows. Elements in the "Once" column are bootstrapped on first sync and then guarded by the `_settings_panel_bootstrapped` / `_quickset_panel_bootstrapped` flags; calling `sync_rotorhazard_ui` repeatedly therefore no longer produces `RHUI Redefining ...` log spam.
 
-| RH UI element | Once (bootstrap) | GROUPS | DEVICES | DEVICE_MEMBERSHIP | DEVICE_SPECIALS | EFFECTS |
+| RH UI element | Once (bootstrap) | GROUPS | DEVICES | DEVICE_MEMBERSHIP | DEVICE_SPECIALS | PRESETS |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | Panel `rl_settings` | ✓ | | | | | |
 | Panel `rl_quickset` | ✓ | | | | | |
@@ -152,7 +152,7 @@ State mutations travel to the UI layer via two paths: the in-process RotorHazard
 | Quickbutton `run_quickset` | ✓ | | | | | |
 | Option `rl_assignToGroup` (dynamic) | | ✓ | | | | |
 | Option `rl_quickset_group` (dynamic) | | ✓ | | | | |
-| Option `rl_quickset_effect` (dynamic) | | | | | | ✓ |
+| Option `rl_quickset_preset` (dynamic) | | | | | | ✓ |
 | Default `ActionEffect` `gcaction` | | ✓ | | | | ✓ |
 | Per-capability special `ActionEffect`s | | ✓ | ✓ | ✓ | | ✓ |
 
@@ -166,6 +166,6 @@ State mutations travel to the UI layer via two paths: the in-process RotorHazard
 | `DEVICE_MEMBERSHIP` | `["devices", "groups"]` | both (membership affects per-group counts) |
 | `DEVICE_SPECIALS` | `["devices"]` | `loadDevices()` |
 | `GROUPS` | `["groups"]` | `loadGroups()` |
-| `EFFECTS` | `["effects"]` | preset dropdown refresh |
+| `PRESETS` | `["presets"]` | preset dropdown refresh |
 
 **Rule of thumb for new call sites.** When you call `save_to_db(args, scopes=...)`, pick the narrowest token set describing what actually changed. If you genuinely don't know, pass `{FULL}` -- but prefer to refactor so you do know. The RH adapter and SSE scope map are both designed around this precision, and the regression tests in `tests/test_ui_scope_routing.py` (plugin) and `tests/test_state_scope.py` (host) pin the mapping so an accidental FULL-regression surfaces in CI.
