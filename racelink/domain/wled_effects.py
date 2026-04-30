@@ -7,7 +7,7 @@ Regenerate when upgrading the bundled WLED firmware version.
 
 from __future__ import annotations
 
-# Generated: 2026-04-25 00:33:51
+# Generated: 2026-04-29 13:59:50
 
 WLED_EFFECTS = [
     {'value': '0', 'label': 'Solid', 'slots': {'speed': {'used': False}, 'intensity': {'used': False}, 'custom1': {'used': False}, 'custom2': {'used': False}, 'custom3': {'used': False}, 'check1': {'used': False}, 'check2': {'used': False}, 'check3': {'used': False}, 'color1': {'used': True}, 'color2': {'used': True}, 'color3': {'used': True}, 'palette': {'used': True}}},

@@ -29,6 +29,130 @@ class WebRequestHelpersTests(unittest.TestCase):
         self.assertEqual(parsed["base_url"], "http://4.3.2.1")
         self.assertEqual(parsed["iface"], "wlan0")
         self.assertTrue(parsed["host_wifi_enable"])
+        # New SSID + password defaults: newer firmware first, then the
+        # historical name; default WLED AP password.
+        self.assertEqual(parsed["ssids"], ["WLED_RaceLink_AP", "WLED-AP"])
+        self.assertEqual(parsed["password"], "wled1234")
+        # ``conn_name`` is gone — the dynamic nmcli path doesn't need a
+        # pre-created profile. Old request bodies with ``connName`` are
+        # silently ignored (covered by another test below).
+        self.assertNotIn("conn_name", parsed)
+
+    def test_parse_wifi_options_accepts_ssids_list(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options(
+            {"wifi": {"ssids": ["MyWLED"]}},
+            FakeOTA(),
+        )
+        self.assertEqual(parsed["ssids"], ["MyWLED"])
+
+    def test_parse_wifi_options_splits_string_ssid_on_comma(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options(
+            {"wifi": {"ssid": "WLED_RaceLink_AP, WLED-AP, lab-wled"}},
+            FakeOTA(),
+        )
+        self.assertEqual(
+            parsed["ssids"], ["WLED_RaceLink_AP", "WLED-AP", "lab-wled"],
+        )
+
+    def test_parse_wifi_options_threads_password_through(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options(
+            {"wifi": {"password": "custom-secret"}},
+            FakeOTA(),
+        )
+        self.assertEqual(parsed["password"], "custom-secret")
+
+    def test_parse_wifi_options_rejects_explicit_empty_ssid(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        with self.assertRaises(helpers.RequestParseError) as cm:
+            helpers.parse_wifi_options({"wifi": {"ssids": []}}, FakeOTA())
+        self.assertIn("at least one SSID", str(cm.exception))
+        with self.assertRaises(helpers.RequestParseError):
+            helpers.parse_wifi_options({"wifi": {"ssid": ""}}, FakeOTA())
+        with self.assertRaises(helpers.RequestParseError):
+            helpers.parse_wifi_options({"wifiSsid": ""}, FakeOTA())
+
+    def test_parse_wifi_options_defaults_ota_password_to_wledota(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options({}, FakeOTA())
+        # WLED's stock OTA password (DEFAULT_OTA_PASS in const.h).
+        # Used by the host-side auto-unlock POST on a /update 401.
+        self.assertEqual(parsed["ota_password"], "wledota")
+
+    def test_parse_wifi_options_lowered_timeout_default(self):
+        # 35 s → 20 s default. Real associations finish in 5–15 s so
+        # 20 is a generous 4× ceiling; operators can still override
+        # via the dialog's WiFi-timeout field.
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options({}, FakeOTA())
+        self.assertEqual(parsed["timeout_s"], 20.0)
+
+    def test_parse_wifi_options_threads_ota_password_through(self):
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        # Both nested and flat keys are accepted (matches the wifi.password
+        # / wifiPassword pair already covered above).
+        parsed_nested = helpers.parse_wifi_options(
+            {"wifi": {"otaPassword": "fleet-secret"}}, FakeOTA(),
+        )
+        self.assertEqual(parsed_nested["ota_password"], "fleet-secret")
+        parsed_flat = helpers.parse_wifi_options(
+            {"wifiOtaPassword": "fleet-secret"}, FakeOTA(),
+        )
+        self.assertEqual(parsed_flat["ota_password"], "fleet-secret")
+
+    def test_parse_wifi_options_silently_ignores_legacy_conn_name(self):
+        # Forward-compat: a request body from an older RotorHazard plugin
+        # build that still carries ``connName`` must not 400 — the field
+        # is just unused under the dynamic nmcli path.
+        class FakeOTA:
+            @staticmethod
+            def wled_base_url(raw):
+                return (raw or "http://4.3.2.1").rstrip("/")
+
+        helpers = _load_request_helpers()
+        parsed = helpers.parse_wifi_options(
+            {"wifi": {"connName": "racelink-wled-ap"}},
+            FakeOTA(),
+        )
+        self.assertEqual(parsed["ssids"], ["WLED_RaceLink_AP", "WLED-AP"])
+        self.assertNotIn("conn_name", parsed)
 
 
 class RequireIntTests(unittest.TestCase):

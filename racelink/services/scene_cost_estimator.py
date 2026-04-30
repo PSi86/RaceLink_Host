@@ -62,7 +62,11 @@ from .scenes_service import (
 # ---------------------------------------------------------------------------
 
 LORA_SF: int = 7                  # spreading factor 6..12
-LORA_BW_HZ: int = 250_000         # bandwidth in Hz
+# 2026-04-28: bumped from 250_000 -> 125_000 to match the gateway's actual
+# RACELINK_BW_KHZ=125 in RaceLink_Gateway/src/main.cpp. The previous value
+# under-counted airtime by exactly 2x (Tsym = 2^SF / BW; halving BW doubles
+# Tsym), making cost-badge estimates appear ~half of measured wall-clock.
+LORA_BW_HZ: int = 125_000         # bandwidth in Hz
 LORA_CR: int = 5                  # coding rate denominator: 5 -> 4/5, 8 -> 4/8
 LORA_PREAMBLE_SYM: int = 8        # preamble symbols
 LORA_EXPLICIT_HEADER: bool = True
@@ -73,6 +77,25 @@ LORA_CRC_ON: bool = True
 # the body length but always present on the wire.
 RADIO_HEADER_BYTES = 7   # Header7 (sender + receiver + type)
 USB_FRAMING_BYTES = 2    # 0x00 + LEN prefix on the host<->gateway link
+
+# Per-packet wall-clock overhead in milliseconds, ON TOP of pure LoRa airtime.
+# This is what the host's _send_m2n call wraps around the radio transmission:
+# USB-CDC bridge round-trip (host write + bridge buffering + gateway read) plus
+# gateway state-machine transitions (Idle → Tx → standby → transmit setup →
+# IDLE → continuous-RX) plus the RX-side mirror of the same.
+#
+# Empirically calibrated 2026-04-29 against measured cost-badge `actual:` after
+# the gateway-side optimisations (no jitter, USB low-latency mode, coalesced
+# Serial.write, Core-0 display task):
+#   * 1 pkt 30 B: estimate 67 ms airtime + 12 ms overhead = 79 ms predicted;
+#     observed 78-81 ms wall-clock — match.
+#   * 4 pkts 86 B (offset_group): 216 ms airtime + 4 × 12 ms = 264 ms;
+#     observed 263-267 ms — match.
+#
+# This number is a single-gateway, single-host-to-Pi calibration. Bumping
+# the SF/BW further or moving to a faster transport (native USB-CDC on
+# ESP32-S3) would shift it; keep recalibrating when the wire changes.
+WIRE_OVERHEAD_MS_PER_PACKET: float = 12.0
 
 
 def lora_airtime_ms(payload_bytes: int) -> float:
@@ -97,7 +120,9 @@ def lora_airtime_ms(payload_bytes: int) -> float:
 
 def lora_parameters() -> Dict[str, Any]:
     """The active LoRa parameter dict — exposed via the editor schema so the
-    UI can render a tooltip like "at SF7/250 kHz/CR4:5"."""
+    UI can render a tooltip like "at SF7/125 kHz/CR4:5". Also surfaces
+    ``wire_overhead_ms_per_packet`` so the cost-badge tooltip can break
+    the wall-clock prediction down into "LoRa airtime + radio/USB overhead"."""
     return {
         "sf": LORA_SF,
         "bw_hz": LORA_BW_HZ,
@@ -106,6 +131,7 @@ def lora_parameters() -> Dict[str, Any]:
         "explicit_header": LORA_EXPLICIT_HEADER,
         "low_dr_opt": LORA_LOW_DR_OPT,
         "crc_on": LORA_CRC_ON,
+        "wire_overhead_ms_per_packet": WIRE_OVERHEAD_MS_PER_PACKET,
     }
 
 
@@ -115,10 +141,26 @@ def lora_parameters() -> Dict[str, Any]:
 
 @dataclass
 class ActionCost:
-    """Predicted wire cost for one scene action."""
+    """Predicted wire cost for one scene action.
+
+    Two time fields:
+
+    * ``airtime_ms`` — pure LoRa time-on-air (Semtech AN1200.13). Useful
+      for diagnostics (how many ms of radio resource the action uses).
+    * ``wall_clock_ms`` — the host-observable wall-clock prediction the
+      operator sees on the cost badge: ``airtime + N *
+      WIRE_OVERHEAD_MS_PER_PACKET``. The cost-badge ``≈ NN ms`` should
+      compare to the runner's measured ``actual:`` value within a few
+      milliseconds.
+
+    For the special ``KIND_DELAY`` action both fields equal the
+    configured ``duration_ms`` — the operator wait is "real time" with
+    no per-packet cost.
+    """
     packets: int = 0
     bytes: int = 0
     airtime_ms: float = 0.0
+    wall_clock_ms: float = 0.0
     # Optional structured detail (e.g. optimizer strategy for offset_group).
     detail: Dict[str, Any] = field(default_factory=dict)
 
@@ -126,7 +168,12 @@ class ActionCost:
         self.packets += 1
         frame = body_bytes + RADIO_HEADER_BYTES
         self.bytes += frame + USB_FRAMING_BYTES
-        self.airtime_ms += lora_airtime_ms(frame)
+        airtime = lora_airtime_ms(frame)
+        self.airtime_ms += airtime
+        # wall_clock_ms = airtime + per-packet USB/gateway overhead. See
+        # WIRE_OVERHEAD_MS_PER_PACKET docstring above for the calibration
+        # data behind the constant.
+        self.wall_clock_ms += airtime + WIRE_OVERHEAD_MS_PER_PACKET
 
 
 @dataclass
@@ -167,11 +214,14 @@ def estimate_action(action: Mapping[str, Any], *,
         cost.add_packet(len(build_sync_body(0, 0)))
         return cost
     if kind == KIND_DELAY:
-        # No packets; airtime contribution is the literal sleep duration.
-        # We surface it as airtime_ms so the scene total reflects "real time
-        # the operator will wait" — the scheduler is host-side, not radio,
-        # but it still adds to total scene duration.
-        cost.airtime_ms = float(action.get("duration_ms") or 0)
+        # No packets; both time fields are the literal sleep duration.
+        # The scene total reflects "real time the operator will wait" —
+        # the scheduler is host-side, not radio, but it still adds to
+        # total scene duration. wall_clock_ms tracks the same value
+        # because there's no per-packet overhead to add for a delay.
+        duration = float(action.get("duration_ms") or 0)
+        cost.airtime_ms = duration
+        cost.wall_clock_ms = duration
         return cost
     if kind == KIND_STARTBLOCK:
         # Startblock is handled by the controller via a custom path; treat
@@ -208,6 +258,7 @@ def estimate_scene(scene: Mapping[str, Any], *,
         out.total.packets += cost.packets
         out.total.bytes += cost.bytes
         out.total.airtime_ms += cost.airtime_ms
+        out.total.wall_clock_ms += cost.wall_clock_ms
     return out
 
 

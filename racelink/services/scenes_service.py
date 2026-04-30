@@ -185,6 +185,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _coerce_bool(raw: Any, *, default: bool) -> bool:
+    """Lenient bool parser for persisted JSON / API request payloads.
+
+    Accepts the canonical Python bools, plus the JSON-y string forms
+    (``"true"`` / ``"false"`` case-insensitive) and integers (0/non-zero).
+    Falls back to ``default`` for anything else, including missing/None
+    keys. Used for the scene-level ``stop_on_error`` field.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int):
+        return raw != 0
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
 def _canonical_target(raw: Any) -> Dict[str, Any]:
     """Validate a *top-level* action target: ``group`` or ``device``.
 
@@ -468,6 +489,20 @@ def _canonical_offset_block(raw: Any, *, groups_is_all: bool,
     raise AssertionError(f"unhandled offset mode {mode!r}")
 
 
+# ===== Legacy ``groups_offset`` migration shim =============================
+#
+# B6 sunset note (2026-04-27). This shim translates pre-hierarchy
+# scene actions (``target.kind == "groups_offset"``) into the
+# post-2026-04 ``offset_group`` container shape on load. The project
+# is pre-1.0 and no production deployments use the legacy persisted
+# format any more — the only consumers are the two regression tests
+# in ``tests/test_scenes_service.py`` (``TestLegacyMigration``).
+#
+# **Removal target: 2026-Q3.** When removed, also delete the matching
+# tests, the call site at ``_canonical_action``'s migration check,
+# and the ``_is_legacy_groups_offset_target`` /
+# ``_migrate_legacy_groups_offset_action`` helpers below.
+# ===========================================================================
 def _is_legacy_groups_offset_target(raw: Any) -> bool:
     """Detect a persisted action that uses the now-removed
     ``target.kind == "groups_offset"`` shape (any of its sub-shapes).
@@ -743,6 +778,15 @@ class SceneService:
                 "created": entry.get("created") or _now_iso(),
                 "updated": entry.get("updated") or entry.get("created") or _now_iso(),
                 "actions": actions,
+                # Batch A (2026-04-28): stop_on_error gates the runner's
+                # behaviour after an action fails. Default True is the
+                # conservative choice — a half-failed sequence usually
+                # leaves devices in a state that doesn't match operator
+                # intent, so further sends just waste air-time. Operators
+                # who want the legacy "play through every action" behaviour
+                # uncheck the editor checkbox per scene. Existing scenes
+                # without the field default to True on load.
+                "stop_on_error": _coerce_bool(entry.get("stop_on_error"), default=True),
             })
 
         persisted_next = data.get("next_id")
@@ -821,11 +865,17 @@ class SceneService:
     # ---- public write API -----------------------------------------------
 
     def create(self, *, label: str, actions: Optional[list] = None,
-               key: Optional[str] = None) -> dict:
+               key: Optional[str] = None,
+               stop_on_error: Optional[bool] = None) -> dict:
         label_clean = (label or "").strip()
         if not label_clean:
             raise ValueError("label is required")
         canonical_actions = _canonical_actions(actions)
+        # Default True if the caller didn't specify. None vs False is
+        # meaningful: None -> use default; False -> explicit opt-out.
+        stop_on_error_resolved = (
+            True if stop_on_error is None else _coerce_bool(stop_on_error, default=True)
+        )
         with self._lock:
             items = self._items()
             existing_keys = {s["key"] for s in items}
@@ -841,6 +891,7 @@ class SceneService:
                 "created": now,
                 "updated": now,
                 "actions": canonical_actions,
+                "stop_on_error": stop_on_error_resolved,
             }
             items.append(scene)
             self._write_atomic(items)
@@ -849,7 +900,8 @@ class SceneService:
         return _clone_scene(scene)
 
     def update(self, key: str, *, label: Optional[str] = None,
-               actions: Optional[list] = None) -> Optional[dict]:
+               actions: Optional[list] = None,
+               stop_on_error: Optional[bool] = None) -> Optional[dict]:
         if actions is not None:
             canonical_actions = _canonical_actions(actions)
         else:
@@ -868,6 +920,10 @@ class SceneService:
                     new_entry["label"] = label_clean
                 if canonical_actions is not None:
                     new_entry["actions"] = canonical_actions
+                if stop_on_error is not None:
+                    new_entry["stop_on_error"] = _coerce_bool(
+                        stop_on_error, default=True,
+                    )
                 new_entry["updated"] = _now_iso()
                 items[idx] = new_entry
                 self._write_atomic(items)
@@ -894,7 +950,66 @@ class SceneService:
         if src is None:
             return None
         label = (new_label or f"{src['label']} copy").strip()
-        return self.create(label=label, actions=src["actions"])
+        return self.create(
+            label=label,
+            actions=src["actions"],
+            stop_on_error=src.get("stop_on_error", True),
+        )
+
+    def renumber_group_references(self, deleted_gid: int) -> int:
+        """Rewrite every scene's group references after a group deletion.
+
+        When a group at index ``deleted_gid`` is removed, every device
+        and every persisted reference to a higher-indexed group must
+        shift down by 1. This method handles the *scene* side of that
+        bookkeeping (the API route handles the *device* side).
+
+        Per-reference rule:
+
+        * ``value == deleted_gid`` → 0  (the device is now in
+          Unconfigured; the scene action's target follows it).
+        * ``value > deleted_gid``  → ``value - 1`` (the higher-indexed
+          group's id shifted down by one).
+        * ``value < deleted_gid``  → unchanged.
+
+        Touches every group reference in every action: top-level
+        ``target.value`` for ``kind == "group"``, ``offset_group``
+        container ``groups`` lists, and ``offset_group`` child
+        ``target.value`` for ``kind == "group"``. ``"all"`` and
+        ``"scope"`` references aren't tied to a specific id and
+        pass through untouched.
+
+        Returns the number of scenes whose actions were modified
+        (caller can surface this in the operator-facing response).
+        """
+        changed = 0
+        with self._lock:
+            items = list(self._items())
+            new_items = []
+            for scene in items:
+                new_actions, was_changed = _renumber_actions_for_deleted_group(
+                    scene["actions"], deleted_gid,
+                )
+                if was_changed:
+                    changed += 1
+                    # Re-canonicalise so the stored order matches what
+                    # the validator emits on a fresh load (the
+                    # offset_group ``groups`` list is sorted; the
+                    # explicit-mode ``values`` list is sorted by id).
+                    # Without this the in-memory cache would diverge
+                    # from the post-load state.
+                    new_entry = dict(scene)
+                    new_entry["actions"] = _canonical_actions(new_actions)
+                    new_entry["updated"] = _now_iso()
+                    new_items.append(new_entry)
+                else:
+                    new_items.append(scene)
+            if changed:
+                self._write_atomic(new_items)
+                self._invalidate()
+        if changed:
+            self._fire_changed()
+        return changed
 
     def replace_all(self, scenes: List[dict]) -> None:
         """Bulk replace (used by tests / future import flows). Assigns fresh
@@ -923,6 +1038,145 @@ class SceneService:
         self._fire_changed()
 
 
+def _shift_group_value(value: int, deleted_gid: int) -> int:
+    """Apply the post-deletion shift rule to a single group id.
+
+    * value == deleted_gid → 0 (the group is gone; references collapse to Unconfigured)
+    * value >  deleted_gid → value - 1 (higher indices shifted down)
+    * value <  deleted_gid → unchanged
+    """
+    if value == deleted_gid:
+        return 0
+    if value > deleted_gid:
+        return value - 1
+    return value
+
+
+def _renumber_actions_for_deleted_group(
+    actions: List[Dict[str, Any]],
+    deleted_gid: int,
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Walk a scene's actions and rewrite every group reference per
+    :func:`_shift_group_value`. Returns ``(new_actions, changed)``.
+
+    ``new_actions`` is a defensive deep-copy when ``changed`` is True,
+    or the original list reference when no rewrite happened (so the
+    caller can short-circuit the persist write).
+    """
+    changed = False
+    new_actions: List[Dict[str, Any]] = []
+    for action in actions:
+        new_action, action_changed = _renumber_action(action, deleted_gid)
+        if action_changed:
+            changed = True
+        new_actions.append(new_action)
+    return (new_actions if changed else actions), changed
+
+
+def _renumber_action(
+    action: Dict[str, Any],
+    deleted_gid: int,
+) -> tuple[Dict[str, Any], bool]:
+    """Rewrite group references in one action. See
+    :func:`_renumber_actions_for_deleted_group` for the contract.
+    """
+    kind = action.get("kind")
+    changed = False
+
+    # Top-level target: kind == "group" with int value.
+    target = action.get("target")
+    new_target = target
+    if isinstance(target, dict) and target.get("kind") == "group":
+        try:
+            old = int(target.get("value"))
+        except (TypeError, ValueError):
+            old = None
+        if old is not None:
+            shifted = _shift_group_value(old, deleted_gid)
+            if shifted != old:
+                new_target = dict(target)
+                new_target["value"] = shifted
+                changed = True
+
+    # offset_group container: ``groups`` may be "all" or a list of ints.
+    new_groups = action.get("groups")
+    if kind == KIND_OFFSET_GROUP and isinstance(new_groups, list):
+        shifted_list = [_shift_group_value(int(g), deleted_gid) for g in new_groups]
+        # Drop duplicates that arose from collapsing distinct ids to 0
+        # (e.g. deleted_gid + an id that just shifted to 0). Preserve
+        # order for determinism in the on-disk JSON.
+        seen: set[int] = set()
+        deduped: List[int] = []
+        for g in shifted_list:
+            if g not in seen:
+                seen.add(g)
+                deduped.append(g)
+        if deduped != list(new_groups):
+            new_groups = deduped
+            changed = True
+
+    # offset_group child actions recurse via the same logic — children
+    # are themselves actions with their own ``target``.
+    new_children = action.get("actions")
+    if kind == KIND_OFFSET_GROUP and isinstance(new_children, list):
+        rewritten_children, children_changed = _renumber_actions_for_deleted_group(
+            new_children, deleted_gid,
+        )
+        if children_changed:
+            new_children = rewritten_children
+            changed = True
+
+    # offset.values entries (per-group offset_ms map) — same shift rule
+    # on each ``id``. Drop the entry when its id collapses to 0 (unless
+    # 0 wasn't already present), to keep the explicit-mode list valid.
+    offset_block = action.get("offset")
+    new_offset = offset_block
+    if (
+        kind == KIND_OFFSET_GROUP
+        and isinstance(offset_block, dict)
+        and offset_block.get("mode") == "explicit"
+        and isinstance(offset_block.get("values"), list)
+    ):
+        rewritten_values: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        offset_changed = False
+        for entry in offset_block["values"]:
+            try:
+                old = int(entry.get("id"))
+            except (TypeError, ValueError):
+                rewritten_values.append(entry)
+                continue
+            shifted = _shift_group_value(old, deleted_gid)
+            if shifted != old:
+                offset_changed = True
+            if shifted in seen_ids:
+                offset_changed = True
+                continue
+            seen_ids.add(shifted)
+            new_entry = dict(entry)
+            new_entry["id"] = shifted
+            rewritten_values.append(new_entry)
+        if offset_changed:
+            new_offset = dict(offset_block)
+            new_offset["values"] = rewritten_values
+            changed = True
+
+    if not changed:
+        return action, False
+
+    new_action = dict(action)
+    if new_target is not action.get("target"):
+        new_action["target"] = new_target
+    if kind == KIND_OFFSET_GROUP:
+        if new_groups is not action.get("groups"):
+            new_action["groups"] = new_groups
+        if new_children is not action.get("actions"):
+            new_action["actions"] = new_children
+        if new_offset is not action.get("offset"):
+            new_action["offset"] = new_offset
+    return new_action, True
+
+
 def _clone_scene(scene: dict) -> dict:
     """Return a defensive shallow-deep copy: scene dict + nested actions list
     + per-action shallow copies. Callers can iterate / mutate freely."""
@@ -933,6 +1187,9 @@ def _clone_scene(scene: dict) -> dict:
         "created": scene["created"],
         "updated": scene["updated"],
         "actions": [_clone_action(a) for a in scene.get("actions") or []],
+        # Default True so a clone of a legacy scene (loaded before the
+        # field existed) carries the safer abort-on-error behaviour.
+        "stop_on_error": bool(scene.get("stop_on_error", True)),
     }
 
 

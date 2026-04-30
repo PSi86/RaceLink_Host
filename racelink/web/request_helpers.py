@@ -109,16 +109,122 @@ def parse_recv3_from_addr(addr_str):
         return None
 
 
+# WLED's stock AP password. Default for a fresh fleet that hasn't been
+# reconfigured. Operators with a custom password override per-OTA via the
+# editor's "AP password" field.
+WLED_DEFAULT_AP_PASSWORD = "wled1234"
+
+# WLED's stock OTA password (DEFAULT_OTA_PASS in const.h). Used by the
+# host-side auto-unlock POST to /settings/sec — when WLED's /update
+# returns 401, the host POSTs `OP=<this>` to clear `otaLock` (and, as
+# a side effect of `SU` being absent, flip `otaSameSubnet=false`).
+# Operators whose fleet uses a non-default otaPass override per-OTA.
+WLED_DEFAULT_OTA_PASSWORD = "wledota"
+
+# Default SSID candidates: newer firmware broadcasts the first, older
+# firmware the second. ``connect_ap`` connects to whichever appears
+# first on a scan.
+DEFAULT_WLED_AP_SSIDS = ["WLED_RaceLink_AP", "WLED-AP"]
+
+
+def _normalise_ssid_list(raw) -> list:
+    """Accept ``None``, a string (comma-separated allowed), or an iterable
+    of strings; return a clean list of non-empty SSID candidates in input
+    order. Unknown shapes return an empty list (caller substitutes the
+    default or 400s)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = raw.split(",")
+    else:
+        try:
+            items = list(raw)
+        except TypeError:
+            return []
+    out = []
+    seen = set()
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 def parse_wifi_options(body, ota_service):
+    """Translate the editor's wifi sub-body into the kwargs the OTA
+    workflow expects.
+
+    Body shape (all optional):
+
+      * ``wifi.ssids`` (list[str]) or ``wifi.ssid`` / ``wifiSsid`` (str,
+        comma-split for back-compat) — candidate AP names. Defaults to
+        :data:`DEFAULT_WLED_AP_SSIDS` (newer firmware first).
+      * ``wifi.password`` / ``wifiPassword`` — WLED AP password.
+        Defaults to :data:`WLED_DEFAULT_AP_PASSWORD`.
+      * ``wifi.iface`` / ``wifiIface`` — wireless interface, default
+        ``wlan0``.
+      * ``wifi.bssid`` / ``wifiBssid`` — pin to a specific BSSID
+        (rarely used; useful when more than one node within range
+        broadcasts the same SSID).
+      * ``wifi.timeoutS`` / ``wifiTimeoutS`` — overall scan+connect
+        budget; default 20 s.
+      * ``wifi.otaPassword`` / ``wifiOtaPassword`` — WLED OTA password
+        for the auto-unlock POST on a 401 from ``/update``. Defaults
+        to :data:`WLED_DEFAULT_OTA_PASSWORD` (``"wledota"``).
+      * ``hostWifiEnable`` / ``hostWifiRestore`` — control whether the
+        host's WiFi radio is touched; defaults true.
+
+    A ``connName`` field is silently ignored: the dynamic
+    ``nmcli dev wifi connect`` path supersedes the pre-created NM
+    profile flow we used before. Old request bodies that still carry it
+    keep working without surfacing an error.
+
+    Raises :class:`RequestParseError` if the resolved SSID list is
+    empty after normalisation — the workflow has no AP to look for and
+    would otherwise loop until ``timeoutS`` for nothing.
+    """
     body = body or {}
     wifi = body.get("wifi") or {}
+
+    ssids = _normalise_ssid_list(
+        wifi.get("ssids")
+        if "ssids" in wifi
+        else (wifi.get("ssid") if "ssid" in wifi else body.get("wifiSsid"))
+    )
+    if not ssids:
+        # No SSID supplied at all → fall back to the built-in default.
+        # Explicit-but-empty input (e.g. ``ssids=[]`` or ``ssid=""``)
+        # falls through to the 400 below.
+        if "ssids" not in wifi and "ssid" not in wifi and "wifiSsid" not in body:
+            ssids = list(DEFAULT_WLED_AP_SSIDS)
+        else:
+            raise RequestParseError(
+                "wifi.ssids: at least one SSID required (default: "
+                f"{', '.join(DEFAULT_WLED_AP_SSIDS)})"
+            )
+
+    password = str(
+        wifi.get("password")
+        or body.get("wifiPassword")
+        or WLED_DEFAULT_AP_PASSWORD
+    )
+
+    ota_password = str(
+        wifi.get("otaPassword")
+        or body.get("wifiOtaPassword")
+        or WLED_DEFAULT_OTA_PASSWORD
+    )
+
     return {
         "base_url": ota_service.wled_base_url(body.get("baseUrl") or ""),
-        "ssid": str(wifi.get("ssid") or body.get("wifiSsid") or "WLED-AP"),
+        "ssids": ssids,
+        "password": password,
+        "ota_password": ota_password,
         "iface": str(wifi.get("iface") or body.get("wifiIface") or "wlan0"),
-        "conn_name": str(wifi.get("connName") or body.get("wifiConnName") or "racelink-wled-ap"),
         "bssid": str(wifi.get("bssid") or body.get("wifiBssid") or ""),
-        "timeout_s": float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 35.0),
+        "timeout_s": float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 20.0),
         "host_wifi_enable": bool(wifi.get("hostWifiEnable") if "hostWifiEnable" in wifi else body.get("hostWifiEnable", True)),
         "host_wifi_restore": bool(wifi.get("hostWifiRestore") if "hostWifiRestore" in wifi else body.get("hostWifiRestore", True)),
     }

@@ -75,7 +75,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(packets.build_set_group_body(9), b"\x09")
         self.assertEqual(packets.build_preset_body(1, 2, 3, 4), b"\x01\x02\x03\x04")
         self.assertEqual(packets.build_config_body(5, 1, 2, 3, 4), b"\x05\x01\x02\x03\x04")
+        # Default SYNC body is the legacy 4 B clock-tick form (no flags
+        # byte): autosync uses this so devices skip pending arm-on-sync
+        # materialisation. The deliberate-fire path passes the flags kwarg.
         self.assertEqual(packets.build_sync_body(0x123456, 0x44), b"\x56\x34\x12\x44")
+        # flags=0 explicitly is identical to default (no trailing byte).
+        self.assertEqual(packets.build_sync_body(0x123456, 0x44, flags=0), b"\x56\x34\x12\x44")
+        # flags=SYNC_FLAG_TRIGGER_ARMED appends the flag byte at offset 4.
+        self.assertEqual(
+            packets.build_sync_body(0x123456, 0x44, flags=packets.SYNC_FLAG_TRIGGER_ARMED),
+            b"\x56\x34\x12\x44\x01",
+        )
         # OPC_OFFSET is now variable-length tagged-union. Common header is
         # groupId(1) + mode(1); per-mode payload follows.
         # NONE: 2 B (header only).
@@ -116,7 +126,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(packets.build_set_group_body(3)), RLPA.SZ_P_SetGroup)
         self.assertEqual(len(packets.build_preset_body(1, 2, 3, 4)), RLPA.SZ_P_Preset)
         self.assertEqual(len(packets.build_config_body(5, 1, 2, 3, 4)), RLPA.SZ_P_Config)
-        self.assertEqual(len(packets.build_sync_body(0x123456, 0x44)), RLPA.SZ_P_Sync)
+        # P_Sync is now variable-length (4 B legacy / 5 B with flags). The
+        # auto-generated SZ_P_Sync reflects the full struct (5 B). The
+        # default emit is 4 B for back-compat with the autosync clock-tick
+        # form; emitting with the trigger flag matches the full struct size.
+        self.assertEqual(len(packets.build_sync_body(0x123456, 0x44)), 4)
+        self.assertEqual(
+            len(packets.build_sync_body(0x123456, 0x44, flags=packets.SYNC_FLAG_TRIGGER_ARMED)),
+            RLPA.SZ_P_Sync,
+        )
         self.assertEqual(RLPA.SZ_P_IdentifyReply, 9)
         self.assertEqual(RLPA.SZ_P_StatusReply, 8)
         self.assertEqual(RLPA.SZ_P_Ack, 3)
@@ -140,7 +158,13 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(
             RLPA.STRUCT_FIELDS["P_Sync"],
-            [("ts24_0", "uint8_t", 1), ("ts24_1", "uint8_t", 1), ("ts24_2", "uint8_t", 1), ("brightness", "uint8_t", 1)],
+            [
+                ("ts24_0", "uint8_t", 1),
+                ("ts24_1", "uint8_t", 1),
+                ("ts24_2", "uint8_t", 1),
+                ("brightness", "uint8_t", 1),
+                ("flags", "uint8_t", 1),
+            ],
         )
         # P_Offset is no longer a fixed packed struct (variable-length wire
         # body now). The auto-generator drops it from STRUCT_FIELDS; verify
@@ -166,7 +190,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_protocol_codec_parses_ack_and_status_reply(self):
         ack_payload = bytes.fromhex("AABBCC11223300") + bytes([0x05, 0x00, 0x09]) + b"\x00\x00\x00"
-        ack_event = codec.parse_reply_event(0x7E, ack_payload, timestamp=1.0, host_rssi=-50, host_snr=7, rx_windows=1)
+        ack_event = codec.parse_reply_event(0x7E, ack_payload, timestamp=1.0, host_rssi=-50, host_snr=7)
 
         self.assertEqual(ack_event["reply"], "ACK")
         self.assertEqual(ack_event["ack_of"], 0x05)
@@ -175,7 +199,7 @@ class ProtocolTests(unittest.TestCase):
 
         status_body = b"\x11\x22\x33\x44\x20\x03\xF6\x04"
         status_payload = bytes.fromhex("AABBCC11223300") + status_body + b"\x00\x00\x00"
-        status_event = codec.parse_reply_event(0x03, status_payload, timestamp=2.0, host_rssi=-45, host_snr=5, rx_windows=1)
+        status_event = codec.parse_reply_event(0x03, status_payload, timestamp=2.0, host_rssi=-45, host_snr=5)
 
         self.assertEqual(status_event["reply"], "STATUS_REPLY")
         self.assertEqual(status_event["flags"], 0x11)
@@ -187,7 +211,7 @@ class ProtocolTests(unittest.TestCase):
         identify_body = b"\x04\x21\x09" + bytes.fromhex("AABBCCDDEEFF")
         self.assertEqual(len(identify_body), RLPA.SZ_P_IdentifyReply)
         identify_payload = bytes.fromhex("AABBCC11223300") + identify_body + b"\x00\x00\x00"
-        identify_event = codec.parse_reply_event(0x01, identify_payload, timestamp=3.0, host_rssi=-42, host_snr=6, rx_windows=1)
+        identify_event = codec.parse_reply_event(0x01, identify_payload, timestamp=3.0, host_rssi=-42, host_snr=6)
 
         self.assertEqual(identify_event["reply"], "IDENTIFY_REPLY")
         self.assertEqual(identify_event["version"], 0x04)

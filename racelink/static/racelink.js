@@ -203,19 +203,33 @@
     state.busy = !!isBusy;
     const disable = state.busy;
 
-    // header action buttons
-    $$(".rl-actions button").forEach(b => b.disabled = disable);
-    // group creation + bulk
-    $("#btnNewGroup").disabled = disable;
-    $("#btnBulkSetGroup").disabled = disable;
-    const btnCfg = $("#btnNodeCfgSend");
-    if(btnCfg) btnCfg.disabled = disable;
+    // C7: setBusy is now called from both pages (Devices + Scenes).
+    // Devices-page-only selectors are null-guarded so the function
+    // doesn't crash on /racelink/scenes where those elements don't
+    // exist. ``$$(".rl-actions button")`` already iterates safely
+    // over an empty NodeList; the ``$()`` calls below need explicit
+    // checks because they previously accessed ``.disabled`` on null.
 
-    // allow closing modal even when busy
-    $("#btnDiscoverStart").disabled = disable;
-    updateNodeCfgUi();
-    updatePresetsDownloadUi();
-    updateSpecialUi();
+    // Header action buttons (present on every page).
+    $$(".rl-actions button").forEach(b => b.disabled = disable);
+
+    // Devices-page-only controls.
+    const newGroup = $("#btnNewGroup");          if(newGroup) newGroup.disabled = disable;
+    const bulkBtn  = $("#btnBulkSetGroup");      if(bulkBtn)  bulkBtn.disabled  = disable;
+    const cfgBtn   = $("#btnNodeCfgSend");       if(cfgBtn)   cfgBtn.disabled   = disable;
+    const discBtn  = $("#btnDiscoverStart");     if(discBtn)  discBtn.disabled  = disable;
+
+    // Scenes-page-only controls (the editor's Run/Save/Duplicate/
+    // Delete row). The buttons live inside ``.rl-special-actions``
+    // built per-render by scenes.js; an attribute selector finds
+    // them without scenes.js needing to import a helper.
+    $$("#sceneEditor .rl-special-actions button").forEach(b => b.disabled = disable);
+
+    // Devices-page extra UI updaters — null-guarded so a missing
+    // helper (e.g. on the scenes page) doesn't throw.
+    if(typeof updateNodeCfgUi === "function") updateNodeCfgUi();
+    if(typeof updatePresetsDownloadUi === "function") updatePresetsDownloadUi();
+    if(typeof updateSpecialUi === "function") updateSpecialUi();
   }
 
 
@@ -340,7 +354,15 @@ function buildSpecialVarInput({varKey, varMeta, uiMeta, dev}){
     opts.forEach(optInfo => {
       const opt = document.createElement("option");
       opt.value = String(optInfo.value);
-      opt.textContent = String(optInfo.label ?? optInfo.value);
+      // WLED effect-mode entries carry ``deterministic: true`` for the
+      // 19 effects audited as cross-node sync-safe (see
+      // racelink/domain/wled_deterministic.py + analysis doc). Mark them
+      // with a leading "* " so the operator can pick offset-mode-safe
+      // effects at a glance. The backend already sorts these to the top
+      // of the list, so the marker is what the operator sees first.
+      const baseLabel = String(optInfo.label ?? optInfo.value);
+      opt.textContent = optInfo.deterministic ? `* ${baseLabel}` : baseLabel;
+      if(optInfo.deterministic) opt.dataset.deterministic = "1";
       select.appendChild(opt);
     });
     const desiredNum = Number(defaultVal);
@@ -435,12 +457,11 @@ function renderSpecialTabs(){
     saveBtn.type = "button";
     saveBtn.className = "special-save";
     saveBtn.textContent = "Save";
-    const refreshBtn = document.createElement("button");
-    refreshBtn.type = "button";
-    refreshBtn.className = "special-refresh";
-    refreshBtn.textContent = "Refresh";
+    // B7: the "Refresh" button was a stub — its handler logged
+    // "Refreshing is not implemented yet" and called an endpoint
+    // (``/api/specials/get``) that returns 501. Hidden until a real
+    // implementation lands; restoring the button is one Edit away.
     actions.appendChild(saveBtn);
-    actions.appendChild(refreshBtn);
     row.appendChild(label);
     row.appendChild(input);
     row.appendChild(actions);
@@ -471,13 +492,6 @@ function renderSpecialTabs(){
       }
     });
 
-    refreshBtn.addEventListener("click", async () => {
-      $("#specialHint").textContent = "Refreshing is not implemented yet.";
-      await apiPost("/racelink/api/specials/get", {
-        mac: state.specialDevice?.addr,
-        key: opt.key,
-      }).catch(()=>{});
-    });
   });
 
   if(functions.length){
@@ -514,11 +528,12 @@ function renderSpecialTabs(){
       inputMeta.push({ key: varKey, input, uiMeta, widget, wrap: fieldWrap, labelEl: fieldLabel });
     });
 
-    // A12: dynamische effect-spezifische UI (Slot-Filtering + Labels) — im
-    // Preset-Editor (dlgRlPresets) weiterhin aktiv, im Specials-Dialog nach
-    // Phase D nicht mehr genutzt (wled_control hat nur noch {presetId,
-    // brightness}). Der bedingte Block unten greift deshalb nur, wenn die
-    // Function tatsächlich ein ``mode``-Var mit Slot-Metadaten aufweist.
+    // A12: dynamic effect-specific UI (slot filtering + labels) — still
+    // active in the preset editor (dlgRlPresets); after Phase D the
+    // Specials dialog no longer uses it (wled_control carries only
+    // {presetId, brightness}). The conditional block below therefore
+    // only runs when the function actually has a ``mode`` var carrying
+    // slot metadata.
     const modeMeta = inputMeta.find(m => m.key === "mode");
     const modeOptions = modeMeta && modeMeta.uiMeta && Array.isArray(modeMeta.uiMeta.options)
       ? modeMeta.uiMeta.options
@@ -530,8 +545,8 @@ function renderSpecialTabs(){
         const selected = optionByValue.get(String(modeMeta.input.value));
         const slots = selected && selected.slots ? selected.slots : null;
         for(const m of inputMeta){
-          if(m.key === "mode") continue; // Mode-Select bleibt immer sichtbar
-          // Slot fehlt / unbekannt -> konservativer Fallback: Feld anzeigen, generisches Label.
+          if(m.key === "mode") continue; // mode select stays visible always
+          // Slot missing / unknown -> conservative fallback: show field, generic label.
           const slot = slots ? slots[m.key] : null;
           const used = slot ? Boolean(slot.used) : true;
           m.wrap.style.display = used ? "" : "none";
@@ -560,9 +575,9 @@ function renderSpecialTabs(){
       if(!state.specialDevice) return;
       const params = {};
       for(const meta of inputMeta){
-        // A12: ausgeblendete Felder (effect-spezifisch unused) nicht mitschicken.
-        // Das Backend belässt sie dann aus fieldMask/extMask raus -> der WLED-Node
-        // überschreibt nichts Irrelevantes.
+        // A12: don't submit hidden fields (effect-specific unused). The
+        // backend leaves them out of fieldMask/extMask -> the WLED node
+        // doesn't overwrite anything irrelevant.
         if(meta.wrap && meta.wrap.style.display === "none"){
           continue;
         }
@@ -726,7 +741,35 @@ async function openSpecialsDialog(mac){
     state.groups.forEach(gr => {
       const li = document.createElement("li");
       li.className = (gr.id===state.selGroupId) ? "active" : "";
-      li.innerHTML = `<span>${gr.name}</span> <span class="count">${gr.device_count||0}</span>`;
+      // Build the row in DOM nodes (was innerHTML) so the per-group
+      // delete button can be wired up safely without HTML-escaping
+      // dance on the group name.
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = gr.name || `Group ${gr.id}`;
+      const countSpan = document.createElement("span");
+      countSpan.className = "count";
+      countSpan.textContent = String(gr.device_count || 0);
+      li.appendChild(nameSpan);
+      li.appendChild(countSpan);
+      // Per-group delete button. Hidden by default, revealed on
+      // hover via CSS. Static groups (e.g. "All WLED Nodes") and the
+      // synthetic Unconfigured (id=0) cannot be deleted — skip the
+      // button entirely on those rows.
+      const deletable = !gr.static && Number(gr.id) !== 0;
+      if(deletable){
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "rl-group-delete-btn";
+        delBtn.textContent = "✕";
+        delBtn.title = `Delete group "${gr.name}"`;
+        delBtn.addEventListener("click", async (e) => {
+          // Stop the click from also selecting the group (the row's
+          // own click handler runs in the bubble phase otherwise).
+          e.stopPropagation();
+          await handleGroupDelete(gr);
+        });
+        li.appendChild(delBtn);
+      }
       li.addEventListener("click", () => {
         state.selGroupId = gr.id;
         renderGroups();
@@ -734,6 +777,48 @@ async function openSpecialsDialog(mac){
       });
       ul.appendChild(li);
     });
+  }
+
+  async function handleGroupDelete(group){
+    // C2-style destructive confirm: name the group, count the
+    // affected devices, and warn about scene renumbering. The
+    // device count is already in the group row's payload.
+    const devCount = Number(group.device_count || 0);
+    const consequences = [];
+    if(devCount > 0){
+      consequences.push(
+        `${devCount} device${devCount === 1 ? "" : "s"} will move to "Unconfigured" (group 0)`
+      );
+    }
+    consequences.push(
+      "scene actions targeting this group will collapse to Unconfigured, "
+      + "and scene actions targeting higher-numbered groups will renumber"
+    );
+    const msg = `Delete group "${group.name}"?\n\n` + consequences.join(". ") + ".";
+    if(!confirmDestructive(msg)) return;
+
+    const r = await apiPost("/racelink/api/groups/delete", { id: group.id });
+    if(!r || !r.ok){
+      showToastError(r?.error || "Delete failed.");
+      return;
+    }
+    // Build a friendly summary toast from the response counts.
+    const parts = [];
+    if(r.moved_devices) parts.push(`${r.moved_devices} → Unconfigured`);
+    if(r.renumbered_devices) parts.push(`${r.renumbered_devices} renumbered`);
+    if(r.renumbered_scenes) parts.push(`${r.renumbered_scenes} scene${r.renumbered_scenes === 1 ? "" : "s"} updated`);
+    showToast(
+      parts.length
+        ? `Deleted "${group.name}" — ${parts.join(", ")}.`
+        : `Deleted "${group.name}".`
+    );
+    // If the deleted group was the active filter, drop the filter
+    // so the table doesn't show an empty view.
+    if(state.selGroupId === group.id) state.selGroupId = null;
+    // SSE refresh will fire from the server too; this just makes
+    // the response feel instant.
+    await loadGroups();
+    await loadDevices();
   }
 
   function renderBulkGroup(){
@@ -777,6 +862,15 @@ async function openSpecialsDialog(mac){
       });
     }
 
+    // Flash animation on rows whose last_seen_ts advanced since the
+    // previous render. The first render after page-load has an empty
+    // snapshot so nothing flashes (otherwise every row would on
+    // initial load); subsequent renders flash only the rows that
+    // received fresh data — typically a STATUS_REPLY or
+    // IDENTIFY_REPLY arrived over SSE and triggered a re-render.
+    const prevSeenSnapshot = state._lastSeenSnapshot || {};
+    const nextSeenSnapshot = {};
+
     rows.forEach(r => {
       const tr = document.createElement("tr");
       const checked = state.selected.has(r.addr);
@@ -786,6 +880,18 @@ async function openSpecialsDialog(mac){
       const typeCell = (specials.length && typeLabel)
         ? `<button class="rl-link-btn specials-link" data-mac="${r.addr ?? ""}">${typeLabel}</button>`
         : typeLabel;
+      // Track the row's identity + freshness for the flash detector
+      // below. Use the MAC as the dataset key; the table is rebuilt
+      // each render so we can't keep a per-tr handle across renders.
+      tr.dataset.mac = String(r.addr || "");
+      const seen = Number(r.last_seen_ts || 0);
+      nextSeenSnapshot[r.addr] = seen;
+      if(prevSeenSnapshot[r.addr] !== undefined && seen > prevSeenSnapshot[r.addr]){
+        tr.classList.add("rl-row-flash");
+        // Auto-strip the class after the animation duration so a row
+        // that doesn't refresh next time doesn't leave a stale class.
+        setTimeout(() => { tr.classList.remove("rl-row-flash"); }, 1100);
+      }
       const configByte = Number(r.configByte ?? 0) & 0xFF;
       const selectedConfigs = [];
       const tooltipConfigs = [];
@@ -823,6 +929,13 @@ async function openSpecialsDialog(mac){
       }
       body.appendChild(tr);
     });
+
+    // Persist the freshness snapshot for the next render's flash
+    // comparison. Only includes the macs we just rendered — devices
+    // filtered out (by the group-selection filter) won't flash on
+    // re-appearance, which is the right call (the filter change is
+    // the noise source, not fresh radio data).
+    state._lastSeenSnapshot = nextSeenSnapshot;
 
     // Selection handlers
     $$("#rlBody input[type=checkbox]").forEach(cb => {
@@ -866,29 +979,78 @@ async function openSpecialsDialog(mac){
   });
 
   // Master/task UI
+  // C8 / Batch B: human-readable explanation of each master-state for the
+  // pill tooltip. Pre-Batch-B the host inferred state by combining
+  // EV_RX_WINDOW_OPEN/CLOSED + EV_TX_DONE; v4 mirrors the gateway's
+  // single state byte verbatim, so the help dictionary now matches the
+  // GatewayState enum (IDLE / TX / RX_WINDOW / RX / ERROR / UNKNOWN).
+  const MASTER_STATE_HELP = {
+    UNKNOWN:   "Unknown — host hasn't received a STATE_REPORT yet (USB just connected, or the gateway never replied). Click ↻ to refresh.",
+    IDLE:      "Idle — gateway is in continuous RX, ready for the next host send. No traffic in flight.",
+    TX:        "Transmitting — gateway is sending an RF packet to the fleet. Auto-clears when the radio finishes (LBT backoff ~50–300 ms + airtime).",
+    RX_WINDOW: "RX window — gateway has a bounded receive window open after a unicast/stream send and is waiting for a node reply. Auto-closes at the window's deadline.",
+    RX:        "Receiving — gateway is in active receive (setDefaultRxNone mode only; not used by the current default firmware).",
+    ERROR:     "Error — the gateway reported a fault. May be transient (USB hiccup) or persistent (link lost); check ``last_error`` for the cause and the gateway banner for retry status.",
+  };
+
   function updateMaster(m){
     state.lastMaster = m;
     const pill = $("#masterPill");
     const detail = $("#masterDetail");
 
-    const st = (m && m.state) ? String(m.state) : "IDLE";
-    pill.textContent = st;
-    pill.classList.remove("idle","tx","rx","err");
+    const st = (m && m.state) ? String(m.state) : "UNKNOWN";
+    pill.textContent = st === "RX_WINDOW" ? "RX-WIN" : st;
+    pill.classList.remove("idle","tx","rx","err","unknown");
     if(st==="TX") pill.classList.add("tx");
-    else if(st==="RX") pill.classList.add("rx");
+    else if(st==="RX_WINDOW" || st==="RX") pill.classList.add("rx");
     else if(st==="ERROR") pill.classList.add("err");
+    else if(st==="UNKNOWN") pill.classList.add("unknown");
     else pill.classList.add("idle");
 
     const parts = [];
-    if(m.tx_pending) parts.push("TX pending");
-    if(m.rx_window_open) parts.push(`RX window ${m.rx_window_ms||0}ms`);
-    if(m.last_rx_count_delta) parts.push(`ΔRX ${m.last_rx_count_delta}`);
+    if(st==="RX_WINDOW" && m.state_metadata_ms) parts.push(`min_ms ${m.state_metadata_ms}`);
     if(m.last_event) parts.push(`last: ${m.last_event}`);
     if(m.last_error) parts.push(`err: ${m.last_error}`);
     detail.textContent = parts.join(" · ");
+
+    // C8: build the pill's hover-tooltip from the state explanation
+    // plus the same sub-state parts the masterDetail span shows. The
+    // detail span truncates on narrow screens; the tooltip is the
+    // accessibility-friendly alternative.
+    const help = MASTER_STATE_HELP[st] || `Master state: ${st}`;
+    pill.title = parts.length ? `${help}\n\n${parts.join("\n")}` : help;
+
     updateNodeCfgUi();
     updatePresetsDownloadUi();
 
+  }
+
+  // Batch B: ↻ refresh button on the master pill. Sends a synchronous
+  // STATE_REQUEST to the gateway and merges the reply into the local
+  // master snapshot. Useful at startup, after a USB drop, or when the
+  // operator wants to confirm the gateway is alive.
+  function bindMasterRefresh(){
+    const btn = $("#masterRefresh");
+    if(!btn || btn.dataset.bound) return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const r = await fetch("/racelink/api/gateway/query-state", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+        });
+        if(r.ok) {
+          const j = await r.json();
+          if(j) updateMaster(Object.assign({}, state.lastMaster || {}, j));
+        }
+      } catch(_) {
+        // swallow-ok: SSE will deliver the next gateway-driven update
+        // and the operator can click again. No banner needed.
+      } finally {
+        btn.disabled = false;
+      }
+    });
   }
 
   function updateTask(t){
@@ -914,6 +1076,10 @@ async function openSpecialsDialog(mac){
         if(meta.stage) mparts.push(String(meta.stage));
         if(meta.attempt && meta.retries) mparts.push(`try ${meta.attempt}/${meta.retries}`);
         if(meta.message) mparts.push(String(meta.message));
+        // C4: mirror the running task into the OTA progress dialog
+        // panel if it's currently visible. Cheap to call repeatedly;
+        // the function is a no-op when the panel is hidden.
+        try{ fwUpdateProgressFromTask(t); }catch(e){ console.error(e); }
       }
 
       if(name==="presets_download"){
@@ -928,6 +1094,29 @@ async function openSpecialsDialog(mac){
           if(meta.message) msg.push(String(meta.message));
           hintEl.textContent = msg.join(": ");
         }
+      }
+
+      if(name==="bulk_set_group"){
+        // 2026-04-29: bulk-move "Move selected to group" runs as a
+        // task so the operator gets per-device progress instead of
+        // staring at a frozen UI for 8 s per offline device. Same
+        // ``index/total`` + ``stage`` shape the fwupdate path uses.
+        if(meta.index!==undefined && meta.total!==undefined) mparts.push(`${meta.index}/${meta.total}`);
+        if(meta.stage) mparts.push(String(meta.stage));
+        if(meta.addr) mparts.push(String(meta.addr));
+        if(meta.message) mparts.push(String(meta.message));
+      }
+
+      if(name==="force_groups"){
+        // 2026-04-29 (rf-timing batch): "Re-sync group config"
+        // mirrors the bulk_set_group masterbar layout. The route
+        // skips offline devices entirely, so the index/total ratio
+        // counts every known device but the stage flips quickly
+        // through the offline ones.
+        if(meta.index!==undefined && meta.total!==undefined) mparts.push(`${meta.index}/${meta.total}`);
+        if(meta.stage) mparts.push(String(meta.stage));
+        if(meta.addr) mparts.push(String(meta.addr));
+        if(meta.message) mparts.push(String(meta.message));
       }
 
       const p = [
@@ -969,6 +1158,10 @@ async function openSpecialsDialog(mac){
         hintEl.textContent = `Error: ${t.last_error || "unknown"}`;
       }
     }
+    // C4: also finalise the progress panel if it was shown.
+    if(st==="done" || st==="error"){
+      try{ fwFinaliseProgressFromTask(t); }catch(e){ console.error(e); }
+    }
   }
 
   if(name==="presets_download"){
@@ -997,6 +1190,58 @@ async function openSpecialsDialog(mac){
       } else if(st==="running"){
         // running updates handled above
       }
+    }
+  }
+
+  if(name==="bulk_set_group"){
+    // 2026-04-29 — final summary toast on completion. Pre-fix the
+    // route was synchronous and produced no toast at all; now the
+    // operator gets a per-outcome breakdown ("3 acked, 2 offline,
+    // 1 timed out") that matches what the masterbar showed during
+    // the run.
+    if(st==="done" && state._bulkSetGroupActive){
+      state._bulkSetGroupActive = false;
+      const r = t.result || {};
+      const parts = [];
+      if(r.changed) parts.push(`${r.changed} ACKed`);
+      if(r.skipped_offline) parts.push(`${r.skipped_offline} offline (queued for auto-restore)`);
+      if(r.timed_out) parts.push(`${r.timed_out} timed out`);
+      const summary = parts.length ? parts.join(", ") : "no devices changed";
+      // Use the error-flavoured toast when something went wrong
+      // (timed_out or transport problems); otherwise green.
+      if(r.timed_out){
+        showToastError(`Move finished with timeouts — ${summary}.`);
+      } else {
+        showToast(`Move complete — ${summary}.`);
+      }
+    } else if(st==="error" && state._bulkSetGroupActive){
+      state._bulkSetGroupActive = false;
+      showToastError(`Move failed: ${t.last_error || "unknown error"}`);
+    }
+  }
+
+  if(name==="force_groups"){
+    // 2026-04-29 (rf-timing batch): completion toast for "Re-sync
+    // group config". Same shape as bulk_set_group's summary, gated
+    // by ``_forceGroupsActive`` so the toast only fires for the
+    // run the operator started (not for any historical task that
+    // SSE replays into ``updateTask``).
+    if(st==="done" && state._forceGroupsActive){
+      state._forceGroupsActive = false;
+      const r = t.result || {};
+      const parts = [];
+      if(r.changed) parts.push(`${r.changed} ACKed`);
+      if(r.skipped_offline) parts.push(`${r.skipped_offline} offline (queued for auto-restore)`);
+      if(r.timed_out) parts.push(`${r.timed_out} timed out`);
+      const summary = parts.length ? parts.join(", ") : "no devices changed";
+      if(r.timed_out){
+        showToastError(`Re-sync finished with timeouts — ${summary}.`);
+      } else {
+        showToast(`Re-sync complete — ${summary}.`);
+      }
+    } else if(st==="error" && state._forceGroupsActive){
+      state._forceGroupsActive = false;
+      showToastError(`Re-sync failed: ${t.last_error || "unknown error"}`);
     }
   }
 
@@ -1092,7 +1337,7 @@ async function openSpecialsDialog(mac){
   async function fwUpload(kind, fileInputEl, infoEl){
     const f = fileInputEl.files && fileInputEl.files[0];
     if(!f){
-      alert("Please choose a file first.");
+      showToastError("Please choose a file first.");
       return null;
     }
     const fd = new FormData();
@@ -1100,7 +1345,7 @@ async function openSpecialsDialog(mac){
     fd.append("kind", kind);
     const r = await apiUpload("/racelink/api/fw/upload", fd);
     if(!r.ok){
-      alert(r.error || "Upload failed");
+      showToastError(r.error || "Upload failed");
       return null;
     }
     const s = `${r.file.name} (${r.file.size} B) sha256 ${String(r.file.sha256||"").slice(0,8)}…`;
@@ -1161,7 +1406,7 @@ async function openSpecialsDialog(mac){
     $("#dlgFwUpdate").showModal();
     } catch(e){
       console.error(e);
-      alert("Firmware dialog failed to open. Check console for details.");
+      showToastError("Firmware dialog failed to open. Check console for details.");
     }
   });
 
@@ -1205,27 +1450,34 @@ async function openSpecialsDialog(mac){
   $("#btnFwStart").addEventListener("click", async ()=>{
     const macs = fwMacsForTarget();
     if(!macs.length){
-      alert("No target devices (selection/filter empty).");
+      showToastError("No target devices (selection / filter empty).");
       return;
     }
     const doFirmware = $("#fwDoFirmware").checked;
     const doPresets = $("#fwDoPresets").checked;
     const doCfg = $("#fwDoCfg").checked;
     if(!doFirmware && !doPresets && !doCfg){
-      alert("Select at least one operation (firmware, presets, or cfg).");
+      showToastError("Select at least one operation (firmware, presets, or cfg).");
       return;
     }
 
     const baseUrl = ($("#fwBaseUrl").value || "").trim() || "http://4.3.2.1";
     const retries = Number($("#fwRetries").value || 3) || 3;
 
-    const wifiSsid = ($("#fwWifiSsid")?.value || "WLED-AP").trim();
+    // Parse the comma-separated SSID list. Empty entries are stripped on
+    // the server too; sending an empty list triggers a 400 — the field's
+    // placeholder + default carry the canonical SSIDs so this only fires
+    // if the operator wiped the field intentionally.
+    const wifiSsids = ($("#fwWifiSsid")?.value || "WLED_RaceLink_AP, WLED-AP")
+                       .split(",").map(s => s.trim()).filter(Boolean);
     const wifiIface = ($("#fwWifiIface")?.value || "wlan0").trim();
-    const wifiConnName = ($("#fwWifiConnName")?.value || "racelink-wled-ap").trim();
-    const wifiTimeoutS = Number($("#fwWifiTimeoutS")?.value || 35) || 35;
+    const wifiPassword = ($("#fwWifiPassword")?.value || "wled1234");
+    const wifiOtaPassword = ($("#fwWifiOtaPassword")?.value || "wledota");
+    const wifiTimeoutS = Number($("#fwWifiTimeoutS")?.value || 20) || 20;
 
     const hostWifiEnable = !!($("#fwHostWifiEnable")?.checked);
     const hostWifiRestore = !!($("#fwHostWifiRestore")?.checked);
+    const skipValidation = !!($("#fwSkipValidation")?.checked);
 
     const body = {
       macs,
@@ -1236,12 +1488,19 @@ async function openSpecialsDialog(mac){
       doFirmware,
       doPresets,
       doCfg,
-      wifi: { connName: wifiConnName, ssid: wifiSsid, iface: wifiIface, timeoutS: wifiTimeoutS }
+      skipValidation,
+      wifi: {
+        ssids: wifiSsids,
+        password: wifiPassword,
+        otaPassword: wifiOtaPassword,
+        iface: wifiIface,
+        timeoutS: wifiTimeoutS,
+      }
     };
 
     if(doFirmware){
       if(!state.fwUploads.fwId){
-        alert("Firmware enabled but firmware is not uploaded yet.");
+        showToastError("Firmware enabled but firmware is not uploaded yet.");
         return;
       }
       body.fwId = state.fwUploads.fwId;
@@ -1250,14 +1509,14 @@ async function openSpecialsDialog(mac){
     if(doPresets){
       const presetsName = ($("#fwPresetsSelect").value || "").trim();
       if(!presetsName){
-        alert("Presets enabled but no presets.json is available.");
+        showToastError("Presets enabled but no presets.json is available.");
         return;
       }
       body.presetsName = presetsName;
     }
     if(doCfg){
       if(!state.fwUploads.cfgId){
-        alert("cfg enabled but cfg.json is not uploaded yet.");
+        showToastError("cfg enabled but cfg.json is not uploaded yet.");
         return;
       }
       body.cfgId = state.fwUploads.cfgId;
@@ -1265,16 +1524,208 @@ async function openSpecialsDialog(mac){
 
     const r = await apiPost("/racelink/api/fw/start", body);
     if(r.busy){
-      alert(`Busy: ${r.task?.name || "task"} is running`);
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
       return;
     }
     if(!r.ok){
-      alert(r.error || "Failed to start firmware update.");
+      showToastError(r.error || "Failed to start firmware update.");
       return;
     }
 
-    $("#dlgFwUpdate").close();
+    // C4: keep the dialog open and switch to the progress panel.
+    // ``updateTask`` populates the panel's stage / index / message
+    // fields as the SSE ``task`` events arrive. Operators no longer
+    // see a closed dialog with no feedback during a multi-minute
+    // multi-device firmware roll-out.
+    fwShowProgressPanel(macs);
   });
+
+  // ---- C4: OTA progress panel ---------------------------------------------
+  // Two-state dialog (#fwConfig vs #fwProgress); switching is purely a
+  // visibility toggle. ``state.fwUI`` keeps the macs we expect to see
+  // in the per-device summary so a malformed task-meta payload can't
+  // wipe the row list.
+  state.fwUI = state.fwUI || { macs: [], rows: new Map() };
+
+  function fwShowProgressPanel(macs){
+    const cfg = document.getElementById("fwConfig");
+    const prog = document.getElementById("fwProgress");
+    if(!cfg || !prog) return;
+    cfg.classList.add("hidden");
+    prog.classList.remove("hidden");
+    state.fwUI.macs = (macs || []).map(m => String(m).toUpperCase());
+    state.fwUI.rows = new Map();
+
+    // Seed the per-device summary so the operator can see the planned
+    // macs immediately rather than empty space until the first event.
+    const summary = document.getElementById("fwProgressSummary");
+    if(summary){
+      summary.innerHTML = "";
+      state.fwUI.macs.forEach(mac => {
+        const row = document.createElement("div");
+        row.className = "rl-fw-progress-summary-row";
+        row.dataset.mac = mac;
+        const macSpan = document.createElement("span");
+        macSpan.className = "mac";
+        macSpan.textContent = mac;
+        const status = document.createElement("span");
+        status.className = "status";
+        status.textContent = "queued";
+        row.appendChild(macSpan);
+        row.appendChild(status);
+        summary.appendChild(row);
+        state.fwUI.rows.set(mac, { row, status });
+      });
+    }
+
+    // Initial stage label until the first task event lands.
+    const stage = document.getElementById("fwProgressStage");
+    if(stage) stage.textContent = `Starting (${macs.length} device${macs.length === 1 ? "" : "s"})…`;
+    const msg = document.getElementById("fwProgressMessage");
+    if(msg) msg.textContent = "Waiting for the first stage event…";
+    const bar = document.getElementById("fwProgressBar");
+    if(bar){ bar.style.width = "0%"; bar.classList.remove("done", "error"); }
+  }
+
+  function fwResetDialogToConfig(){
+    const cfg = document.getElementById("fwConfig");
+    const prog = document.getElementById("fwProgress");
+    if(cfg) cfg.classList.remove("hidden");
+    if(prog) prog.classList.add("hidden");
+  }
+
+  // ``btnFwClose`` is a normal cancel-button (form method=dialog), but
+  // we also want the *next* time the operator opens the dialog to
+  // start fresh on the config form. Attach a close handler.
+  const _dlgFw = document.getElementById("dlgFwUpdate");
+  if(_dlgFw){
+    _dlgFw.addEventListener("close", fwResetDialogToConfig);
+  }
+
+  function fwUpdateProgressFromTask(t){
+    const prog = document.getElementById("fwProgress");
+    if(!prog || prog.classList.contains("hidden")) return;
+
+    const meta = t.meta || {};
+    const stageEl = document.getElementById("fwProgressStage");
+    const msgEl = document.getElementById("fwProgressMessage");
+    const bar = document.getElementById("fwProgressBar");
+
+    const idx = Number(meta.index || 0);
+    const total = Number(meta.total || state.fwUI.macs.length || 0);
+    const stage = String(meta.stage || "");
+    const addr = String(meta.addr || "").toUpperCase();
+    const attempt = meta.attempt;
+    const retries = meta.retries;
+    const message = String(meta.message || "");
+
+    if(stageEl){
+      const parts = [];
+      if(total) parts.push(`Device ${idx} of ${total}`);
+      if(stage) parts.push(stage);
+      if(attempt && retries) parts.push(`try ${attempt}/${retries}`);
+      stageEl.textContent = parts.join(" · ") || "Running…";
+    }
+    if(msgEl){
+      msgEl.textContent = message || (addr ? `device ${addr}` : "");
+    }
+    if(bar && total){
+      const pct = Math.max(0, Math.min(100, Math.round((idx / total) * 100)));
+      bar.style.width = `${pct}%`;
+    }
+
+    // Per-device row updates: mark the current device as running, the
+    // ones before it as ok (best-effort — the task only signals
+    // forward progress; per-device errors from results.errors are
+    // applied on task done/error below).
+    if(addr && state.fwUI.rows.has(addr)){
+      const cur = state.fwUI.rows.get(addr);
+      if(!cur.row.classList.contains("error") && !cur.row.classList.contains("ok")){
+        cur.row.classList.remove("running");
+        cur.row.classList.add("running");
+        cur.status.textContent = stage || "running";
+      }
+    }
+    // Mark every mac that appears before the current one as "ok"
+    // (best-effort, see comment above).
+    if(addr && state.fwUI.macs.length){
+      const seen = state.fwUI.macs.indexOf(addr);
+      if(seen > 0){
+        for(let i = 0; i < seen; i++){
+          const m = state.fwUI.macs[i];
+          const r = state.fwUI.rows.get(m);
+          if(r && !r.row.classList.contains("error") && !r.row.classList.contains("ok")){
+            r.row.classList.remove("running");
+            r.row.classList.add("ok");
+            r.status.textContent = "ok";
+          }
+        }
+      }
+    }
+  }
+
+  function fwFinaliseProgressFromTask(t){
+    const prog = document.getElementById("fwProgress");
+    if(!prog || prog.classList.contains("hidden")) return;
+    const stageEl = document.getElementById("fwProgressStage");
+    const msgEl = document.getElementById("fwProgressMessage");
+    const bar = document.getElementById("fwProgressBar");
+
+    const result = t.result || {};
+    const errs = (result.errors && result.errors.length) ? result.errors.length : 0;
+    const errored = t.state === "error" || errs > 0;
+
+    if(stageEl){
+      stageEl.textContent = errored
+        ? "Update finished with errors"
+        : "Update complete";
+    }
+    if(msgEl){
+      if(errored){
+        const lastErr = t.last_error || (result.errors && result.errors[0]) || "see device list below";
+        msgEl.textContent = `Errors: ${errs}. ${lastErr}`;
+      } else {
+        msgEl.textContent = "All devices updated successfully. You can close this dialog.";
+      }
+    }
+    if(bar){
+      bar.style.width = "100%";
+      bar.classList.remove("done", "error");
+      bar.classList.add(errored ? "error" : "done");
+    }
+
+    // Apply per-device results when available. The OTA workflow
+    // populates ``result.devices`` with per-mac entries; map them
+    // onto the seeded rows.
+    const devices = result.devices || [];
+    devices.forEach(d => {
+      const mac = String(d.addr || d.mac || "").toUpperCase();
+      const row = state.fwUI.rows.get(mac);
+      if(!row) return;
+      row.row.classList.remove("running", "ok", "error");
+      if(d.ok){
+        row.row.classList.add("ok");
+        row.status.textContent = "ok";
+      } else {
+        row.row.classList.add("error");
+        row.status.textContent = d.error || "failed";
+      }
+    });
+    // Any rows still in "running" state when the task ended -
+    // attribute them to the operator-visible aggregate result.
+    state.fwUI.rows.forEach(({row, status}) => {
+      if(row.classList.contains("running") && !row.classList.contains("error") && !row.classList.contains("ok")){
+        row.classList.remove("running");
+        if(errored){
+          row.classList.add("error");
+          status.textContent = "no result";
+        } else {
+          row.classList.add("ok");
+          status.textContent = "ok";
+        }
+      }
+    });
+  }
 
   // Transient banner (server unreachable / restarting) -----------------------
   function showTransientBanner(message){
@@ -1290,8 +1741,14 @@ async function openSpecialsDialog(mac){
   }
 
   // Ephemeral toast -----------------------------------------------------------
+  // Two flavours, sharing one DOM element:
+  //   * ``showToast(msg)``       success / info (green, 3 s default)
+  //   * ``showToastError(msg)``  error / validation (red, 5 s default)
+  // Both are non-blocking; native ``alert()`` is no longer used in the
+  // operator-facing UI. Error toasts deliberately get a longer default
+  // duration so a fast scroll doesn't lose them.
   let _toastTimer = null;
-  function showToast(message, durationMs){
+  function _renderToast(message, durationMs){
     const toast = document.getElementById("rlToast");
     if(!toast) return;
     toast.textContent = message;
@@ -1301,7 +1758,29 @@ async function openSpecialsDialog(mac){
     _toastTimer = setTimeout(()=>{
       toast.classList.add("rl-toast-fade");
       setTimeout(()=>toast.classList.add("hidden"), 300);
-    }, durationMs || 3000);
+    }, durationMs);
+  }
+  function showToast(message, durationMs){
+    const toast = document.getElementById("rlToast");
+    if(!toast) return;
+    toast.classList.remove("rl-toast-error");
+    _renderToast(message, durationMs || 3000);
+  }
+  function showToastError(message, durationMs){
+    const toast = document.getElementById("rlToast");
+    if(!toast) return;
+    toast.classList.add("rl-toast-error");
+    _renderToast(message, durationMs || 5000);
+  }
+
+  // C2: standardised confirmation for destructive ops. Uses native
+  // ``confirm()`` because it's blocking, accessible, and keyboard-
+  // friendly out of the box; building a custom modal here would be
+  // bigger scope than the audit asked for. Keep callsites consistent
+  // by routing through this wrapper so a future swap to a custom
+  // modal is one-line.
+  function confirmDestructive(message){
+    return Boolean(window.confirm(message));
   }
 
   // Gateway banner render -----------------------------------------------------
@@ -1548,9 +2027,37 @@ async function openSpecialsDialog(mac){
     if(!r.busy) await loadAll();
   });
 
-  $("#btnForce").addEventListener("click", async ()=>{
-    const r = await apiPost("/racelink/api/groups/force",{});
-    if(r.busy) return;
+  // 2026-04-29 (rf-timing batch + skip-offline toggle): the route is
+  // TaskManager-wrapped (mirrors bulk_set_group). The dialog exposes
+  // the ``skipOffline`` toggle — default OFF so re-sync's operator
+  // semantic ("push to ALL") is the no-click path. Operators with
+  // large fleets can opt into the fast skip-offline path.
+  const dlgResync = $("#dlgResyncGroups");
+  $("#btnForce").addEventListener("click", ()=>{
+    // Reset the checkbox each time the dialog opens so the previous
+    // run's choice doesn't silently persist into the next.
+    const cb = $("#resyncSkipOffline");
+    if(cb) cb.checked = false;
+    if(dlgResync) dlgResync.showModal();
+  });
+
+  $("#btnResyncStart").addEventListener("click", async (e)=>{
+    e.preventDefault();
+    const skipOffline = !!$("#resyncSkipOffline")?.checked;
+    if(dlgResync) dlgResync.close();
+    const r = await apiPost("/racelink/api/groups/force", {skipOffline});
+    if(r && r.task){
+      state._forceGroupsActive = true;
+      const toastMsg = skipOffline
+        ? "Re-syncing group config (skipping offline)…"
+        : "Re-syncing group config…";
+      showToast(toastMsg);
+      try{ updateTask(r.task); }catch(err){ console.error(err); }
+    } else if(r && r.busy){
+      // covered by the universal busy toast in apiPost
+    } else if(r && !r.ok){
+      showToastError(`Re-sync failed: ${r.error || "unknown error"}`);
+    }
   });
 
   const dlgSpecials = $("#dlgSpecials");
@@ -1603,7 +2110,7 @@ async function openSpecialsDialog(mac){
     if(!fileEl || !infoEl) return;
     const file = fileEl.files && fileEl.files[0];
     if(!file){
-      alert("Select a presets.json file first.");
+      showToastError("Select a presets.json file first.");
       return;
     }
     const formData = new FormData();
@@ -1624,14 +2131,16 @@ async function openSpecialsDialog(mac){
   $("#btnPresetsDownload").addEventListener("click", async ()=>{
     const macs = Array.from(state.selected);
     if(macs.length !== 1){
-      alert("Select exactly one device to download presets.");
+      showToastError("Select exactly one device to download presets.");
       return;
     }
     const baseUrl = ($("#presetsBaseUrl").value || "").trim() || "http://4.3.2.1";
-    const wifiSsid = ($("#presetsWifiSsid")?.value || "WLED-AP").trim();
+    const wifiSsids = ($("#presetsWifiSsid")?.value || "WLED_RaceLink_AP, WLED-AP")
+                       .split(",").map(s => s.trim()).filter(Boolean);
     const wifiIface = ($("#presetsWifiIface")?.value || "wlan0").trim();
-    const wifiConnName = ($("#presetsWifiConnName")?.value || "racelink-wled-ap").trim();
-    const wifiTimeoutS = Number($("#presetsWifiTimeoutS")?.value || 35) || 35;
+    const wifiPassword = ($("#presetsWifiPassword")?.value || "wled1234");
+    const wifiOtaPassword = ($("#presetsWifiOtaPassword")?.value || "wledota");
+    const wifiTimeoutS = Number($("#presetsWifiTimeoutS")?.value || 20) || 20;
     const hostWifiEnable = !!($("#presetsHostWifiEnable")?.checked);
     const hostWifiRestore = !!($("#presetsHostWifiRestore")?.checked);
 
@@ -1641,10 +2150,16 @@ async function openSpecialsDialog(mac){
       baseUrl,
       hostWifiEnable,
       hostWifiRestore,
-      wifi: { connName: wifiConnName, ssid: wifiSsid, iface: wifiIface, timeoutS: wifiTimeoutS }
+      wifi: {
+        ssids: wifiSsids,
+        password: wifiPassword,
+        otaPassword: wifiOtaPassword,
+        iface: wifiIface,
+        timeoutS: wifiTimeoutS,
+      }
     });
     if(r.busy){
-      alert(`Busy: ${r.task?.name || "task"} is running`);
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
       return;
     }
     if(!r.ok){
@@ -1658,23 +2173,47 @@ async function openSpecialsDialog(mac){
     if(macs.length===0) return;
     const r = await apiPost("/racelink/api/status", {selection: macs});
     if(r.busy){
-      alert(`Busy: ${r.task?.name || "task"} is running`);
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
     }
   });
 
   $("#btnStatusAll").addEventListener("click", async ()=>{
     const r = await apiPost("/racelink/api/status", {});
     if(r.busy){
-      alert(`Busy: ${r.task?.name || "task"} is running`);
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
     }
   });
 
   $("#btnBulkSetGroup").addEventListener("click", async ()=>{
     const macs = Array.from(state.selected);
     const gid = Number($("#bulkGroup").value);
-    if(macs.length===0) return;
+    if(macs.length===0){
+      showToastError("Select one or more devices first.");
+      return;
+    }
+    // C2: changing group membership for many devices at once is
+    // destructive in the "operator clicked the wrong dropdown"
+    // sense — confirm with the count + the target group.
+    const groupSel = $("#bulkGroup");
+    const groupLabel = groupSel.options[groupSel.selectedIndex]?.textContent || `Group ${gid}`;
+    if(!confirmDestructive(
+      `Move ${macs.length} device${macs.length === 1 ? "" : "s"} to "${groupLabel}"? `
+      + "This sends a SET_GROUP packet to each one."
+    )) return;
     const r = await apiPost("/racelink/api/devices/update-meta", {macs, groupId: gid});
-    if(!r.busy) { /* refresh happens via SSE */ }
+    if(r && r.task){
+      // 2026-04-29: bulk-move now runs as a TaskManager job. Mark
+      // the click as "in flight" so updateTask's done/error branch
+      // fires the summary toast for THIS click (not for any older
+      // bulk that finished while we were idle).
+      state._bulkSetGroupActive = true;
+      showToast(`Moving ${macs.length} device${macs.length === 1 ? "" : "s"} → ${groupLabel}…`);
+      try{ updateTask(r.task); }catch(e){ console.error(e); }
+    } else if(r && r.busy){
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
+    } else if(r && !r.ok){
+      showToastError(r.error || "Bulk move failed.");
+    }
   });
 
   // Discover modal
@@ -1683,7 +2222,7 @@ async function openSpecialsDialog(mac){
 $("#btnNodeCfgSend").addEventListener("click", async ()=>{
   const macs = Array.from(state.selected);
   if(macs.length !== 1){
-    alert("Select exactly one device for CONFIG commands.");
+    showToastError("Select exactly one device for CONFIG commands.");
     return;
   }
   const sel = ($("#nodeCfgCmd").value || "").trim();
@@ -1694,15 +2233,20 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
   const data2 = Number(parts[3] || 0);
   const data3 = Number(parts[4] || 0);
 
+  // C2: confirms for the two destructive node-config ops are routed
+  // through ``confirmDestructive`` for consistency. The wording stays
+  // close to the pre-fix prompts so muscle memory carries over.
   if(option === 0x80){
-    if(!confirm("Forget learned Master MAC on the selected node?")) return;
+    if(!confirmDestructive("Forget the learned Master MAC on the selected node? "
+      + "The node will need to re-pair on its next discovery.")) return;
   } else if(option === 0x81){
-    if(!confirm("Reboot the selected node now?")) return;
+    if(!confirmDestructive("Reboot the selected node now? "
+      + "It will be unreachable for a few seconds.")) return;
   }
 
   const r = await apiPost("/racelink/api/config", {mac: macs[0], option, data0, data1, data2, data3});
   if(r.busy){
-    alert(`Busy: ${r.task?.name || "task"} is running`);
+    showToast(`Busy: ${r.task?.name || "task"} is running`);
   }
 });
 
@@ -1762,7 +2306,7 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
     if(!name) return;
     const r = await apiPost("/racelink/api/groups/create", {name});
     if(r.busy){
-      alert(`Busy: ${r.task?.name || "task"} is running`);
+      showToast(`Busy: ${r.task?.name || "task"} is running`);
     }
   });
 
@@ -1781,6 +2325,11 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
     }
 
     renderConfigDisplayOptions();
+
+    // Batch B: wire the ↻ refresh affordance once per page load. Has to
+    // happen after the DOM is ready (the button lives in the masterbar
+    // header rendered by Flask).
+    try{ bindMasterRefresh(); }catch(_){}
 
     try{
       await loadAll();
@@ -1825,6 +2374,7 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
       vars: r.schema.vars || RL_PRESET_VARS,
       ui: r.schema.ui || {},
       flags: Array.isArray(r.schema.flags) ? r.schema.flags : null,
+      paletteColorRules: r.schema.palette_color_rules || null,
     };
     return rlPresetUiSchema;
   }
@@ -1919,25 +2469,62 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
     row.appendChild(document.createElement("div"));
     container.appendChild(row);
 
-    // A12 re-wire: mode-select change -> toggle visibility + labels
+    // A12 re-wire: mode-select change -> toggle visibility + labels.
+    // Some built-in palettes ("* Color 1", "* Colors 1&2", "* Color Gradient",
+    // "* Colors Only") force-show extra color slots regardless of the
+    // effect's static metadata — mirrors WLED's updateSelectedPalette()
+    // in wled00/data/index.js. The exact thresholds come from the schema
+    // (auto-extracted by gen_wled_metadata.py); the literals below are
+    // a safety fallback for older backends that don't ship the rule yet.
     const modeMeta = inputMeta.find(m => m.key === "mode");
+    const paletteMeta = inputMeta.find(m => m.key === "palette");
+    const COLOR_KEY_TO_SLOT = { color1: 0, color2: 1, color3: 2 };
+    const DEFAULT_COLOR_LABEL = ["Fx", "Bg", "Cs"];
+    const paletteRules = (schema && schema.paletteColorRules) || {
+      force_slot_min_palette: [2, 3, 4],
+      max_palette_id: 5,
+    };
+    const paletteForcesSlot = (paletteId, slotIndex) => {
+      const p = Number(paletteId);
+      if(!Number.isFinite(p)) return false;
+      if(p > paletteRules.max_palette_id) return false;
+      const min = paletteRules.force_slot_min_palette[slotIndex];
+      return min !== undefined && p >= min;
+    };
     if(modeMeta && modeMeta.uiMeta && Array.isArray(modeMeta.uiMeta.options)){
       const optionByValue = new Map(modeMeta.uiMeta.options.map(o => [String(o.value), o]));
       const apply = () => {
         const selected = optionByValue.get(String(modeMeta.input.value));
         const slots = selected && selected.slots ? selected.slots : null;
+        const paletteId = paletteMeta ? paletteMeta.input.value : null;
         for(const m of inputMeta){
           if(m.key === "mode") continue;
           const slot = slots ? slots[m.key] : null;
-          const used = slot ? Boolean(slot.used) : true;
+          const effectUses = slot ? Boolean(slot.used) : true;
+          const slotIndex = COLOR_KEY_TO_SLOT[m.key];
+          const paletteForces = slotIndex !== undefined && paletteForcesSlot(paletteId, slotIndex);
+          const used = effectUses || paletteForces;
           m.wrap.style.display = used ? "" : "none";
           if(m.labelEl){
-            const custom = slot && typeof slot.label === "string" && slot.label ? slot.label : null;
-            m.labelEl.textContent = custom || m.labelEl.dataset.defaultLabel || m.key;
+            let label;
+            if(slotIndex !== undefined){
+              if(effectUses){
+                const custom = slot && typeof slot.label === "string" && slot.label ? slot.label : null;
+                label = custom || DEFAULT_COLOR_LABEL[slotIndex];
+              }else if(paletteForces){
+                label = String(slotIndex + 1);
+              }
+            }
+            if(!label){
+              const custom = slot && typeof slot.label === "string" && slot.label ? slot.label : null;
+              label = custom || m.labelEl.dataset.defaultLabel || m.key;
+            }
+            m.labelEl.textContent = label;
           }
         }
       };
       modeMeta.input.addEventListener("change", apply);
+      if(paletteMeta) paletteMeta.input.addEventListener("change", apply);
       apply();
     }
 
@@ -2143,6 +2730,15 @@ $("#btnNodeCfgSend").addEventListener("click", async ()=>{
     apiGet, apiPost, apiPut, apiDelete,
     withBasePath,
     state,
+    // C2 + C3: scenes.js can route through the same toast / confirm
+    // helpers so message styling and button-confirm wording stay
+    // consistent across the two pages.
+    showToast, showToastError, confirmDestructive,
+    // C7: shared busy indicator. setBusy is null-guarded so calls
+    // from scenes.js (where the Devices controls don't exist) are
+    // safe — only the elements that exist on the current page get
+    // disabled.
+    setBusy,
   };
 
   // =====================================================================

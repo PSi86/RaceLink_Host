@@ -19,6 +19,7 @@ from racelink.services.scene_cost_estimator import (
     LORA_SF,
     RADIO_HEADER_BYTES,
     USB_FRAMING_BYTES,
+    WIRE_OVERHEAD_MS_PER_PACKET,
     estimate_action,
     estimate_scene,
     lora_airtime_ms,
@@ -34,29 +35,36 @@ from racelink.services.scenes_service import (
 
 
 class LoRaAirtimeTests(unittest.TestCase):
-    """The Semtech AN1200.13 airtime formula at SF7/BW250/CR4:5 yields well-
-    known values; verify our implementation matches within ~5% for several
-    payload sizes."""
+    """The Semtech AN1200.13 airtime formula at SF7/BW125/CR4:5 yields
+    well-known values; verify our implementation matches within ~10% for
+    several payload sizes.
+
+    BW was 250_000 pre-2026-04-28 — the gateway actually runs at 125 kHz
+    (RACELINK_BW_KHZ in RaceLink_Gateway/src/main.cpp). Halving BW
+    doubles Tsym, so airtime scaled 2x. Bounds were widened accordingly.
+    """
 
     def test_active_lora_parameters_are_the_defaults(self):
         # Sanity: the test expectations below assume the default profile.
         self.assertEqual(LORA_SF, 7)
-        self.assertEqual(LORA_BW_HZ, 250_000)
+        self.assertEqual(LORA_BW_HZ, 125_000)
 
     def test_airtime_for_small_payload_is_in_expected_range(self):
-        # 14-byte payload (Header7 + ~7 B body) at SF7/250 kHz/CR4:5 with
-        # 8-symbol preamble + explicit header + CRC ≈ 16-22 ms.
+        # 14-byte payload (Header7 + ~7 B body) at SF7/125 kHz/CR4:5 with
+        # 8-symbol preamble + explicit header + CRC ≈ 32-50 ms (was
+        # 16-22 ms at the old 250 kHz value).
         t = lora_airtime_ms(14)
-        self.assertGreater(t, 12.0)
-        self.assertLess(t, 25.0)
+        self.assertGreater(t, 30.0)
+        self.assertLess(t, 55.0)
 
     def test_airtime_for_22b_full_control_body(self):
         # 22 B (worst-case OPC_CONTROL body) + 7 B header = 29 B PHY
         # payload. Reference: Semtech online airtime calculator at SF7/
-        # BW250/CR4:5/8-sym preamble/explicit header/CRC ≈ 30 ms.
+        # BW125/CR4:5/8-sym preamble/explicit header/CRC ≈ 60 ms (was
+        # ~30 ms at the old 250 kHz value).
         t = lora_airtime_ms(29)
-        self.assertGreater(t, 25.0)
-        self.assertLess(t, 35.0)
+        self.assertGreater(t, 55.0)
+        self.assertLess(t, 75.0)
 
     def test_airtime_grows_with_payload(self):
         for n in (4, 8, 16, 32, 64):
@@ -70,6 +78,93 @@ class LoRaAirtimeTests(unittest.TestCase):
         self.assertIn("cr", params)
         self.assertEqual(params["sf"], LORA_SF)
         self.assertEqual(params["bw_hz"], LORA_BW_HZ)
+        # Frontend tooltip uses this to render "+12 ms/pkt USB+gateway
+        # overhead" — make sure the schema surfaces the constant.
+        self.assertIn("wire_overhead_ms_per_packet", params)
+        self.assertEqual(params["wire_overhead_ms_per_packet"], WIRE_OVERHEAD_MS_PER_PACKET)
+
+
+class WallClockOverheadTests(unittest.TestCase):
+    """Wall-clock prediction adds per-packet USB/gateway overhead on top of
+    LoRa airtime so the cost-badge ``≈ NN ms`` matches the runner's measured
+    ``actual:`` within a few ms.
+
+    Calibration data behind WIRE_OVERHEAD_MS_PER_PACKET = 12.0 (post-Batch-B
+    gateway optimisations, 2026-04-29):
+
+    * 1 pkt 30 B: 67 ms airtime + 12 ms = 79 ms predicted; observed 78-81 ms.
+    * 4 pkts 86 B (offset_group): 216 ms airtime + 4 × 12 = 264 ms; observed
+      263-267 ms.
+
+    These tests pin the formula. Recalibrate WIRE_OVERHEAD_MS_PER_PACKET when
+    the wire path changes (e.g. if the gateway moves to native USB-CDC).
+    """
+
+    def test_wire_overhead_constant_is_calibrated(self):
+        # Pin the calibration constant. If a future tweak bumps it, the
+        # next reviewer should be aware that the change ripples through
+        # every cost-badge prediction. Adjust this value when (and only
+        # when) the per-packet wire path measurably changes.
+        self.assertEqual(WIRE_OVERHEAD_MS_PER_PACKET, 12.0)
+
+    def test_single_packet_wall_clock_equals_airtime_plus_overhead(self):
+        cost = estimate_action({"kind": KIND_SYNC})
+        # 4 B body + 7 B header = 11 B PHY → airtime is whatever the
+        # Semtech formula yields. wall_clock_ms must be exactly that
+        # plus one per-packet overhead (one packet sent).
+        expected_wall_clock = cost.airtime_ms + WIRE_OVERHEAD_MS_PER_PACKET
+        self.assertAlmostEqual(cost.wall_clock_ms, expected_wall_clock, places=6)
+
+    def test_wall_clock_scales_with_packet_count(self):
+        # An offset_group with two participating groups + one WLED preset
+        # child fans out to 2 OPC_OFFSET (Phase 1) + 1 OPC_PRESET child
+        # = 3 packets. Every packet contributes one overhead increment.
+        cost = estimate_action({
+            "kind": KIND_OFFSET_GROUP,
+            "groups": [1, 2],
+            "offset": {"mode": "explicit", "offset_ms": 100},
+            "actions": [
+                {"kind": KIND_WLED_PRESET,
+                 "target": {"kind": "group", "value": 1},
+                 "params": {"presetId": 7, "brightness": 128}},
+            ],
+        })
+        self.assertGreater(cost.packets, 0)
+        expected_overhead = cost.packets * WIRE_OVERHEAD_MS_PER_PACKET
+        self.assertAlmostEqual(
+            cost.wall_clock_ms - cost.airtime_ms,
+            expected_overhead,
+            places=6,
+            msg="wall_clock_ms must be airtime + (packets * per-packet overhead)",
+        )
+
+    def test_delay_action_wall_clock_equals_duration_no_overhead(self):
+        # KIND_DELAY sends no packet — wall_clock must equal duration_ms,
+        # NOT duration_ms + overhead (there's nothing to "send").
+        cost = estimate_action({"kind": KIND_DELAY, "duration_ms": 500})
+        self.assertEqual(cost.packets, 0)
+        self.assertEqual(cost.airtime_ms, 500.0)
+        self.assertEqual(cost.wall_clock_ms, 500.0)
+
+    def test_scene_total_wall_clock_is_sum_of_per_action(self):
+        # Two SYNCs + one DELAY: scene total wall_clock should equal the
+        # sum of individual per-action wall_clock values (no inter-action
+        # surcharge in this iteration).
+        scene = {"actions": [
+            {"kind": KIND_SYNC},
+            {"kind": KIND_DELAY, "duration_ms": 100},
+            {"kind": KIND_SYNC},
+        ]}
+        result = estimate_scene(scene)
+        expected_total = sum(a.wall_clock_ms for a in result.per_action)
+        self.assertAlmostEqual(result.total.wall_clock_ms, expected_total, places=6)
+        # Sanity: total wall_clock includes the DELAY's full duration AND
+        # the two SYNCs' overhead.
+        self.assertGreater(result.total.wall_clock_ms, 100.0)
+        self.assertGreaterEqual(
+            result.total.wall_clock_ms,
+            result.total.airtime_ms + 2 * WIRE_OVERHEAD_MS_PER_PACKET - 0.001,
+        )
 
 
 class ActionCostTests(unittest.TestCase):

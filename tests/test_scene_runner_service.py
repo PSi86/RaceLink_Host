@@ -89,8 +89,13 @@ class _RecordingSyncService:
     def __init__(self):
         self.sync_calls = []
 
-    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
-        self.sync_calls.append({"ts24": ts24, "brightness": brightness, "recv3": recv3})
+    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed=False):
+        self.sync_calls.append({
+            "ts24": ts24,
+            "brightness": brightness,
+            "recv3": recv3,
+            "trigger_armed": trigger_armed,
+        })
 
 
 class _StubRlPresets:
@@ -308,6 +313,11 @@ class SceneRunnerDispatchTests(_SceneFixture):
         # ts24 = lower 24 bits of clock_ms()
         self.assertEqual(sync.sync_calls[0]["ts24"], 12345678 & 0xFFFFFF)
         self.assertEqual(sync.sync_calls[0]["brightness"], 0)
+        # Scene runner's deliberate sync MUST set trigger_armed=True so the
+        # device materialises any pending arm-on-sync state. Without this,
+        # scenes silently stop firing armed effects under the new SYNC
+        # protocol — this assertion is the regression guard.
+        self.assertTrue(sync.sync_calls[0]["trigger_armed"])
 
     def test_delay_action_blocks_via_sleep_helper(self):
         self.scenes.create(label="D", actions=[{"kind": KIND_DELAY, "duration_ms": 750}])
@@ -350,6 +360,10 @@ class SceneRunnerDispatchTests(_SceneFixture):
                          [KIND_RL_PRESET, KIND_RL_PRESET, KIND_SYNC, KIND_DELAY, KIND_WLED_PRESET])
 
     def test_failed_action_does_not_abort_subsequent_actions(self):
+        """Legacy "play through every action" semantic is opt-in via
+        ``stop_on_error=False`` per scene (Batch A, 2026-04-28). With
+        the new default ``True``, this scene would abort at action #2;
+        the test pins the opt-out path."""
         # Make wled_control fail; preceding wled_preset and following sync still run.
         self.scenes.create(label="X", actions=[
             {"kind": KIND_WLED_PRESET, "target": {"kind": "group", "value": 1},
@@ -357,12 +371,13 @@ class SceneRunnerDispatchTests(_SceneFixture):
             {"kind": KIND_WLED_CONTROL, "target": {"kind": "group", "value": 2},
              "params": {"mode": 5}},
             {"kind": KIND_SYNC},
-        ])
+        ], stop_on_error=False)
         ctrl = _RecordingControlService(fail_kinds={"wled_control"})
         sync = _RecordingSyncService()
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl, sync_service=sync)
         result = runner.run("x")
         self.assertFalse(result.ok)
+        self.assertIsNone(result.aborted_at_index)
         self.assertTrue(result.actions[0].ok)
         self.assertFalse(result.actions[1].ok)
         self.assertTrue(result.actions[2].ok)
@@ -405,6 +420,83 @@ class SceneRunnerLookupTests(_SceneFixture):
         self.assertTrue(result.ok)
 
 
+class SceneRunnerEphemeralSceneTests(_SceneFixture):
+    """When ``run`` is called with ``scene=<dict>``, the runner must execute
+    that dict and never read from storage — this is the path the editor
+    uses so clicking Run does not overwrite the saved scene under the
+    same key.
+    """
+
+    def test_run_with_dict_uses_supplied_actions_not_storage(self):
+        # Stored scene has a single SYNC action; the supplied dict has a
+        # 10ms DELAY. We assert the delay actually executed (presence in
+        # results, kind=delay) and the stored sync did NOT.
+        self.scenes.create(label="Saved", actions=[{"kind": KIND_SYNC}])
+        runner, _ = _make_runner(scenes=self.scenes)
+        ephemeral = {
+            "key": "saved",
+            "label": "draft",
+            "actions": [{"kind": KIND_DELAY, "duration_ms": 10}],
+            "stop_on_error": True,
+        }
+        result = runner.run("saved", scene=ephemeral)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.actions), 1)
+        self.assertEqual(result.actions[0].kind, KIND_DELAY)
+
+    def test_run_with_dict_does_not_consult_storage_for_unknown_key(self):
+        # Empty store, but ``scene`` dict supplied → the ``scene_not_found``
+        # branch must not fire. The runner runs the supplied dict against
+        # a key that has no persisted counterpart.
+        runner, _ = _make_runner(scenes=self.scenes)
+        ephemeral = {
+            "key": "phantom",
+            "label": "draft",
+            "actions": [{"kind": KIND_DELAY, "duration_ms": 1}],
+            "stop_on_error": True,
+        }
+        result = runner.run("phantom", scene=ephemeral)
+        self.assertTrue(result.ok)
+        self.assertNotEqual(result.error, "scene_not_found")
+        self.assertEqual(len(result.actions), 1)
+
+    def test_run_with_dict_broadcasts_using_supplied_key(self):
+        # SSE progress events must use the ``scene_key`` passed to ``run``
+        # (the editor's activeRunKey) — not anything embedded in the dict.
+        self.scenes.create(label="Saved", actions=[{"kind": KIND_SYNC}])
+        runner, _ = _make_runner(scenes=self.scenes)
+        events = []
+        ephemeral = {
+            "key": "ignored_inner_key",
+            "label": "draft",
+            "actions": [{"kind": KIND_DELAY, "duration_ms": 1}],
+            "stop_on_error": True,
+        }
+        runner.run("saved", progress_cb=events.append, scene=ephemeral)
+        self.assertTrue(events)
+        for ev in events:
+            self.assertEqual(ev["scene_key"], "saved")
+
+    def test_run_with_dict_does_not_mutate_saved_scene(self):
+        # Hard rule: clicking Run on a dirty draft must not change anything
+        # on disk. The stored actions stay exactly as the user saved them.
+        self.scenes.create(label="Saved", actions=[
+            {"kind": KIND_SYNC},
+            {"kind": KIND_DELAY, "duration_ms": 5},
+        ])
+        before = list(self.scenes.get("saved")["actions"])
+        runner, _ = _make_runner(scenes=self.scenes)
+        ephemeral = {
+            "key": "saved",
+            "label": "draft",
+            "actions": [{"kind": KIND_DELAY, "duration_ms": 1}],
+            "stop_on_error": True,
+        }
+        runner.run("saved", scene=ephemeral)
+        after = list(self.scenes.get("saved")["actions"])
+        self.assertEqual(before, after)
+
+
 class SceneRunnerProgressCallbackTests(_SceneFixture):
     """R7a: per-action progress events fire before each action runs and again
     on completion with the terminal status. The callback is purely additive
@@ -444,6 +536,8 @@ class SceneRunnerProgressCallbackTests(_SceneFixture):
         # action 0: ok wled_preset
         # action 1: error (forced fail)
         # action 2: degraded (device target not in fixture)
+        # ``stop_on_error=False`` keeps the legacy "play through" semantic
+        # so all three actions emit terminal events (Batch A, 2026-04-28).
         rl = _StubRlPresets([{
             "id": 1, "key": "p", "label": "x", "params": {},
             "flags": {"arm_on_sync": False, "force_tt0": False, "force_reapply": False, "offset_mode": False},
@@ -455,7 +549,7 @@ class SceneRunnerProgressCallbackTests(_SceneFixture):
              "params": {"mode": 5}},
             {"kind": KIND_RL_PRESET, "target": {"kind": "device", "value": "AABBCCDDEEFF"},
              "params": {"presetId": "p"}},
-        ])
+        ], stop_on_error=False)
         ctrl = _RecordingControlService(fail_kinds={"wled_control"})
         events = []
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl, rl_presets=rl, devices=[])
@@ -810,6 +904,94 @@ class OffsetGroupContainerTests(_SceneFixture):
         runner.run("c")
         self.assertEqual(sync.sync_calls, [])
 
+    def test_offset_group_mode_none_sends_children_with_offset_mode_false(self):
+        """Option C (2026-04-30): when ``offset.mode == "none"``, the
+        runner must NOT force ``offset_mode=True`` on children. Pre-fix
+        the runner forced True unconditionally, which combined with the
+        firmware's strict gate caused every child to be dropped (F=1 +
+        eff.mode=NONE → drop). Post-fix the children fly with F=0 and
+        the relaxed gate accepts them, giving "clear AND play" behaviour."""
+        self.scenes.create(label="ClearAndPlay", actions=[
+            self._container(
+                groups="all",
+                offset={"mode": "none"},
+                children=[{
+                    "kind": "wled_control",
+                    "target": {"kind": "scope"},
+                    "params": {"mode": 0, "brightness": 100},
+                }],
+            ),
+        ])
+        ctrl = _RecordingControlService()
+        runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl)
+        result = runner.run("clearandplay")
+
+        self.assertTrue(result.ok)
+        # The Phase-1 OPC_OFFSET(NONE) packet still fires — that's what
+        # tells the devices to clear pending.
+        self.assertEqual(len(ctrl.offset_calls), 1)
+        self.assertEqual(ctrl.offset_calls[0]["mode"], "none")
+        # The Phase-2 child fires with offset_mode=False so the relaxed
+        # gate (F=0 always-accept) lets it through on devices that just
+        # had their offset cleared. ``_merge_flags_into_params`` strips
+        # False flags from the params dict, so the key is absent (rather
+        # than present with value False) when the flag is off.
+        self.assertEqual(len(ctrl.control_calls), 1)
+        self.assertFalse(
+            ctrl.control_calls[0]["params"].get("offset_mode", False),
+            "mode='none' must not force offset_mode flag on children",
+        )
+
+    def test_offset_group_mode_none_overrides_child_flags_override_true(self):
+        """Even if a child explicitly sets ``offset_mode: True`` in its
+        flags_override, the parent's mode=none decision wins. Otherwise
+        the gate would still drop the child."""
+        self.scenes.create(label="ClearOverride", actions=[
+            self._container(
+                groups="all",
+                offset={"mode": "none"},
+                children=[{
+                    "kind": "wled_control",
+                    "target": {"kind": "scope"},
+                    "params": {"mode": 0},
+                    "flags_override": {"offset_mode": True, "arm_on_sync": True},
+                }],
+            ),
+        ])
+        ctrl = _RecordingControlService()
+        runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl)
+        runner.run("clearoverride")
+        self.assertEqual(len(ctrl.control_calls), 1)
+        self.assertFalse(ctrl.control_calls[0]["params"].get("offset_mode", False))
+        # arm_on_sync override still passes through — only offset_mode is
+        # decided by the parent.
+        self.assertTrue(ctrl.control_calls[0]["params"]["arm_on_sync"])
+
+    def test_offset_group_mode_linear_still_forces_offset_mode_true(self):
+        """Regression: non-none modes continue to force offset_mode=True
+        on every child. The Option C fix is mode-conditional, not a
+        blanket removal of the force-flag."""
+        self.scenes.create(label="LinearForce", actions=[
+            self._container(
+                groups="all",
+                offset={"mode": "linear", "base_ms": 0, "step_ms": 50},
+                children=[{
+                    "kind": "wled_control",
+                    "target": {"kind": "scope"},
+                    "params": {"mode": 5},
+                    "flags_override": {"offset_mode": False},
+                }],
+            ),
+        ])
+        ctrl = _RecordingControlService()
+        runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl)
+        runner.run("linearforce")
+        self.assertEqual(len(ctrl.control_calls), 1)
+        self.assertTrue(
+            ctrl.control_calls[0]["params"]["offset_mode"],
+            "mode='linear' must still force offset_mode=True on children",
+        )
+
     def test_legacy_groups_offset_target_action_runs_via_migration(self):
         """A legacy ``rl_preset`` action with ``target.kind=groups_offset``
         is migrated to an offset_group container on load and dispatches
@@ -833,6 +1015,165 @@ class OffsetGroupContainerTests(_SceneFixture):
         self.assertEqual(len(ctrl.offset_calls), 1)
         self.assertEqual(ctrl.offset_calls[0]["mode"], "linear")
         self.assertEqual(len(ctrl.control_calls), 1)
+
+
+class StopOnErrorTests(_SceneFixture):
+    """Batch A (2026-04-28): the runner aborts after the first failed
+    action when ``scene.stop_on_error`` is True (the default). When
+    False, it plays through every action regardless of errors. Aborted
+    runs append ``ActionResult(ok=False, error="skipped: aborted")``
+    placeholders for the unrun actions and stamp
+    ``SceneRunResult.aborted_at_index`` so the UI knows where the
+    sequence stopped."""
+
+    def _two_actions_first_fails(self, *, stop_on_error):
+        rl = _StubRlPresets([{
+            "id": 1, "key": "p", "label": "P",
+            "params": {"mode": 1},
+            "flags": {"arm_on_sync": False, "force_tt0": False,
+                      "force_reapply": False, "offset_mode": False},
+        }])
+        # Two RL preset actions; the first targets a "fail" group
+        # (control service rejects the send), the second is a sibling
+        # action that would otherwise run.
+        self.scenes.create(
+            label="X",
+            actions=[
+                {"kind": KIND_RL_PRESET,
+                 "target": {"kind": "group", "value": 1},
+                 "params": {"presetId": "p"}},
+                {"kind": KIND_SYNC},
+            ],
+            stop_on_error=stop_on_error,
+        )
+        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        runner, _ = _make_runner(
+            scenes=self.scenes, control_service=ctrl, rl_presets=rl,
+        )
+        return runner.run("x"), ctrl
+
+    def test_stop_on_error_true_aborts_after_first_failure(self):
+        result, ctrl = self._two_actions_first_fails(stop_on_error=True)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.aborted_at_index, 0)
+        # Both action results present; the second is a skipped
+        # placeholder.
+        self.assertEqual(len(result.actions), 2)
+        self.assertFalse(result.actions[0].ok)
+        self.assertFalse(result.actions[1].ok)
+        self.assertEqual(result.actions[1].error, "skipped: aborted")
+        self.assertEqual(result.actions[1].duration_ms, 0)
+        # The SYNC action's underlying sync_service was NOT called —
+        # the runner short-circuited.
+        # (The recording sync service is implicit via _make_runner's
+        # default; check via the recorded calls indirectly by asserting
+        # the placeholder kind matches.)
+        self.assertEqual(result.actions[1].kind, KIND_SYNC)
+
+    def test_stop_on_error_false_plays_through_failure(self):
+        result, ctrl = self._two_actions_first_fails(stop_on_error=False)
+        self.assertFalse(result.ok)  # overall ok is still False
+        self.assertIsNone(result.aborted_at_index)
+        # Both actions ran; second succeeded (SYNC is unconditional).
+        self.assertEqual(len(result.actions), 2)
+        self.assertFalse(result.actions[0].ok)
+        self.assertTrue(result.actions[1].ok)
+
+    def test_stop_on_error_default_is_true(self):
+        """Scenes loaded without an explicit stop_on_error field default
+        True via scenes_service. Verify the runner respects that."""
+        rl = _StubRlPresets([{
+            "id": 1, "key": "p", "label": "P",
+            "params": {"mode": 1},
+            "flags": {"arm_on_sync": False, "force_tt0": False,
+                      "force_reapply": False, "offset_mode": False},
+        }])
+        # create() without stop_on_error — defaults to True.
+        self.scenes.create(
+            label="Default",
+            actions=[
+                {"kind": KIND_RL_PRESET,
+                 "target": {"kind": "group", "value": 1},
+                 "params": {"presetId": "p"}},
+                {"kind": KIND_SYNC},
+            ],
+        )
+        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        runner, _ = _make_runner(
+            scenes=self.scenes, control_service=ctrl, rl_presets=rl,
+        )
+        result = runner.run("default")
+        self.assertEqual(result.aborted_at_index, 0)
+        self.assertEqual(result.actions[1].error, "skipped: aborted")
+
+    def test_degraded_does_not_trigger_abort(self):
+        """A ``degraded`` action (e.g. unknown device target) is not the
+        same as a hard failure. The runner continues past it even with
+        stop_on_error on — degraded is "ran with caveats", not "didn't
+        run"."""
+        rl = _StubRlPresets([{
+            "id": 1, "key": "p", "label": "P",
+            "params": {"mode": 1},
+            "flags": {"arm_on_sync": False, "force_tt0": False,
+                      "force_reapply": False, "offset_mode": False},
+        }])
+        # Device target with an unknown MAC → degraded path.
+        self.scenes.create(
+            label="Deg",
+            actions=[
+                {"kind": KIND_RL_PRESET,
+                 "target": {"kind": "device", "value": "DEADBEEF0000"},
+                 "params": {"presetId": "p"}},
+                {"kind": KIND_SYNC},
+            ],
+            stop_on_error=True,
+        )
+        ctrl = _RecordingControlService()
+        runner, _ = _make_runner(
+            scenes=self.scenes, control_service=ctrl, rl_presets=rl,
+        )
+        result = runner.run("deg")
+        # First action is degraded (target unknown). Second still ran.
+        self.assertTrue(result.actions[0].degraded)
+        self.assertIsNone(result.aborted_at_index)
+        # Second SYNC action ran (would have been skipped on a hard
+        # failure, but degraded passes through).
+        self.assertTrue(result.actions[1].ok)
+
+    def test_aborted_run_emits_skipped_progress_events(self):
+        """The progress_cb receives ``status='skipped'`` for actions
+        that were aborted — used by the SSE bridge to colour rows."""
+        rl = _StubRlPresets([{
+            "id": 1, "key": "p", "label": "P",
+            "params": {"mode": 1},
+            "flags": {"arm_on_sync": False, "force_tt0": False,
+                      "force_reapply": False, "offset_mode": False},
+        }])
+        self.scenes.create(
+            label="Prog",
+            actions=[
+                {"kind": KIND_RL_PRESET,
+                 "target": {"kind": "group", "value": 1},
+                 "params": {"presetId": "p"}},
+                {"kind": KIND_SYNC},
+                {"kind": KIND_DELAY, "duration_ms": 0},
+            ],
+            stop_on_error=True,
+        )
+        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        runner, _ = _make_runner(
+            scenes=self.scenes, control_service=ctrl, rl_presets=rl,
+        )
+        events = []
+        runner.run("prog", progress_cb=events.append)
+        statuses = [(e["index"], e["status"]) for e in events]
+        # First action: running → error.
+        self.assertIn((0, "running"), statuses)
+        self.assertIn((0, "error"), statuses)
+        # Subsequent actions: emit a single 'skipped' event (no
+        # 'running' because they never started).
+        skipped = [s for s in statuses if s[1] == "skipped"]
+        self.assertEqual({s[0] for s in skipped}, {1, 2})
 
 
 if __name__ == "__main__":

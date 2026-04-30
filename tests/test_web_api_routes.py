@@ -140,6 +140,32 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertTrue(options["ok"])
         self.assertEqual(options["presets"], [{"value": "01", "label": "Red"}])
 
+    def test_groups_route_carries_caps_in_group_for_C5_filtering(self):
+        """C5 contract: every row in /api/groups must include
+        ``caps_in_group`` so the scene editor can filter target
+        dropdowns to capable devices.
+
+        The fixture's first device (a startblock node with caps
+        [STARTBLOCK, WLED]) sits in groupId=1; the second device
+        (plain WLED) sits in groupId=2 which the route filters out
+        because the matching group at list-index 2 is the static
+        ``All WLED Nodes`` group. That detail is incidental — what
+        we assert is the cap-counts for the row that *does* hold a
+        device, plus that every row carries the field."""
+        groups = self._route("/api/groups")()
+        self.assertTrue(groups["ok"])
+        rows = {row["id"]: row for row in groups["groups"]}
+
+        # Group at id=1 holds the startblock device (caps WLED+STARTBLOCK).
+        self.assertIn(1, rows)
+        self.assertEqual(rows[1].get("caps_in_group"), {"WLED": 1, "STARTBLOCK": 1})
+
+        # Every row exposes the field — even Unconfigured (id=0) and
+        # empty groups end up with an empty dict, never missing.
+        for row in groups["groups"]:
+            self.assertIn("caps_in_group", row)
+            self.assertIsInstance(row["caps_in_group"], dict)
+
 
 class _RouteValidationContext(_FakeContext):
     """Extends ``_FakeContext`` for routes that validate body fields and
@@ -249,6 +275,44 @@ class GroupsRenameDeleteValidationTests(unittest.TestCase):
         # 200 OK comes back as a plain dict, not a (payload, status) tuple.
         self.assertNotIsInstance(result, tuple, f"unexpected error response: {result}")
         self.assertTrue(result["ok"])
+
+    def test_delete_non_empty_group_moves_devices_to_unconfigured(self):
+        """Feature 1 (2026-04-29): /api/groups/delete now accepts
+        non-empty groups by moving the devices to groupId=0 instead
+        of rejecting. Devices in higher-indexed groups are
+        renumbered down by one to keep the index→group mapping
+        valid after the array shift."""
+        # Fixture has two devices: one in groupId=1, one in groupId=2.
+        # Group at list-index 1 ("Group 2" in the fixture) is
+        # non-static so it can be deleted.
+        ctx = self.ctx
+        # Position the devices: one in the to-be-deleted group, one
+        # in a higher-indexed group so we can verify the renumber.
+        ctx._devices[0].groupId = 1   # will move to 0
+        ctx._devices[1].groupId = 2   # will renumber to 1
+        self._set_body({"id": 1})
+        result = self._post("/api/groups/delete")
+        self.assertNotIsInstance(result, tuple, f"unexpected error: {result}")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["moved_devices"], 1)
+        self.assertEqual(result["renumbered_devices"], 1)
+        # Confirm the in-memory device groupIds reflect the changes.
+        self.assertEqual(int(ctx._devices[0].groupId), 0)
+        self.assertEqual(int(ctx._devices[1].groupId), 1)
+
+    def test_delete_static_group_still_rejected(self):
+        """The static-group guard (e.g. ``All WLED Nodes``) still
+        rejects the deletion. The non-empty change above must not
+        relax that protection."""
+        ctx = self.ctx
+        # The fixture's third group is static_group=1.
+        # In ctx.groups() it sits at index 2.
+        self._set_body({"id": 2})
+        result = self._post("/api/groups/delete")
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 400)
+        self.assertIn("static", payload["error"])
 
 
 class DevicesControlRoutesTests(unittest.TestCase):
@@ -381,6 +445,7 @@ class _FakeSceneRunner:
     def __init__(self, *, ok=True, error=None, actions=None, missing_keys=(),
                  progress_events=None):
         self.calls = []
+        self.scene_args = []  # parallel to ``calls`` — captures the ``scene`` kwarg
         self._ok = ok
         self._error = error
         self._actions = actions or []
@@ -388,14 +453,15 @@ class _FakeSceneRunner:
         self._progress_events = list(progress_events or [])
         self.last_progress_cb = None
 
-    def run(self, key, *, progress_cb=None):
+    def run(self, key, *, progress_cb=None, scene=None):
         from racelink.services.scene_runner_service import SceneRunResult
         self.calls.append(key)
+        self.scene_args.append(scene)
         self.last_progress_cb = progress_cb
-        if key in self._missing_keys:
-            # Match the real runner: scene-not-found short-circuits BEFORE any
-            # progress event fires, so a misdirected POST doesn't leak SSE
-            # noise to other tabs.
+        # When a draft dict is supplied the route bypasses the
+        # ``scene_not_found`` lookup — match that semantics here so the
+        # fake mirrors the real runner's contract.
+        if scene is None and key in self._missing_keys:
             return SceneRunResult(scene_key=key, ok=False, error="scene_not_found")
         if progress_cb is not None:
             for ev in self._progress_events:
@@ -617,6 +683,82 @@ class WebApiScenesRouteTests(unittest.TestCase):
         self.assertIsInstance(result, tuple)
         self.assertEqual(result[1], 404)
         self.assertEqual(result[0]["error"], "scene_not_found")
+
+    # ---- ephemeral-draft run (Run executes the displayed scene without
+    # overwriting the saved one) ----------------------------------------
+
+    def test_run_with_actions_body_passes_dict_to_runner(self):
+        # Persist a baseline scene, then POST run with a body whose actions
+        # differ — the runner must receive the body's actions as ``scene``,
+        # and the persisted scene under the same key must remain unchanged
+        # (only the explicit Save button persists).
+        self._set_body({"label": "X", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        before = self.ctx.services["scenes"].get("x")
+        # Now simulate the editor sending a draft body with a different
+        # action set. The fake runner records the ``scene`` kwarg.
+        self._set_body({
+            "label": "X",
+            "actions": [{"kind": "delay", "duration_ms": 25}],
+            "stop_on_error": False,
+        })
+        self._route("/api/scenes/<key>/run", "POST")("x")
+        # Runner saw the draft as a dict, with canonicalised actions.
+        self.assertEqual(len(self.runner.scene_args), 1)
+        scene_arg = self.runner.scene_args[0]
+        self.assertIsNotNone(scene_arg)
+        self.assertEqual(scene_arg["key"], "x")
+        self.assertEqual(scene_arg["actions"][0]["kind"], "delay")
+        self.assertEqual(scene_arg["actions"][0]["duration_ms"], 25)
+        # stop_on_error from the body wins.
+        self.assertFalse(scene_arg["stop_on_error"])
+        # Storage untouched: the persisted scene still has the SYNC action.
+        after = self.ctx.services["scenes"].get("x")
+        self.assertEqual(before["actions"], after["actions"])
+        self.assertEqual(after["actions"][0]["kind"], "sync")
+
+    def test_run_without_actions_body_uses_storage(self):
+        # Body without an ``actions`` key (or empty body) keeps the legacy
+        # behaviour: runner reads from storage. ``scene`` kwarg stays None.
+        self._set_body({"label": "X", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        self._set_body({})  # explicitly empty
+        self._route("/api/scenes/<key>/run", "POST")("x")
+        self.assertEqual(self.runner.scene_args, [None])
+
+    def test_run_with_actions_body_inherits_saved_stop_on_error(self):
+        # Body without ``stop_on_error`` falls back to the persisted scene's
+        # value so toggling the saved checkbox still influences a draft run
+        # when the operator hasn't touched the box in this session.
+        self._set_body({"label": "X", "actions": [{"kind": "sync"}], "stop_on_error": False})
+        self._route("/api/scenes", "POST")()
+        self._set_body({"actions": [{"kind": "sync"}]})  # no stop_on_error
+        self._route("/api/scenes/<key>/run", "POST")("x")
+        self.assertEqual(len(self.runner.scene_args), 1)
+        self.assertFalse(self.runner.scene_args[0]["stop_on_error"])
+
+    def test_run_with_actions_body_for_unknown_key_runs_anyway(self):
+        # The draft body is the source of truth — the saved scene under
+        # ``key`` may not exist (deleted from another tab mid-edit) and
+        # the run must still proceed against the supplied actions.
+        self._set_body({"actions": [{"kind": "sync"}]})
+        out = self._route("/api/scenes/<key>/run", "POST")("ghost")
+        # Should NOT 404 — the ``scene`` kwarg short-circuits the lookup.
+        self.assertNotIsInstance(out, tuple)
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.runner.calls, ["ghost"])
+        self.assertIsNotNone(self.runner.scene_args[0])
+
+    def test_run_with_invalid_actions_body_returns_400(self):
+        # Validation runs through ``_canonical_actions``; an unknown kind
+        # surfaces as a 400 instead of being silently dispatched.
+        self._set_body({"actions": [{"kind": "nope"}]})
+        out = self._route("/api/scenes/<key>/run", "POST")("x")
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(out[1], 400)
+        self.assertFalse(out[0]["ok"])
+        # Runner never called — validation short-circuits.
+        self.assertEqual(self.runner.calls, [])
 
     # ---- R7 progress wiring -------------------------------------------
 

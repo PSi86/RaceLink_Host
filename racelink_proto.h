@@ -76,7 +76,17 @@ struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                 
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
 struct __attribute__((packed)) P_Preset      { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B (OPC_PRESET; add palette later?)
 struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; uint8_t data1; uint8_t data2; uint8_t data3; }; // 5B
-struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
+// OPC_SYNC body. Wire length is 4B (legacy clock-tick form) or 5B
+// (flag-bearing form). The 5th byte is `flags`; bit 0 =
+// SYNC_FLAG_TRIGGER_ARMED. The device adjusts its timebase on every SYNC
+// regardless of length; pending arm-on-sync state materialises ONLY when
+// the trigger bit is set. Autosync (whether gateway- or host-driven)
+// emits the 4B form so it cannot accidentally fire armed effects ahead of
+// a deliberate sync. RULES[].req_len must be 0 (variable) for OPC_SYNC.
+struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; uint8_t flags; }; // 5B (4B legacy w/o flags) // 24-bit timestamp LSB first + bri + flags
+// SYNC flags. Trigger bit gates pending arm-on-sync materialisation; bit 1
+// reserved for a future HAS_GROUP_MASK extension carrying selective fire.
+static const uint8_t SYNC_FLAG_TRIGGER_ARMED = 0x01;
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
 // OPC_OFFSET (Master -> Node, RESP_NONE) — variable-length 2..7 B body.
 // First two bytes are always present:
@@ -93,10 +103,26 @@ struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];   
 // SYNC handler's deferred-apply path. A subsequent OPC_OFFSET cannot
 // retroactively shift an already-armed effect.
 //
-// Acceptance gate: a packet with OFFSET_MODE flag is accepted only when
-// the receiver's effective config has mode != NONE; vice versa for the
-// flag = 0 case. This is what makes a single broadcast OPC_CONTROL with
-// OFFSET_MODE=1 reach exactly the offset-configured devices.
+// Acceptance gate (strict symmetric, 2026-04-30):
+//   The packet's OFFSET_MODE flag MUST match the receiver's effective
+//   offset state. Both directions strict:
+//     * F=1 + E=1 -> ACCEPT (use stored offset)
+//     * F=0 + E=0 -> ACCEPT (normal immediate apply)
+//     * F=1 + E=0 -> DROP   (use-offset request without configured offset)
+//     * F=0 + E=1 -> DROP   (the device "stays in offset mode" until
+//                            OPC_OFFSET(NONE) + materialisation transitions
+//                            it out)
+//   State transitions between "in offset mode" and "not in offset mode"
+//   happen ONLY via OPC_OFFSET. CONTROL/PRESET packets dispatch effects
+//   within the current state; they never transition the device's offset
+//   configuration. The strict gate also gives Strategy A its broadcast
+//   targeting: a single OPC_CONTROL with F=1 lands on exactly the
+//   offset-configured devices.
+// To leave offset mode the operator sends OPC_OFFSET(NONE) (sets
+// pending=NONE so subsequent F=0 packets accept) followed by a
+// materialisation event (OPC_PRESET, or ARM_ON_SYNC OPC_CONTROL with
+// F=0 followed by OPC_SYNC). The scene_runner's ``offset_group(mode=none)``
+// container performs both steps in one operator action.
 //
 // Variable length is signalled by req_len=0 in the rules table (same as
 // OPC_CONTROL); body bounds are enforced in the receiver based on mode.
@@ -116,6 +142,64 @@ enum OffsetMode : uint8_t {
 // only for buffer sizing; the actual length is mode-driven.
 static const uint8_t MAX_P_OFFSET = 7;
 static_assert(MAX_P_OFFSET <= BODY_MAX, "MAX_P_OFFSET exceeds BODY_MAX");
+
+// -------------------- Gateway USB events + commands (Master <-> Host) --------------------
+// These constants do NOT travel over LoRa. They are USB-only event types
+// emitted by the gateway firmware to the host (and command bytes from
+// host to gateway) over the [0x00][LEN][TYPE][DATA] USB framing.
+// They live in this shared header so the firmware and the host transport
+// (racelink/transport/gateway_events.py) can never drift on the byte
+// values — the same drift test that pins the wire protocol pins these.
+//
+// Gateway state-machine refactor (Batch B, 2026-04-28):
+//   * EV_RX_WINDOW_OPEN (0xF1)  -> repurposed as EV_STATE_CHANGED.
+//   * EV_RX_WINDOW_CLOSED (0xF2) -> retired; subsumed by EV_STATE_CHANGED(IDLE).
+//   * EV_IDLE (0xF4)             -> repurposed as EV_TX_REJECTED.
+//   * EV_STATE_REPORT (0xF5)     -> new; reply to GW_CMD_STATE_REQUEST.
+//   * GW_CMD_STATE_REQUEST       -> new; host asks gateway for current state.
+// The wire-vocabulary table in docs/PROTOCOL.md mirrors this set.
+static const uint8_t EV_ERROR         = 0xF0;  // body: UTF-8 reason or reason code(s)
+static const uint8_t EV_STATE_CHANGED = 0xF1;  // body: [state_byte, [metadata...]]
+// 0xF2 retired (was EV_RX_WINDOW_CLOSED); subsumed by EV_STATE_CHANGED(IDLE).
+static const uint8_t EV_TX_DONE       = 0xF3;  // body: 1 byte (last_len; legacy)
+static const uint8_t EV_TX_REJECTED   = 0xF4;  // body: [type_full, reason_byte]
+static const uint8_t EV_STATE_REPORT  = 0xF5;  // body: [state_byte, [metadata...]]
+
+// Gateway state machine bytes carried inside EV_STATE_CHANGED /
+// EV_STATE_REPORT body[0]. The state set depends on the gateway's
+// default RX mode at boot:
+//   * setDefaultRxContinuous (current setup): IDLE / TX / RX_WINDOW / ERROR.
+//     IDLE means "in continuous RX, ready for the next host TX".
+//   * setDefaultRxNone: RX / TX / RX_WINDOW / ERROR. RX means "actively
+//     receiving"; there is no resting "doing nothing" state.
+// The two sets are mutually exclusive at runtime (the gateway picks one
+// at boot based on its mode and uses only that subset).
+enum GatewayState : uint8_t {
+  GW_STATE_IDLE      = 0x00,  // continuous RX, ready
+  GW_STATE_TX        = 0x01,  // transmitting
+  GW_STATE_RX_WINDOW = 0x02,  // bounded RX window open; metadata = uint16 min_ms LE
+  GW_STATE_RX        = 0x03,  // active receive only (setDefaultRxNone mode)
+  GW_STATE_ERROR     = 0xFE,  // fault; metadata = reason byte(s) or empty
+};
+
+// EV_TX_REJECTED reason codes carried in body[1]. body[0] echoes the
+// rejected packet's type_full so the host can match the NACK to the
+// offending send. The reason set is small on purpose — most rejections
+// are txPending (single-slot scheduler busy); the others guard against
+// host-side framing bugs.
+static const uint8_t TX_REJECT_TXPENDING = 0x01;  // gateway already transmitting
+static const uint8_t TX_REJECT_OVERSIZE  = 0x02;  // body too large for txBuf
+static const uint8_t TX_REJECT_ZEROLEN   = 0x03;  // body empty / zero-length
+static const uint8_t TX_REJECT_UNKNOWN   = 0xFF;
+
+// Host -> Gateway USB-only command bytes (NOT LoRa opcodes). Sent as the
+// TYPE byte in the [0x00][LEN][TYPE][DATA] framing. Gateway dispatches
+// these in handleCommand() ahead of the wire-protocol DIR_M2N branch.
+//
+// IDENTIFY is the legacy port-discovery ping; STATE_REQUEST is the new
+// (Batch B) gateway-state query that replies via EV_STATE_REPORT.
+static const uint8_t GW_CMD_IDENTIFY      = 0x01;  // 1-byte payload [0x01]
+static const uint8_t GW_CMD_STATE_REQUEST = 0x7F;  // 1-byte payload [0x7F] -> EV_STATE_REPORT
 
 // -------------------- P_Control (variable-length, 3..21 B) --------------------
 // Master -> Node, OPC_CONTROL. Direct effect-parameter packet (pre-rename:
@@ -222,8 +306,10 @@ static constexpr PacketRule RULES[] = {
   { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           0 /*variable*/,      0,                     "CONTROL" },
   // CONFIG (M2N, 5B) -> ACK
   { OPC_CONFIG,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Config>(),      SZ<P_Ack>(),           "CONFIG" },
-  // OPC_SYNC: SYNC (M2N, 4B) -> no response
-  { OPC_SYNC,       DIR_M2N, RESP_NONE,     0,           SZ<P_Sync>(),        0,                     "SYNC" },
+  // OPC_SYNC: SYNC (M2N, variable 4..5B) -> no response.
+  // req_len = 0 signals variable length; legacy 4B form has no flags byte
+  // (clock-tick only), 5B form carries SYNC_FLAG_* in the trailing byte.
+  { OPC_SYNC,       DIR_M2N, RESP_NONE,     0,           0 /*variable*/,      0,                     "SYNC" },
   // OPC_OFFSET: variable-length offset config (M2N, 2..7B) -> no response.
   // req_len = 0 signals variable length; receiver decodes mode-specific
   // payload sizing — see OffsetMode enum above.

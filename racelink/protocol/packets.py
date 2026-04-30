@@ -31,9 +31,27 @@ def build_config_body(option: int = 0, data0: int = 0, data1: int = 0, data2: in
     return struct.pack("<BBBBB", int(option) & 0xFF, int(data0) & 0xFF, int(data1) & 0xFF, int(data2) & 0xFF, int(data3) & 0xFF)
 
 
-def build_sync_body(ts24: int = 0, brightness: int = 0) -> bytes:
+# OPC_SYNC flags. Mirrors ``SYNC_FLAG_TRIGGER_ARMED`` in ``racelink_proto.h``.
+# Bit 0 gates pending arm-on-sync materialisation device-side; without it,
+# OPC_SYNC only adjusts the device timebase. Autosync (gateway- or
+# host-driven) MUST emit the 4-byte legacy form (flags omitted) so it
+# never accidentally fires armed effects ahead of a deliberate sync.
+SYNC_FLAG_TRIGGER_ARMED = 0x01
+
+
+def build_sync_body(ts24: int = 0, brightness: int = 0, flags: int = 0) -> bytes:
+    """Serialize an OPC_SYNC body. 4 B legacy when ``flags == 0`` (clock
+    tick), 5 B with the trailing flags byte otherwise. Device firmware
+    has ``req_len = 0`` for OPC_SYNC so both lengths are accepted; old
+    firmware that still has ``req_len = 4`` will reject the 5 B form —
+    do not deploy a new host against unflashed nodes.
+    """
     ts = int(ts24) & 0xFFFFFF
-    return bytes([(ts & 0xFF), ((ts >> 8) & 0xFF), ((ts >> 16) & 0xFF), (int(brightness) & 0xFF)])
+    base = bytes([(ts & 0xFF), ((ts >> 8) & 0xFF), ((ts >> 16) & 0xFF), (int(brightness) & 0xFF)])
+    f = int(flags) & 0xFF
+    if f == 0:
+        return base
+    return base + bytes([f])
 
 
 # OPC_OFFSET modes — mirrors the OffsetMode enum in racelink_proto.h.

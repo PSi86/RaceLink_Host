@@ -7,7 +7,14 @@ import struct
 from . import rules
 
 
-def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rssi: int, host_snr: int, rx_windows: int) -> dict:
+def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rssi: int, host_snr: int) -> dict:
+    # Batch B (2026-04-28) dropped the ``rx_windows`` parameter. Pre-Batch-B
+    # the host derived an open/close counter from EV_RX_WINDOW_OPEN/CLOSED
+    # and threaded it through every parsed reply event. The v4 redesign
+    # collapsed those events into EV_STATE_CHANGED (with a state byte),
+    # so the counter no longer exists; consumers that need to know whether
+    # the gateway has a window open should read the gateway-state mirror
+    # (transport.gateway_state_byte / GATEWAY_STATE_RX_WINDOW).
     hdr = data[:7]
     body = data[7:-3]
     sender3 = bytes(hdr[0:3])
@@ -23,7 +30,6 @@ def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rss
         "host_rssi": host_rssi,
         "host_snr": host_snr,
         "ts": timestamp,
-        "rx_windows": rx_windows,
     }
 
     if opc == 0x01:

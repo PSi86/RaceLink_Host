@@ -122,6 +122,77 @@ class SceneServiceCrudTests(unittest.TestCase):
         self.assertEqual(a["id"], 0)
         self.assertEqual(b["id"], 1)  # not recycled
 
+    def test_create_default_stop_on_error_is_true(self):
+        """Batch A (2026-04-28): default value of stop_on_error.
+
+        The runner aborts a sequence on first failure under this default
+        — the safer behaviour when a half-failed scene would otherwise
+        burn air-time on packets that can't reach the intended state."""
+        scene = self.svc.create(label="Default", actions=[])
+        self.assertTrue(scene["stop_on_error"])
+        # And persisted on disk.
+        with open(self.path) as fh:
+            data = json.load(fh)
+        self.assertTrue(data["scenes"][0]["stop_on_error"])
+
+    def test_create_explicit_stop_on_error_false_persists(self):
+        scene = self.svc.create(label="Loose", actions=[], stop_on_error=False)
+        self.assertFalse(scene["stop_on_error"])
+        # Round-trips through reload.
+        reloaded = SceneService(storage_path=self.path).get("loose")
+        self.assertFalse(reloaded["stop_on_error"])
+
+    def test_legacy_scene_without_field_loads_with_default_true(self):
+        """Backward-compat: a scene file written before stop_on_error
+        existed loads with the safer default. No migration needed."""
+        legacy_payload = {
+            "schema_version": 1,
+            "next_id": 1,
+            "scenes": [{
+                "id": 0,
+                "key": "old",
+                "label": "Old",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:00Z",
+                "actions": [],
+                # stop_on_error intentionally omitted
+            }],
+        }
+        with open(self.path, "w") as fh:
+            json.dump(legacy_payload, fh)
+        svc = SceneService(storage_path=self.path)
+        self.assertTrue(svc.get("old")["stop_on_error"])
+
+    def test_update_can_toggle_stop_on_error(self):
+        self.svc.create(label="Toggle", actions=[])
+        updated = self.svc.update("toggle", stop_on_error=False)
+        self.assertFalse(updated["stop_on_error"])
+        # Survives reload.
+        reloaded = SceneService(storage_path=self.path).get("toggle")
+        self.assertFalse(reloaded["stop_on_error"])
+
+    def test_update_preserves_stop_on_error_when_not_passed(self):
+        self.svc.create(label="Keep", actions=[], stop_on_error=False)
+        updated = self.svc.update("keep", label="Keep v2")
+        self.assertFalse(updated["stop_on_error"])
+        self.assertEqual(updated["label"], "Keep v2")
+
+    def test_duplicate_carries_stop_on_error_value(self):
+        self.svc.create(label="Source", actions=[], stop_on_error=False)
+        dup = self.svc.duplicate("source")
+        self.assertFalse(dup["stop_on_error"])
+
+    def test_create_coerces_stop_on_error_string_forms(self):
+        """The frontend round-trips ``stop_on_error`` as a JSON bool, but
+        legacy / hand-edited scenes might carry stringy forms — handle
+        them defensively."""
+        a = self.svc.create(label="A", actions=[], stop_on_error="false")
+        b = self.svc.create(label="B", actions=[], stop_on_error="0")
+        c = self.svc.create(label="C", actions=[], stop_on_error="yes")
+        self.assertFalse(a["stop_on_error"])
+        self.assertFalse(b["stop_on_error"])
+        self.assertTrue(c["stop_on_error"])
+
 
 class SceneServiceValidationTests(unittest.TestCase):
     def setUp(self):
@@ -641,6 +712,165 @@ class SceneServicePersistenceTests(unittest.TestCase):
             fh.write("not a JSON document {{")
         svc = SceneService(storage_path=self.path)
         self.assertEqual(svc.list(), [])
+
+
+class RenumberGroupReferencesTests(unittest.TestCase):
+    """Group-deletion path: ``SceneService.renumber_group_references``
+    rewrites every persisted scene's group references after the API
+    deletes the group at index ``deleted_gid``.
+
+    Shift contract:
+      * value == deleted_gid → 0 (collapse to Unconfigured)
+      * value >  deleted_gid → value - 1
+      * value <  deleted_gid → unchanged
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "scenes.json")
+        self.svc = SceneService(storage_path=self.path)
+
+    def test_no_op_when_no_scene_references_deleted_group(self):
+        self.svc.create(
+            label="A", actions=[_rl_preset_action(group_id=5)],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=2)
+        self.assertEqual(changed, 1)  # group 5 shifted to 4
+        self.assertEqual(self.svc.list()[0]["actions"][0]["target"]["value"], 4)
+
+    def test_top_level_target_collapses_when_id_matches(self):
+        self.svc.create(label="A", actions=[_rl_preset_action(group_id=3)])
+        changed = self.svc.renumber_group_references(deleted_gid=3)
+        self.assertEqual(changed, 1)
+        self.assertEqual(self.svc.list()[0]["actions"][0]["target"]["value"], 0)
+
+    def test_lower_indexed_target_stays_unchanged(self):
+        self.svc.create(label="A", actions=[_rl_preset_action(group_id=1)])
+        changed = self.svc.renumber_group_references(deleted_gid=5)
+        # Lower id is unchanged → no rewrite needed → changed count is 0.
+        self.assertEqual(changed, 0)
+        self.assertEqual(self.svc.list()[0]["actions"][0]["target"]["value"], 1)
+
+    def test_offset_group_groups_list_shifts(self):
+        self.svc.create(
+            label="A",
+            actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": [1, 3, 5],
+                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                "actions": [],
+            }],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=3)
+        self.assertEqual(changed, 1)
+        scene = self.svc.list()[0]
+        # 1 stays, 3 collapses to 0, 5 shifts to 4. Stored order is
+        # canonical (sorted) — the validator sorts the groups list.
+        self.assertEqual(scene["actions"][0]["groups"], [0, 1, 4])
+
+    def test_offset_group_groups_list_dedupes_after_collapse(self):
+        """If ``deleted_gid == 1`` and the list is ``[0, 1, 2]``, the
+        rewrite produces ``[0, 0, 1]``. Duplicate ``0`` is collapsed
+        so the on-disk list stays canonical."""
+        self.svc.create(
+            label="A",
+            actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": [0, 1, 2],
+                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                "actions": [],
+            }],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=1)
+        self.assertEqual(changed, 1)
+        self.assertEqual(self.svc.list()[0]["actions"][0]["groups"], [0, 1])
+
+    def test_offset_group_all_passes_through(self):
+        """``groups: 'all'`` is dynamic — it doesn't tie to specific
+        ids and should pass unchanged. The action's children may
+        still need rewriting though."""
+        self.svc.create(
+            label="A",
+            actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": "all",
+                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                "actions": [],
+            }],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=2)
+        self.assertEqual(changed, 0)
+        self.assertEqual(self.svc.list()[0]["actions"][0]["groups"], "all")
+
+    def test_offset_group_child_target_shifts(self):
+        self.svc.create(
+            label="A",
+            actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": [3, 5],
+                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                "actions": [
+                    {
+                        "kind": KIND_WLED_PRESET,
+                        "target": {"kind": "group", "value": 5},
+                        "params": {"presetId": 1, "brightness": 100},
+                    },
+                ],
+            }],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=3)
+        self.assertEqual(changed, 1)
+        scene = self.svc.list()[0]
+        # Both the parent groups list and the child target are
+        # rewritten; the parent list is canonicalised to sorted.
+        self.assertEqual(scene["actions"][0]["groups"], [0, 4])
+        self.assertEqual(scene["actions"][0]["actions"][0]["target"]["value"], 4)
+
+    def test_explicit_offset_values_shift_and_dedupe(self):
+        self.svc.create(
+            label="A",
+            actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": [3, 5],
+                "offset": {
+                    "mode": "explicit",
+                    "values": [
+                        {"id": 3, "offset_ms": 100},
+                        {"id": 5, "offset_ms": 250},
+                    ],
+                },
+                "actions": [],
+            }],
+        )
+        changed = self.svc.renumber_group_references(deleted_gid=3)
+        self.assertEqual(changed, 1)
+        scene = self.svc.list()[0]
+        # id=3 collapses to 0, id=5 shifts to 4.
+        self.assertEqual(
+            scene["actions"][0]["offset"]["values"],
+            [{"id": 0, "offset_ms": 100}, {"id": 4, "offset_ms": 250}],
+        )
+
+    def test_multiple_scenes_only_changed_count_returned(self):
+        # Scene A: references group 5 → will rewrite.
+        self.svc.create(label="A", actions=[_rl_preset_action(group_id=5)])
+        # Scene B: references group 1 (below deleted_gid=3) → no change.
+        self.svc.create(label="B", actions=[_rl_preset_action(group_id=1)])
+        changed = self.svc.renumber_group_references(deleted_gid=3)
+        self.assertEqual(changed, 1)
+        scenes = {s["label"]: s for s in self.svc.list()}
+        self.assertEqual(scenes["A"]["actions"][0]["target"]["value"], 4)
+        self.assertEqual(scenes["B"]["actions"][0]["target"]["value"], 1)
+
+    def test_persistence_round_trips_renumbered_state(self):
+        """A delete + reload cycle must show the renumbered values
+        on disk, not just in memory."""
+        self.svc.create(label="A", actions=[_rl_preset_action(group_id=5)])
+        self.svc.renumber_group_references(deleted_gid=3)
+        # Fresh service loads from disk.
+        svc2 = SceneService(storage_path=self.path)
+        self.assertEqual(svc2.list()[0]["actions"][0]["target"]["value"], 4)
 
 
 if __name__ == "__main__":

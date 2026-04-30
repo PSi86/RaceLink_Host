@@ -1,4 +1,25 @@
-"""Helpers for resolving and validating specials metadata and actions."""
+"""Resolution + validation for "specials" — per-capability options.
+
+Specials are the per-device-type configuration knobs operators
+expose in the Device Options dialog (e.g. WLED specials for LED
+nodes, Startblock specials for starting-block hardware). The
+service resolves an operator-facing key (``"wled.brightness"``)
+to its target device-type, validates the value against the
+spec's bounds, and exposes the schema to the WebUI.
+
+Public API:
+
+* ``get_serialized_config()`` — dump the full spec to JSON for
+  the editor schema endpoint.
+* ``resolve_option(dev, key)`` — given a device + a key, return
+  the matching option metadata (None if the key doesn't apply
+  to that device's caps).
+* ``resolve_function(dev, key)`` — same but for action-style
+  specials (the "Refresh" / "Calibrate" buttons in the dialog).
+
+Threading: pure read-only helpers, no shared mutable state.
+Safe to call from any thread.
+"""
 
 from __future__ import annotations
 

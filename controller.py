@@ -585,10 +585,20 @@ class RaceLink_Host:
             if origin == "manual":
                 self._notify(self._translate(reason))
         except Exception as ex:
-            # swallow-ok: best-effort fallback; caller proceeds with safe default
-            self._record_gateway_error(reason=str(ex), origin=origin)
+            # swallow-ok: discoverPort surfaces failures via the
+            # gateway-error record (red banner). Include the type so a
+            # rare AttributeError from a renamed method is
+            # distinguishable from the common SerialException path —
+            # historically these all collapsed to ``str(ex)`` and were
+            # indistinguishable in the operator-facing toast.
+            logger.warning(
+                "discoverPort failed: %s", type(ex).__name__, exc_info=True,
+            )
+            self._record_gateway_error(
+                reason=f"{type(ex).__name__}: {ex}", origin=origin,
+            )
             if origin == "manual":
-                self._notify(self._translate("Failed to initialize communicator: {}").format(str(ex)))
+                self._notify(self._translate("Failed to initialize communicator: {}").format(f"{type(ex).__name__}: {ex}"))
 
     def _record_gateway_error(self, *, reason: str, origin: str, code: Optional[str] = None) -> None:
         self.ready = False
@@ -671,6 +681,7 @@ class RaceLink_Host:
 
         timer = threading.Timer(float(delay_s), _fire)
         timer.daemon = True
+        timer.name = "rl-gateway-retry"  # A8: name daemon threads
         self._gateway_retry_timer = timer
         timer.start()
 
@@ -745,6 +756,15 @@ class RaceLink_Host:
             self.save_to_db({}, scopes={state_scope.NONE})
         except Exception:
             logger.exception("RaceLink: error persisting state during shutdown")
+        # A7: release the auto-restore executor so its threads exit.
+        # Best-effort — service may not have been fully wired in some
+        # plugin-loader scenarios.
+        gateway_svc = getattr(self, "gateway_service", None)
+        if gateway_svc is not None:
+            try:
+                gateway_svc.shutdown()
+            except Exception:
+                logger.exception("RaceLink: error shutting down gateway service")
         self.ready = False
 
     def onRaceStart(self, _args) -> None:
@@ -810,9 +830,29 @@ class RaceLink_Host:
             _send()
             return True
 
-        events, _ = self._send_and_wait_for_reply(recv3, LP.OPC_SET_GROUP, _send, timeout_s=8.0)
+        events, _ = self.gateway_service.send_and_wait_with_retries(
+            recv3, LP.OPC_SET_GROUP, _send,
+        )
         if not events:
             logger.warning("No ACK_OK for SET_GROUP to %s (timeout)", targetDevice.addr)
+            # The device didn't ACK within the timeout window — it's
+            # not responding. Reflect that in the online flag so the
+            # WebUI doesn't keep showing a non-responding device as
+            # online. Mirrors the wording used by the auto-restore
+            # path (gateway_service._spawn_auto_reassign_worker) and
+            # the status-window timeout path (status_service).
+            try:
+                targetDevice.mark_offline("Missing reply (SET_GROUP)")
+            except Exception:
+                # swallow-ok: best-effort flag flip; the False return
+                # below is the authoritative failure signal for the
+                # caller. mark_offline only fails on malformed device
+                # records which are already logged elsewhere.
+                logger.debug(
+                    "mark_offline failed after SET_GROUP timeout for %r",
+                    getattr(targetDevice, "addr", "?"),
+                    exc_info=True,
+                )
             return False
 
         ev = events[-1]
@@ -866,7 +906,16 @@ class RaceLink_Host:
                     device.presetId = preset_id
                     device.brightness = brightness
                 except Exception:
-                    # swallow-ok: best-effort fallback; caller proceeds with safe default
+                    # swallow-ok: bulk cache update keeps going on the
+                    # remaining devices. Per-device failure here means
+                    # malformed groupId / non-int field — a data
+                    # quality issue worth diagnosing, so debug-log with
+                    # traceback rather than silently dropping.
+                    logger.debug(
+                        "group-control cache update skipped device %r",
+                        getattr(device, "addr", "?"),
+                        exc_info=True,
+                    )
                     continue
 
     def sendRaceLink(self, targetDevice, flags=None, presetId=None, brightness=None):
@@ -983,8 +1032,10 @@ class RaceLink_Host:
         recv3: bytes,
         opcode7: int,
         send_fn,
-        timeout_s: float = 8.0,
+        timeout_s: Optional[float] = None,
     ) -> tuple[list[dict], bool]:
+        if timeout_s is None:
+            return self.gateway_service.send_and_wait_for_reply(recv3, opcode7, send_fn)
         return self.gateway_service.send_and_wait_for_reply(recv3, opcode7, send_fn, timeout_s=timeout_s)
 
     def sendConfig(
@@ -996,7 +1047,7 @@ class RaceLink_Host:
         data3=0,
         recv3=b"\xFF\xFF\xFF",
         wait_for_ack: bool = False,
-        timeout_s: float = 6.0,
+        timeout_s: Optional[float] = None,
     ):
         """Compatibility entrypoint forwarding config writes to ConfigService."""
         return self.config_service.send_config(
@@ -1091,9 +1142,17 @@ class RaceLink_Host:
         with self._pending_expect_lock:
             self._pending_expect = None
 
-    def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
-        """Compatibility entrypoint forwarding sync packets to SyncService."""
-        return self.sync_service.send_sync(ts24, brightness, recv3=recv3)
+    def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
+        """Compatibility entrypoint forwarding sync packets to SyncService.
+
+        ``trigger_armed`` defaults to ``False`` (clock-tick only); set it to
+        ``True`` when this is a deliberate fire that should materialise
+        pending arm-on-sync state. The scene runner's ``_run_sync`` already
+        passes ``True`` through ``SyncService`` directly; this shim is only
+        kept for any external compatibility callers.
+        """
+        return self.sync_service.send_sync(ts24, brightness, recv3=recv3,
+                                           trigger_armed=trigger_armed)
 
     def sendStream(
         self,

@@ -7,7 +7,7 @@ Regenerate when upgrading the bundled WLED firmware version.
 
 from __future__ import annotations
 
-# Generated: 2026-04-25 00:33:51
+# Generated: 2026-04-29 13:59:50
 
 WLED_PALETTES = [
     {'value': '0', 'label': 'Default'},

@@ -57,7 +57,16 @@ class ControlService:
                 device.presetId = preset_id
                 device.brightness = brightness
             except Exception:
-                # swallow-ok: best-effort fallback; caller proceeds with safe default
+                # swallow-ok: bulk cache update keeps going on the
+                # remaining devices. Per-device failure here means
+                # malformed groupId / non-int field — a data quality
+                # issue worth diagnosing, so debug-log with traceback
+                # rather than silently dropping (B5).
+                logger.debug(
+                    "group-preset cache update skipped device %r",
+                    getattr(device, "addr", "?"),
+                    exc_info=True,
+                )
                 continue
 
     def send_device_preset(self, target_device, flags=None, preset_id=None, brightness=None) -> bool:

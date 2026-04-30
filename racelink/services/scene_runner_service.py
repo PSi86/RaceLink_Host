@@ -75,6 +75,13 @@ class SceneRunResult:
     ok: bool
     error: Optional[str] = None
     actions: List[ActionResult] = field(default_factory=list)
+    # Batch A (2026-04-28): when ``stop_on_error`` aborts a run mid-
+    # sequence, ``aborted_at_index`` carries the 0-based index of the
+    # action that triggered the abort. Subsequent action indices are
+    # represented by ``ActionResult`` entries with ``error="skipped:
+    # aborted"`` so the UI can show why they didn't run. ``None`` when
+    # the run completed every action (whether ok or not).
+    aborted_at_index: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -84,6 +91,8 @@ class SceneRunResult:
         }
         if self.error is not None:
             out["error"] = self.error
+        if self.aborted_at_index is not None:
+            out["aborted_at_index"] = int(self.aborted_at_index)
         return out
 
 
@@ -128,6 +137,7 @@ class SceneRunnerService:
         scene_key: str,
         *,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        scene: Optional[Dict[str, Any]] = None,
     ) -> SceneRunResult:
         """Run a scene and optionally emit per-action progress events.
 
@@ -138,13 +148,33 @@ class SceneRunnerService:
         Callback exceptions are swallowed so an SSE outage on the consumer
         side cannot abort the run. The synchronous ``SceneRunResult`` is
         unchanged — the callback is purely additive observability.
-        """
-        scene = self.scenes_service.get(scene_key)
-        if scene is None:
-            return SceneRunResult(scene_key=scene_key, ok=False, error="scene_not_found")
 
+        ``scene`` (optional): when supplied, the runner uses this dict as
+        the source-of-truth instead of looking ``scene_key`` up in storage.
+        Used by the editor's "Run executes the displayed draft without
+        overwriting the saved scene" path. ``scene_key`` is still required
+        — it identifies the broadcast key on ``scene_progress`` SSE events
+        so listeners (the editor's ``activeRunKey`` filter) match the run
+        the operator just kicked off. The supplied dict must already be in
+        canonical form (validated via ``_canonical_actions``); the runner
+        does not re-validate.
+        """
+        if scene is None:
+            scene = self.scenes_service.get(scene_key)
+            if scene is None:
+                return SceneRunResult(scene_key=scene_key, ok=False, error="scene_not_found")
+
+        # Batch A (2026-04-28): per-scene stop-on-error gate. Default
+        # True for both legacy scenes (loaded without the field) and
+        # newly-created ones — matches the editor checkbox default.
+        # Operators who want the legacy "play through every action"
+        # semantic explicitly opt out per scene.
+        stop_on_error = bool(scene.get("stop_on_error", True))
+
+        scene_actions = list(scene["actions"])
         results: List[ActionResult] = []
-        for index, action in enumerate(scene["actions"]):
+        aborted_at_index: Optional[int] = None
+        for index, action in enumerate(scene_actions):
             self._emit_progress(progress_cb, {
                 "scene_key": scene_key,
                 "index": index,
@@ -168,8 +198,45 @@ class SceneRunnerService:
                 "duration_ms": result.duration_ms,
             })
 
+            # Abort the rest of the scene on first failure when
+            # stop_on_error is on. ``degraded`` does NOT trigger abort
+            # — degraded means "ran with caveats" (e.g. unknown device
+            # target collapsed to a no-op); the runner saw a sensible
+            # outcome. Only outright ``ok=False`` terminates.
+            if stop_on_error and not result.ok and not result.degraded:
+                aborted_at_index = index
+                # Append "skipped" placeholders for every remaining
+                # action so the UI / SSE consumer can render the abort
+                # cleanly without needing to reason about the absence.
+                for skipped_idx in range(index + 1, len(scene_actions)):
+                    skipped_action = scene_actions[skipped_idx]
+                    skipped_result = ActionResult(
+                        index=skipped_idx,
+                        kind=skipped_action.get("kind") or "unknown",
+                        ok=False,
+                        error="skipped: aborted",
+                        duration_ms=0,
+                    )
+                    results.append(skipped_result)
+                    self._emit_progress(progress_cb, {
+                        "scene_key": scene_key,
+                        "index": skipped_idx,
+                        "kind": skipped_result.kind,
+                        "status": "skipped",
+                        "error": skipped_result.error,
+                        "duration_ms": 0,
+                    })
+                break
+
+        # ``ok`` reflects whether *every* action succeeded — an aborted
+        # run with skipped placeholders is not ``ok``.
         ok = all(r.ok for r in results)
-        return SceneRunResult(scene_key=scene_key, ok=ok, actions=results)
+        return SceneRunResult(
+            scene_key=scene_key,
+            ok=ok,
+            actions=results,
+            aborted_at_index=aborted_at_index,
+        )
 
     @staticmethod
     def _emit_progress(progress_cb, payload):
@@ -437,11 +504,24 @@ class SceneRunnerService:
                 any_offset_failed = True
             offset_results[str(op.target_group)] = row
 
-        # Phase 2: dispatch each child action with OFFSET_MODE forced on.
+        # Phase 2: dispatch each child action.
+        #
+        # The OFFSET_MODE flag forced on each child depends on the parent's
+        # offset.mode. For real formula modes (linear/explicit/vshape/modulo)
+        # we force F=1 so the firmware-side gate (asymmetric, Option C)
+        # accepts on offset-configured devices and drops on the rest. For
+        # mode="none" we force F=0 — the OPC_OFFSET(NONE) Phase-1 packet
+        # has cleared pending; sending children with F=1 would still be
+        # gate-dropped (F=1 + eff.mode=NONE drops). With F=0 the children
+        # are always accepted, and the operator gets "clear AND play"
+        # behaviour from a single offset_group(mode=none) scene.
         child_results: List[Dict[str, Any]] = []
         any_child_failed = False
+        force_offset_flag = (offset_mode != "none")
         for child_idx, child in enumerate(children):
-            child_outcome = self._dispatch_offset_group_child(child)
+            child_outcome = self._dispatch_offset_group_child(
+                child, force_offset_flag=force_offset_flag,
+            )
             child_results.append({"index": child_idx, **child_outcome})
             if not child_outcome["ok"]:
                 any_child_failed = True
@@ -466,12 +546,22 @@ class SceneRunnerService:
             detail=detail,
         )
 
-    def _dispatch_offset_group_child(self, child: dict) -> Dict[str, Any]:
+    def _dispatch_offset_group_child(
+        self, child: dict, *, force_offset_flag: bool = True,
+    ) -> Dict[str, Any]:
         """Dispatch a single child action inside an offset_group container.
 
-        The OFFSET_MODE flag is forced on; ARM_ON_SYNC stays driven by the
-        child's flags_override / persisted preset flags. Target translation
-        per kind:
+        ``force_offset_flag`` controls the OFFSET_MODE wire flag the child's
+        OPC_CONTROL/OPC_PRESET packet carries. The parent
+        ``_run_offset_group`` derives this from ``offset.mode``:
+
+        * ``mode != "none"`` → ``True`` (the gate's F=1 + E=1 path).
+        * ``mode == "none"`` → ``False`` (children apply immediately,
+          gate's F=0 always-accept path; pending=NONE state on devices
+          would otherwise drop F=1 children).
+
+        ARM_ON_SYNC stays driven by the child's flags_override / persisted
+        preset flags. Target translation per kind:
 
             * ``target.kind == "scope"``  → broadcast (groupId=255)
             * ``target.kind == "group"``  → unicast to group
@@ -489,7 +579,7 @@ class SceneRunnerService:
             }
 
         forced = dict(child.get("flags_override") or {})
-        forced["offset_mode"] = True
+        forced["offset_mode"] = bool(force_offset_flag)
 
         if kind == KIND_RL_PRESET:
             params = dict(child.get("params") or {})
@@ -570,7 +660,13 @@ class SceneRunnerService:
         except Exception:
             # swallow-ok: optimizer falls back to no-known-devices (Strategy A
             # broadcast still works without a device list); a flaky repository
-            # call must not break scene playback.
+            # call must not break scene playback. Debug-log so a recurring
+            # repository regression is diagnosable.
+            logger.debug(
+                "scene runner: device_repository.list() failed; "
+                "optimizer falls back to no-known-devices",
+                exc_info=True,
+            )
             return []
         ids: set[int] = set()
         for d in devices:
@@ -608,8 +704,12 @@ class SceneRunnerService:
         # unwraps it to a monotonic 32-bit timebase. brightness=0 is ignored
         # by nodes whose flags carry HAS_BRI; it's only consumed as live
         # brightness when HAS_BRI=0, which is fine here.
+        # ``trigger_armed=True`` writes SYNC_FLAG_TRIGGER_ARMED on the wire so
+        # the device materialises any pending arm-on-sync state. Autosync
+        # (gateway- or future host-driven) leaves the flag unset so the
+        # interval pulse cannot fire armed effects ahead of this packet.
         ts24 = int(self._clock_ms()) & 0xFFFFFF
-        self.sync_service.send_sync(ts24, 0)
+        self.sync_service.send_sync(ts24, 0, trigger_armed=True)
         return ActionResult(
             index=index, kind=KIND_SYNC, ok=True,
             duration_ms=self._clock_ms() - started,

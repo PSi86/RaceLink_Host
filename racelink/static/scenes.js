@@ -127,6 +127,51 @@
       .sort((a, b) => a - b);
   }
 
+  // ---- C5: capability filtering for scene-action target dropdowns ---
+  //
+  // Different action kinds land on different device types: a
+  // ``wled_preset`` packet is meaningless to a non-WLED node, a
+  // ``startblock`` action only fires on starting-block hardware. Pre-
+  // C5 the dropdowns showed every group / every device regardless of
+  // the action kind, so picking a non-matching target produced a
+  // green SSE pip with no actual effect — the worst kind of bug.
+  //
+  // ``requiredCapForKind`` maps each scene-action kind to the
+  // capability string the wire packet needs (or ``null`` for kinds
+  // that broadcast or don't touch hardware).
+  // ``deviceHasCap`` reads the ``dev_type_caps`` array the device DTO
+  // carries (see racelink/web/dto.py::serialize_device).
+  // ``groupHasCap`` consults the ``caps_in_group`` map the
+  // ``/api/groups`` endpoint now returns.
+  function requiredCapForKind(kind){
+    switch(kind){
+      case "rl_preset":
+      case "wled_preset":
+      case "wled_control":
+        return "WLED";
+      case "startblock":
+        return "STARTBLOCK";
+      // sync / delay / offset_group don't carry a capability
+      // requirement — sync broadcasts, delay is host-side, and
+      // offset_group's children carry their own kind (which is
+      // checked separately for the child target picker).
+      default:
+        return null;
+    }
+  }
+
+  function deviceHasCap(device, cap){
+    if(!cap || !device) return true;
+    const caps = device.dev_type_caps;
+    return Array.isArray(caps) && caps.indexOf(cap) >= 0;
+  }
+
+  function groupCapCount(group, cap){
+    if(!cap) return undefined;  // no filter active
+    const map = (group && group.caps_in_group) || {};
+    return Number(map[cap] || 0);
+  }
+
   // Mirrors racelink/domain/offset_formula.py — both sides must produce
   // byte-identical results. Used for the live preview AND for sparse
   // selections (the runner runs the same logic Python-side).
@@ -193,13 +238,24 @@
     return out;
   }
 
-  // Strip ``_ui`` from an action tree before save; the server drops unknown
-  // keys but we send a clean payload for cleaner debugging / API logs.
-  // Container actions are recursed so nested children also get cleaned.
+  // Strip ``_ui`` and any ``__*`` render-side scratch fields from an
+  // action tree before save; the server drops unknown keys but we send
+  // a clean payload for cleaner debugging / API logs. Container actions
+  // are recursed so nested children also get cleaned.
+  //
+  // The dunder-prefix strip is also load-bearing for the dirty-tracker:
+  // ``_canonicalDraftJson`` runs this function so any render-time scratch
+  // (e.g. a stale ``__cid`` from a pre-fix draft) is normalised away
+  // before comparison. Stick to dunder-prefixed names for any future
+  // render scratch so this stays automatic.
   function stripUiBeforeSave(actions){
     return (actions || []).map(a => {
-      const out = { ...a };
-      delete out._ui;
+      const out = {};
+      for(const key of Object.keys(a)){
+        if(key === "_ui") continue;
+        if(key.startsWith("__")) continue;
+        out[key] = a[key];
+      }
       if(out.kind === "offset_group" && Array.isArray(out.actions)){
         out.actions = stripUiBeforeSave(out.actions);
       }
@@ -216,27 +272,121 @@
   let _costFetchTimer = null;
   let _costFetchSeq = 0;
 
-  function formatCost(cost){
+  // 2026-04-28: cost badges optionally show *measured* wall-clock
+  // duration alongside the estimated airtime. ``measuredMs`` is the
+  // last-run duration_ms for that action (or the sum across all
+  // actions for the total badge). When supplied, an "actual" fragment
+  // is appended in a span with the ``rl-scene-cost-actual`` class so
+  // CSS can style it distinctly from the estimate.
+  //
+  // Returns a DocumentFragment (not a string) when ``measuredMs`` is
+  // present, so the styling-span can be inlined; falls back to a
+  // plain string for the estimate-only case to preserve the existing
+  // ``textContent`` callsites' simplicity.
+  function formatCost(cost, measuredMs){
     if(!cost) return "≈ —";
-    const ms = Math.round(cost.airtime_ms || 0);
-    return `≈ ${cost.packets} pkts · ${cost.bytes} B · ${ms} ms`;
+    // Prefer wall_clock_ms (LoRa airtime + per-packet USB/gateway overhead)
+    // so the badge prediction matches the runner's measured `actual:`. Fall
+    // back to airtime_ms for back-compat with any older API response (e.g.
+    // a stale RotorHazard build serving an older host plugin).
+    const ms = Math.round(
+      (cost.wall_clock_ms != null ? cost.wall_clock_ms : cost.airtime_ms) || 0
+    );
+    const estimate = `≈ ${cost.packets} pkts · ${cost.bytes} B · ${ms} ms`;
+    if(measuredMs === undefined || measuredMs === null) return estimate;
+    return { estimate, measuredMs: Math.round(Number(measuredMs) || 0) };
   }
 
-  function loraTooltip(){
+  function setBadgeContent(el, formatted){
+    // Accepts either a plain string (estimate only) or an object
+    // ``{estimate, measuredMs}``. The object form renders the actual
+    // fragment in a styled child span.
+    if(typeof formatted === "string"){
+      el.textContent = formatted;
+      return;
+    }
+    el.textContent = formatted.estimate + " · ";
+    const actual = document.createElement("span");
+    actual.className = "rl-scene-cost-actual";
+    actual.textContent = `actual: ${formatted.measuredMs} ms`;
+    el.appendChild(actual);
+  }
+
+  function loraTooltip(measuredMs, predictedWallClockMs, estimatedAirtimeMs){
     const lora = state.scenes.schema && state.scenes.schema.lora;
-    if(!lora) return "";
-    const bw = (lora.bw_hz / 1000).toFixed(0);
-    return `at SF${lora.sf}/${bw} kHz/CR4:${lora.cr}` +
-           ` · bytes include Header7 + USB framing; airtime via Semtech AN1200.13`;
+    let base = "";
+    if(lora){
+      const bw = (lora.bw_hz / 1000).toFixed(0);
+      const overhead = lora.wire_overhead_ms_per_packet;
+      const overheadFrag = (overhead != null)
+        ? ` · +${Math.round(overhead)} ms/pkt USB+gateway overhead`
+        : "";
+      base = `at SF${lora.sf}/${bw} kHz/CR4:${lora.cr}` +
+             ` · bytes include Header7 + USB framing` +
+             ` · airtime via Semtech AN1200.13${overheadFrag}`;
+    }
+    // Optional second line: per-action airtime breakdown so the operator
+    // can see how much of the wall-clock prediction is pure radio vs.
+    // host-side roundtrip cost. Both inputs are estimates from the API.
+    const est = Math.round(Number(predictedWallClockMs) || 0);
+    const air = Math.round(Number(estimatedAirtimeMs) || 0);
+    const overheadMs = Math.max(0, est - air);
+    const breakdown = (est > 0 && air > 0)
+      ? `Predicted: ${est} ms (LoRa airtime ${air} ms + radio/USB overhead ${overheadMs} ms).`
+      : "";
+    if(measuredMs === undefined || measuredMs === null){
+      return [base, breakdown].filter(Boolean).join("\n");
+    }
+    // Measured includes the same wall-clock overhead the prediction
+    // already models. Any residual delta is calibration drift (e.g.
+    // gateway latency_timer not actually at 1 ms, scene-runner step
+    // overhead between actions) — small, but visible here.
+    const meas = Math.round(Number(measuredMs) || 0);
+    const delta = meas - est;
+    const sign = delta >= 0 ? "+" : "";
+    return [
+      base,
+      breakdown,
+      `Last run: ${meas} ms wall-clock (predicted ${est} ms · ${sign}${delta} ms residual).`,
+    ].filter(Boolean).join("\n");
+  }
+
+  function _measuredDurationsFromLastRun(){
+    // Returns ``{perAction: Map<idx, ms>, total: ms | null}`` from the
+    // last successful run. Operators see measured values *only* until
+    // they start a new run or load a different scene; after that the
+    // map is empty and badges fall back to estimate-only rendering.
+    const lr = state.scenes && state.scenes.lastRunResult;
+    if(!lr || !Array.isArray(lr.actions)) return { perAction: new Map(), total: null };
+    const perAction = new Map();
+    let total = 0;
+    lr.actions.forEach(a => {
+      if(typeof a.duration_ms === "number"){
+        perAction.set(Number(a.index), a.duration_ms);
+        total += a.duration_ms;
+      }
+    });
+    return { perAction, total: perAction.size ? total : null };
   }
 
   function applyCostPayload(seq, payload){
     if(seq !== _costFetchSeq) return;        // stale response
     if(!payload || !payload.ok) return;
+    const measured = _measuredDurationsFromLastRun();
     const tot = document.getElementById("sceneCostTotal");
     if(tot){
-      tot.textContent = "Total " + formatCost(payload.total);
-      tot.title = loraTooltip();
+      const t = payload.total || {};
+      // wall_clock_ms is the new (Batch B follow-up) prediction the cost
+      // badge displays; airtime_ms remains for the tooltip's breakdown
+      // line. Older API responses without wall_clock_ms fall back to
+      // airtime_ms (no overhead modelled there).
+      const totalWallClockMs = (t.wall_clock_ms != null ? t.wall_clock_ms : t.airtime_ms) || 0;
+      const totalAirtimeMs   = t.airtime_ms || 0;
+      const formatted = formatCost(t, measured.total);
+      tot.textContent = "";
+      tot.appendChild(document.createTextNode("Total "));
+      setBadgeContent(tot, formatted);
+      tot.title = loraTooltip(measured.total, totalWallClockMs, totalAirtimeMs);
     }
     const editor = document.getElementById("sceneEditor");
     if(!editor) return;
@@ -245,8 +395,14 @@
       if(!row) return;
       const badge = row.querySelector(".rl-scene-action-cost");
       if(!badge) return;
-      badge.textContent = formatCost(cost);
-      badge.title = loraTooltip();
+      const actionMeasured = measured.perAction.has(idx)
+        ? measured.perAction.get(idx)
+        : null;
+      const formatted = formatCost(cost, actionMeasured);
+      setBadgeContent(badge, formatted);
+      const wallClock = cost && (cost.wall_clock_ms != null ? cost.wall_clock_ms : cost.airtime_ms);
+      const airtime   = cost && cost.airtime_ms;
+      badge.title = loraTooltip(actionMeasured, wallClock, airtime);
     });
   }
 
@@ -356,19 +512,59 @@
     });
   }
 
+  // C11: dirty-tracking. ``pristineDraftJson`` is the canonical
+  // serialised form of the draft at the moment it was loaded /
+  // last saved. ``isDraftDirty`` recomputes the same canonical form
+  // and compares; truthy means "the operator has unsaved edits".
+  // Used by the beforeunload listener (browser-level navigation
+  // away) and by selectScene / newSceneDraft (in-editor draft
+  // swap) to confirm before discarding work.
+  function _canonicalDraftJson(draft){
+    if(!draft) return "";
+    return JSON.stringify({
+      label: String(draft.label || ""),
+      actions: stripUiBeforeSave(draft.actions || []),
+      // Include stop_on_error so toggling the editor checkbox marks
+      // the draft dirty (would otherwise silently round-trip).
+      stop_on_error: (draft.stop_on_error === undefined || draft.stop_on_error === null)
+                     ? true
+                     : !!draft.stop_on_error,
+    });
+  }
+  function _markPristine(){
+    state.scenes.pristineDraftJson = _canonicalDraftJson(state.scenes.draft);
+  }
+  function isDraftDirty(){
+    const draft = state.scenes.draft;
+    if(!draft) return false;
+    const baseline = state.scenes.pristineDraftJson;
+    if(baseline === undefined) return false;  // never seeded yet
+    return _canonicalDraftJson(draft) !== baseline;
+  }
+  function _confirmDiscardIfDirty(){
+    if(!isDraftDirty()) return true;
+    return RL.confirmDestructive(
+      "You have unsaved changes to this scene. Discard them and continue?"
+    );
+  }
+
   function selectScene(key){
+    if(!_confirmDiscardIfDirty()) return;
     state.scenes.selectedKey = key;
     state.scenes.lastRunResult = null;
     const scene = state.scenes.items.find(s => s.key === key) || null;
     state.scenes.draft = scene ? cloneAction(scene) : null;
+    _markPristine();
     renderSceneList();
     renderSceneEditor();
   }
 
   function newSceneDraft(){
+    if(!_confirmDiscardIfDirty()) return;
     state.scenes.selectedKey = null;
     state.scenes.lastRunResult = null;
     state.scenes.draft = { id: null, key: null, label: "", actions: [] };
+    _markPristine();
     renderSceneList();
     renderSceneEditor();
   }
@@ -407,6 +603,29 @@
       meta.appendChild(keyInfo);
     }
 
+    // Stop-on-error toggle — Batch A (2026-04-28). Default true (the
+    // safer behaviour: a half-failed sequence aborts the rest rather
+    // than wasting air-time on packets that can't reach the intended
+    // state). Stored on the scene root, persisted via the API.
+    const stopOnErrorWrap = document.createElement("label");
+    stopOnErrorWrap.className = "inline rl-scene-stop-on-error";
+    stopOnErrorWrap.title = "Abort the run on the first action that fails. " +
+                            "Off = play through every action regardless of errors.";
+    const stopOnErrorCb = document.createElement("input");
+    stopOnErrorCb.type = "checkbox";
+    stopOnErrorCb.id = "sceneStopOnError";
+    // Default true for missing/legacy field. Server's _coerce_bool
+    // normalises both directions — frontend just round-trips the bool.
+    stopOnErrorCb.checked = (draft.stop_on_error === undefined || draft.stop_on_error === null)
+                            ? true
+                            : !!draft.stop_on_error;
+    stopOnErrorCb.addEventListener("change", () => {
+      draft.stop_on_error = !!stopOnErrorCb.checked;
+    });
+    stopOnErrorWrap.appendChild(stopOnErrorCb);
+    stopOnErrorWrap.appendChild(document.createTextNode(" Stop on error"));
+    meta.appendChild(stopOnErrorWrap);
+
     // Scene-level cost badge — populated asynchronously via the
     // ``/api/scenes/estimate`` endpoint after each edit. Tooltip surfaces
     // the active LoRa params per user feedback point 3.
@@ -424,16 +643,41 @@
       strip.className = "rl-scene-progress";
       const status = document.createElement("span");
       const r = state.scenes.lastRunResult;
-      status.textContent = r.ok ? "Last run: OK" : `Last run: ${r.error || "failed"}`;
+      // Batch A (2026-04-28): aborted runs surface a clear message
+      // separate from the generic "failed" — the operator knows
+      // exactly where the sequence stopped and which actions never
+      // ran.
+      if(r.aborted_at_index !== undefined && r.aborted_at_index !== null){
+        const failedIdx = Number(r.aborted_at_index);
+        const failed = (r.actions || []).find(a => a.index === failedIdx);
+        const why = (failed && failed.error) ? failed.error : "failed";
+        status.textContent =
+          `Last run: aborted at action #${failedIdx + 1} (${why}). ` +
+          `Remaining actions skipped — uncheck "Stop on error" to play through.`;
+      } else {
+        status.textContent = r.ok ? "Last run: OK" : `Last run: ${r.error || "failed"}`;
+      }
       strip.appendChild(status);
       (r.actions || []).forEach(a => {
         const pip = document.createElement("span");
-        pip.className = "pip " + (a.degraded ? "degraded" : (a.ok ? "ok" : "error"));
+        // ``error: "skipped: aborted"`` is the placeholder the runner
+        // emits for actions after the abort point. Render with a
+        // distinct ``skipped`` class so CSS can mute them.
+        const isSkipped = (a.error && a.error.startsWith("skipped"));
+        let cls;
+        if(isSkipped) cls = "skipped";
+        else if(a.degraded) cls = "degraded";
+        else if(a.ok) cls = "ok";
+        else cls = "error";
+        pip.className = "pip " + cls;
         // Display rebased to 1 to match the action-row labels (#1 #2 …).
         // The runner's ActionResult.index stays 0-based for log/structured output.
         const display = a.index + 1;
         pip.textContent = String(display);
-        pip.title = `#${display} ${a.kind}${a.error ? " — " + a.error : ""} (${a.duration_ms}ms)`;
+        const tooltipBits = [`#${display}`, a.kind];
+        if(a.error) tooltipBits.push(`— ${a.error}`);
+        if(!isSkipped) tooltipBits.push(`(${a.duration_ms}ms)`);
+        pip.title = tooltipBits.join(" ");
         strip.appendChild(pip);
       });
       editor.appendChild(strip);
@@ -643,11 +887,50 @@
     return row;
   }
 
+  // Build the permutation map for a single splice-style move: the action
+  // at ``from`` ends up at ``to``; other actions shift through the gap. The
+  // returned ``map`` is such that ``map[oldIdx] === newIdx`` for every
+  // index in [0, n). Used to keep ``state.scenes.lastRunResult`` indices in
+  // sync with the displayed action order so "actual" times follow their
+  // action on a reorder rather than staying at the old slot.
+  function _permutationFromMove(from, to, n){
+    const map = new Array(n);
+    for(let i = 0; i < n; i++) map[i] = i;
+    if(from === to) return map;
+    map[from] = to;
+    if(from < to){
+      for(let i = from + 1; i <= to; i++) map[i] = i - 1;
+    } else {
+      for(let i = to; i < from; i++) map[i] = i + 1;
+    }
+    return map;
+  }
+
+  // Apply the permutation to ``state.scenes.lastRunResult`` so post-run
+  // indices follow the actions through the move. Top-level only — nested
+  // child reorders inside an offset_group don't surface in lastRunResult
+  // (the offset_group is treated as a single action by the runner).
+  function _remapLastRunResultIndices(map){
+    const lr = state.scenes && state.scenes.lastRunResult;
+    if(!lr) return;
+    if(Array.isArray(lr.actions)){
+      lr.actions.forEach(a => {
+        if(typeof a.index === "number" && map[a.index] !== undefined){
+          a.index = map[a.index];
+        }
+      });
+    }
+    if(typeof lr.aborted_at_index === "number" && map[lr.aborted_at_index] !== undefined){
+      lr.aborted_at_index = map[lr.aborted_at_index];
+    }
+  }
+
   function moveAction(draft, idx, delta){
     const j = idx + delta;
     if(j < 0 || j >= draft.actions.length) return;
     const [item] = draft.actions.splice(idx, 1);
     draft.actions.splice(j, 0, item);
+    _remapLastRunResultIndices(_permutationFromMove(idx, j, draft.actions.length));
     renderSceneEditor();
   }
 
@@ -657,6 +940,7 @@
     if(newIndex < 0 || newIndex >= draft.actions.length) return;
     const [item] = draft.actions.splice(oldIndex, 1);
     draft.actions.splice(newIndex, 0, item);
+    _remapLastRunResultIndices(_permutationFromMove(oldIndex, newIndex, draft.actions.length));
     renderSceneEditor();
   }
 
@@ -821,23 +1105,37 @@
     const isGroup = target.kind === "group";
     const valueSelect = document.createElement("select");
 
+    // C5: which capability does this action's wire packet need? Used
+    // below to filter groups (skip groups with 0 capable devices) and
+    // devices (skip devices without the cap).
+    const cap = requiredCapForKind(action.kind);
+
     function fillValueOptions(){
       valueSelect.innerHTML = "";
       if(isGroup){
         // selectableGroups filters out the synthetic "Unconfigured"
-        // bucket (id=0) — never a productive scene target.
+        // bucket (id=0) — never a productive scene target. C5
+        // additionally drops groups whose ``caps_in_group`` count for
+        // the required capability is zero.
         selectableGroups().forEach(g => {
           const id = (typeof g.id === "number") ? g.id : g.groupId;
+          const capCount = groupCapCount(g, cap);
+          if(cap && (capCount || 0) === 0) return;  // C5 filter
           const opt = document.createElement("option");
           opt.value = String(id);
-          opt.textContent = `${g.name || ("Group " + id)} (${id})`;
+          // Label: ``Group 1 (3 WLED)`` when a cap filter is active,
+          // ``Group 1 (1)`` (the existing format) otherwise.
+          const annot = cap ? ` — ${capCount} ${cap}` : "";
+          opt.textContent = `${g.name || ("Group " + id)} (${id})${annot}`;
           if(Number(target.value) === id) opt.selected = true;
           valueSelect.appendChild(opt);
         });
         if(!valueSelect.options.length){
           const opt = document.createElement("option");
           opt.value = "1";
-          opt.textContent = "(no groups — using id=1)";
+          opt.textContent = cap
+            ? `(no groups with ${cap} devices — assign a ${cap} node first)`
+            : "(no groups — using id=1)";
           valueSelect.appendChild(opt);
         }
       }else{
@@ -845,6 +1143,7 @@
           if(!d.addr) return;
           const addr = String(d.addr).toUpperCase();
           if(addr.length !== 12) return;
+          if(cap && !deviceHasCap(d, cap)) return;  // C5 filter
           const opt = document.createElement("option");
           opt.value = addr;
           opt.textContent = `${d.name || addr} (${addr})`;
@@ -854,7 +1153,9 @@
         if(!valueSelect.options.length){
           const opt = document.createElement("option");
           opt.value = "AABBCCDDEEFF";
-          opt.textContent = "(no devices yet — placeholder)";
+          opt.textContent = cap
+            ? `(no ${cap} devices known — discover or assign one first)`
+            : "(no devices yet — placeholder)";
           valueSelect.appendChild(opt);
         }
       }
@@ -869,6 +1170,18 @@
     });
 
     fillValueOptions();
+
+    // C5: if a cap filter dropped the previously-selected option (e.g.
+    // the operator switched from ``wled_preset`` to ``startblock``
+    // and the existing target group has no STARTBLOCK devices), the
+    // browser will pick option[0] visually but ``action.target.value``
+    // stays at the stale id. Sync them so saves and cost estimates
+    // see the same target the operator does.
+    if(valueSelect.selectedIndex < 0 && valueSelect.options.length){
+      valueSelect.selectedIndex = 0;
+      valueSelect.dispatchEvent(new Event("change"));
+    }
+
     wrap.appendChild(valueSelect);
     return wrap;
   }
@@ -1275,7 +1588,7 @@
     childrenContainer.className = "rl-offset-group-children-list";
     (action.actions || []).forEach((child, childIdx) => {
       childrenContainer.appendChild(
-        buildOffsetGroupChildRow(child, childIdx, action, draft)
+        buildOffsetGroupChildRow(child, childIdx, action, draft, idx)
       );
     });
     if(!numChildren){
@@ -1322,10 +1635,17 @@
     return wrap;
   }
 
-  function buildOffsetGroupChildRow(child, childIdx, parent, draft){
+  function buildOffsetGroupChildRow(child, childIdx, parent, draft, parentIdx){
     // A child action row inside an offset_group container. Layout mirrors
     // a top-level row but with restricted kind dropdown + scope/group/device
     // target picker and a forced-on offset_mode flag (visually disabled).
+    //
+    // ``parentIdx`` is the parent action's index in ``draft.actions``. It's
+    // threaded through so the radio-button group name can be derived
+    // deterministically (``parentIdx-childIdx``) instead of from a random
+    // id stored on the child action — the latter polluted the canonical
+    // JSON used by the dirty-tracker, causing spurious "unsaved changes"
+    // prompts on every render.
     const row = document.createElement("div");
     row.className = "rl-offset-group-child-row";
 
@@ -1365,7 +1685,7 @@
     const bodyCol = document.createElement("div");
     bodyCol.className = "rl-scene-action-body";
     bodyCol.dataset.kind = child.kind;
-    bodyCol.appendChild(buildChildTargetPicker(child, parent));
+    bodyCol.appendChild(buildChildTargetPicker(child, parent, parentIdx, childIdx));
     const meta = findKindMeta(child.kind);
     if(meta && Array.isArray(meta.vars) && meta.vars.length){
       bodyCol.appendChild(buildVarsRow(child, childIdx, draft, meta));
@@ -1391,11 +1711,18 @@
     return row;
   }
 
-  function buildChildTargetPicker(child, parent){
+  function buildChildTargetPicker(child, parent, parentIdx, childIdx){
     // Three options: scope (broadcast to all participants),
     // group (one of the parent's groups), device (any device whose
     // groupId is in the parent's scope). Filtered choices reflect the
     // parent's ``groups`` field.
+    //
+    // The radio-button group name is derived from ``parentIdx-childIdx``
+    // (deterministic, stable across renders, unique within the page).
+    // Earlier code stored a random ``__cid`` on the child action object
+    // for this purpose; that property leaked into ``stripUiBeforeSave``'s
+    // output and caused the dirty-tracker to flag every render as
+    // "unsaved changes" even on freshly-loaded scenes.
     const wrap = document.createElement("div");
     wrap.className = "rl-scene-target";
     if(!child.target) child.target = { kind: "scope" };
@@ -1403,11 +1730,13 @@
     const radioRow = document.createElement("div");
     radioRow.className = "rl-scene-target-radios";
 
+    const radioName = `child-target-${parentIdx}-${childIdx}`;
+
     const radios = {};
     [["scope", "Scope (broadcast)"], ["group", "Group"], ["device", "Device"]].forEach(([kind, lbl]) => {
       const r = document.createElement("input");
       r.type = "radio";
-      r.name = `child-target-${child.__cid || (child.__cid = Math.random().toString(36).slice(2))}`;
+      r.name = radioName;
       r.value = kind;
       r.checked = child.target.kind === kind;
       radios[kind] = r;
@@ -1427,23 +1756,33 @@
       bodyHolder.innerHTML = "";
       const tk = child.target.kind;
       if(tk === "scope") return;  // no value picker
+      // C5: child kind drives the cap filter. All current
+      // OFFSET_GROUP_CHILD_KINDS (rl_preset / wled_preset /
+      // wled_control) require WLED, but ``requiredCapForKind`` is
+      // the source of truth so future kinds inherit the behaviour.
+      const cap = requiredCapForKind(child.kind);
       const sel = document.createElement("select");
       if(tk === "group"){
         const allowedIds = (parent.groups === "all")
           ? knownGroupIds()
           : (parent.groups || []);
         allowedIds.forEach(id => {
+          const meta = (state.groups || []).find(g => ((typeof g.id === "number") ? g.id : g.groupId) === id);
+          const capCount = groupCapCount(meta, cap);
+          if(cap && (capCount || 0) === 0) return;  // C5 filter
           const opt = document.createElement("option");
           opt.value = String(id);
-          const meta = (state.groups || []).find(g => ((typeof g.id === "number") ? g.id : g.groupId) === id);
-          opt.textContent = `${meta?.name || ("Group " + id)} (${id})`;
+          const annot = cap ? ` — ${capCount} ${cap}` : "";
+          opt.textContent = `${meta?.name || ("Group " + id)} (${id})${annot}`;
           if(Number(child.target.value) === id) opt.selected = true;
           sel.appendChild(opt);
         });
         if(!sel.options.length){
           const opt = document.createElement("option");
           opt.value = "1";
-          opt.textContent = "(no groups in parent scope)";
+          opt.textContent = cap
+            ? `(no groups in parent scope have ${cap} devices)`
+            : "(no groups in parent scope)";
           sel.appendChild(opt);
         }
         sel.addEventListener("change", () => {
@@ -1458,6 +1797,8 @@
           if(addr.length !== 12) return;
           // Filter to devices whose groupId is in the parent's scope.
           if(allowedIds !== null && !allowedIds.includes(d.groupId)) return;
+          // C5: also filter by capability.
+          if(cap && !deviceHasCap(d, cap)) return;
           const opt = document.createElement("option");
           opt.value = addr;
           opt.textContent = `${d.name || addr} (${addr})`;
@@ -1469,13 +1810,23 @@
         if(!sel.options.length){
           const opt = document.createElement("option");
           opt.value = "AABBCCDDEEFF";
-          opt.textContent = "(no devices in parent scope)";
+          opt.textContent = cap
+            ? `(no ${cap} devices in parent scope)`
+            : "(no devices in parent scope)";
           sel.appendChild(opt);
         }
         sel.addEventListener("change", () => {
           child.target = { kind: "device", value: String(sel.value || "").toUpperCase() };
           scheduleCostEstimate();
         });
+      }
+      // C5 auto-sync (same rationale as buildSingleTargetSelect): if
+      // the existing target was filtered out, pick option[0] and
+      // update ``child.target`` so the cost estimate / save sees the
+      // visible selection.
+      if(sel.selectedIndex < 0 && sel.options.length){
+        sel.selectedIndex = 0;
+        sel.dispatchEvent(new Event("change"));
       }
       bodyHolder.appendChild(sel);
     }
@@ -1659,7 +2010,18 @@
     const labelInput = $("#sceneLabelInput");
     const label = (labelInput && labelInput.value || "").trim();
     if(!label){ setScenesHint("Label is required."); return; }
-    const body = { label, actions: stripUiBeforeSave(draft.actions) };
+    // Batch A (2026-04-28): stop_on_error round-trips with the scene.
+    // Default true if missing/null (defensive — checkbox seeds the
+    // draft on render, but we don't want a stale draft to silently
+    // disable the safer behaviour).
+    const stopOnError = (draft.stop_on_error === undefined || draft.stop_on_error === null)
+                        ? true
+                        : !!draft.stop_on_error;
+    const body = {
+      label,
+      actions: stripUiBeforeSave(draft.actions),
+      stop_on_error: stopOnError,
+    };
     let r;
     if(draft.key){
       r = await apiPut(`/racelink/api/scenes/${draft.key}`, body);
@@ -1671,12 +2033,22 @@
     await loadScenes();
     state.scenes.selectedKey = r.scene.key;
     state.scenes.draft = cloneAction(r.scene);
+    // C11: a successful save makes the current draft pristine — the
+    // beforeunload listener won't prompt until the next edit.
+    _markPristine();
     renderSceneList();
     renderSceneEditor();
   }
 
   async function runScene(key){
     setScenesHint(`Running "${key}"…`);
+    // C7: disable the Run / Save / Duplicate / Delete buttons in the
+    // scene editor for the duration of the run. Without this the
+    // operator can click Run repeatedly and queue up duplicate
+    // requests, or Save/Delete mid-run and get a confused state.
+    // ``setBusy`` is null-guarded for the Devices-page-only
+    // selectors so it's safe to call from /scenes.
+    if(typeof RL.setBusy === "function") RL.setBusy(true);
     // R7: arm live-status tracking. Each action row clears its border
     // colour and the SSE handler will paint blue (running) / green (ok) /
     // red (error/degraded) as transitions arrive.
@@ -1685,19 +2057,43 @@
     state.scenes.lastRunResult = null;
     renderSceneEditor();
 
-    const r = await apiPost(`/racelink/api/scenes/${key}/run`, {});
-    state.scenes.activeRunKey = null;
-    if(r && r.result){
-      state.scenes.lastRunResult = r.result;
-      const summary = r.ok ? "OK" : (r.result.error || "failed");
-      setScenesHint(`Run "${key}": ${summary}`);
-    }else{
-      setScenesHint(`Run "${key}" failed: ${(r && r.error) || "unknown error"}`);
+    // Run the *displayed* draft when it has unsaved edits, never the
+    // last persisted version. The body short-circuits the runner's
+    // storage lookup so the saved scene under ``key`` is left untouched
+    // — only the explicit Save button persists changes. When the draft
+    // is clean (or there is no draft for this key), we send no body and
+    // the runner falls back to the persisted scene as before.
+    const draft = state.scenes.draft;
+    let body = {};
+    if(draft && draft.key === key && isDraftDirty()){
+      const stopOnError = (draft.stop_on_error === undefined || draft.stop_on_error === null)
+                          ? true
+                          : !!draft.stop_on_error;
+      body = {
+        label: (draft.label || "").trim() || "draft",
+        actions: stripUiBeforeSave(draft.actions || []),
+        stop_on_error: stopOnError,
+      };
     }
-    // Drop the per-row live state on completion — lastRunResult drives the
-    // borders from here on, identical to pre-R7 behaviour.
-    state.scenes.actionStatus = [];
-    renderSceneEditor();
+    try{
+      const r = await apiPost(`/racelink/api/scenes/${key}/run`, body);
+      state.scenes.activeRunKey = null;
+      if(r && r.result){
+        state.scenes.lastRunResult = r.result;
+        const summary = r.ok ? "OK" : (r.result.error || "failed");
+        setScenesHint(`Run "${key}": ${summary}`);
+      }else{
+        setScenesHint(`Run "${key}" failed: ${(r && r.error) || "unknown error"}`);
+      }
+      // Drop the per-row live state on completion — lastRunResult drives the
+      // borders from here on, identical to pre-R7 behaviour.
+      state.scenes.actionStatus = [];
+      renderSceneEditor();
+    } finally {
+      // C7: clear busy regardless of success/failure so a network
+      // error doesn't leave the editor permanently disabled.
+      if(typeof RL.setBusy === "function") RL.setBusy(false);
+    }
   }
 
   // R7: live progress handler installed for racelink.js's SSE listener.
@@ -1734,6 +2130,9 @@
                             && fresh.label === state.scenes.draft.label;
           if(sameAsDraft){
             state.scenes.draft = cloneAction(fresh);
+            // C11: SSE refresh accepted — the on-disk version
+            // matches the draft, so the new draft is pristine.
+            _markPristine();
             renderSceneEditor();
           }
         }catch{
@@ -1742,6 +2141,8 @@
       }else if(!fresh){
         state.scenes.selectedKey = null;
         state.scenes.draft = null;
+        // C11: nothing to be dirty about now.
+        _markPristine();
         renderSceneEditor();
       }
     }
@@ -1757,9 +2158,29 @@
     }
     const sel = state.scenes.items.find(s => s.key === state.scenes.selectedKey) || null;
     state.scenes.draft = sel ? cloneAction(sel) : null;
+    // C11: pristine baseline so isDraftDirty() compares against
+    // the just-loaded state, not against ``undefined``.
+    _markPristine();
     renderSceneList();
     renderSceneEditor();
   }
+
+  // C11: warn the operator about unsaved scene-editor changes when
+  // they navigate away (refresh, close tab, click ← Devices). The
+  // browser itself shows the prompt — we just signal "yes, there
+  // is unsaved work" by setting ``returnValue`` on the event.
+  // Modern browsers ignore custom messages and show their own
+  // confirmation; the dialog is unconditional once returnValue is
+  // set, so we gate by ``isDraftDirty`` to avoid prompting on
+  // pristine navigations.
+  window.addEventListener("beforeunload", (event) => {
+    if(!isDraftDirty()) return;
+    event.preventDefault();
+    // returnValue text shown only on legacy browsers; modern
+    // Chromium / Firefox use their canned "leave site?" dialog.
+    event.returnValue = "You have unsaved changes to this scene.";
+    return event.returnValue;
+  });
 
   document.addEventListener("DOMContentLoaded", () => {
     init().catch(e => {

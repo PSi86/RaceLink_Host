@@ -1,22 +1,64 @@
-"""Gateway orchestration service for transport events and reply handling."""
+"""Gateway orchestration service: transport events, reply matching, lifecycle.
+
+The single largest service in the host. Owns:
+
+* The **pending-request registry** (:class:`PendingRequestRegistry` from
+  ``pending_requests``) used for unicast ``send_and_wait_for_reply``
+  request/response matching.
+* The **TX listener path** (``on_transport_tx``) that stamps a pending
+  expectation when a unicast request goes out, and the matching
+  **RX listener path** (``on_transport_event`` →
+  ``pending_try_match`` / ``pending_window_closed``) that clears the
+  expectation on a reply or window-closed.
+* **Reconnect** (``schedule_reconnect``) and **auto-restore**
+  (``_spawn_auto_reassign_worker`` via a bounded
+  ``ThreadPoolExecutor``) when the gateway disconnects or a node
+  comes back with the wrong groupId.
+* **High-level dispatch helpers**: ``send_config``, ``send_sync``,
+  ``send_stream`` — orchestrate the transport's primitive
+  ``send_*`` ops with retries and ACK-collection.
+
+Threading: this module is the host's primary cross-thread surface.
+The transport's RX reader thread fans out to ``on_transport_event``;
+web request threads + the scene runner call the dispatch helpers
+synchronously. Audit findings A1–A6 + B5 (see the active project-
+wide audit plan in ``.claude/plans/``) added the TX-serialization
+lock, the ``_pending_config_lock`` and ``_pending_expect_lock``,
+and the SSE broadcast lock-discipline fix that this service
+depends on.
+"""
 
 from __future__ import annotations
 
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 from ..domain import create_device, get_dev_type_info
 from ..protocol import opcode_name as protocol_opcode_name
 from ..protocol import request_direction, response_opcode, response_policy, rules as protocol_rules
 from ..transport.framing import mac_last3_from_hex
-from ..transport.gateway_events import EV_ERROR, EV_RX_WINDOW_CLOSED, EV_RX_WINDOW_OPEN, EV_TX_DONE, LP
+from ..transport.gateway_events import (
+    EV_ERROR,
+    EV_STATE_CHANGED,
+    EV_STATE_REPORT,
+    EV_TX_DONE,
+    EV_TX_REJECTED,
+    GATEWAY_STATE_IDLE,
+    GATEWAY_STATE_NAME,
+    GATEWAY_STATE_RX,
+    GATEWAY_STATE_RX_WINDOW,
+    GATEWAY_STATE_UNKNOWN,
+    LP,
+)
 from .pending_requests import (
     RESP_ACK as PR_RESP_ACK,
     RESP_SPECIFIC as PR_RESP_SPECIFIC,
     PendingRequestRegistry,
 )
+from . import rf_timing
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +79,23 @@ class GatewayService:
         self._auto_reassign_cooldown_s = 2.0
         self._auto_reassign_recent: dict[str, float] = {}
         self._auto_reassign_lock = threading.Lock()
-        # Tracks in-flight auto-restore worker threads. Tests join on them via
-        # ``_join_auto_restore_workers`` to make the asynchronous behavior
-        # deterministic.
-        self._auto_restore_workers: list[threading.Thread] = []
+        # A7: bounded executor for auto-restore workers. The previous
+        # implementation kept a ``list[Thread]`` and pruned dead
+        # entries on every spawn — which never pruned if no further
+        # spawns happened, leaving up to N+1 dead Thread objects in
+        # memory until process exit. ``ThreadPoolExecutor`` caps
+        # concurrent work at ``max_workers`` (8 is plenty for typical
+        # fleets) and reuses threads across submissions; an idle pool
+        # holds 0 active threads.
+        #
+        # ``_auto_restore_futures`` keeps the in-flight futures so the
+        # test hook ``_join_auto_restore_workers`` can wait on them
+        # deterministically (mirrors the previous behaviour).
+        self._auto_restore_executor = ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="rl-auto-restore",
+        )
+        self._auto_restore_futures: list[Future] = []
         # Transport redesign (plan Phase B): the Host owns request/reply
         # matching now that the Gateway stays in Continuous RX. The registry
         # unblocks unicast waiters as soon as the expected frame arrives; any
@@ -72,7 +127,13 @@ class GatewayService:
             return _NullLock()
         return lock
 
-    def send_and_wait_for_reply(self, recv3: bytes, opcode7: int, send_fn, timeout_s: float = 8.0) -> tuple[list[dict], bool]:
+    def send_and_wait_for_reply(
+        self,
+        recv3: bytes,
+        opcode7: int,
+        send_fn,
+        timeout_s: float = rf_timing.UNICAST_ATTEMPT_TIMEOUT_S,
+    ) -> tuple[list[dict], bool]:
         """Unicast request/response helper (plan Transport Redesign Phase B).
 
         The Host registers the expected ``(sender, opcode/ack_of)`` with the
@@ -134,7 +195,7 @@ class GatewayService:
                 send_fn,
                 _bcast_pred,
                 expected=1,
-                idle_timeout_s=0.6,
+                idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
                 max_timeout_s=float(timeout_s),
             )
             return replies, bool(replies)
@@ -203,14 +264,74 @@ class GatewayService:
             time.sleep(settle)
         return [req.reply], True
 
+    def send_and_wait_with_retries(
+        self,
+        recv3: bytes,
+        opcode7: int,
+        send_fn,
+        *,
+        attempts: Optional[int] = None,
+        per_attempt_timeout_s: Optional[float] = None,
+        retry_delay_s: Optional[float] = None,
+    ) -> tuple[list[dict], bool]:
+        """Wait-for-reply with bounded retries on transient timeout.
+
+        Composes ``send_and_wait_for_reply`` in a retry loop. The
+        per-attempt timeout is short (``rf_timing.UNICAST_ATTEMPT_TIMEOUT_S``,
+        default 1.5 s); a single dropped frame on either direction
+        triggers an automatic retry rather than a false-negative
+        timeout for the caller. Success on any attempt
+        short-circuits.
+
+        Defaults pulled from :mod:`rf_timing`. Worst case
+        ≈ ``per_attempt × attempts + retry_delay × (attempts - 1)``,
+        which with the defaults is ~4.7 s — *shorter* than the
+        old 8 s single-attempt timeout this helper replaces, even
+        for genuinely-offline devices.
+        """
+        n = int(attempts if attempts is not None else rf_timing.UNICAST_MAX_ATTEMPTS)
+        if n < 1:
+            n = 1
+        per = float(
+            per_attempt_timeout_s
+            if per_attempt_timeout_s is not None
+            else rf_timing.UNICAST_ATTEMPT_TIMEOUT_S
+        )
+        delay = float(
+            retry_delay_s if retry_delay_s is not None else rf_timing.UNICAST_RETRY_DELAY_S
+        )
+
+        last_events: list[dict] = []
+        for attempt in range(n):
+            events, ok = self.send_and_wait_for_reply(recv3, opcode7, send_fn, timeout_s=per)
+            if ok:
+                if attempt > 0:
+                    logger.debug(
+                        "send_and_wait_with_retries: matched on attempt %d/%d (opcode=0x%02X)",
+                        attempt + 1,
+                        n,
+                        int(opcode7) & 0x7F,
+                    )
+                return events, True
+            last_events = events
+            if attempt < n - 1 and delay > 0.0:
+                time.sleep(delay)
+        logger.debug(
+            "send_and_wait_with_retries: exhausted %d attempts (opcode=0x%02X, per=%.2fs)",
+            n,
+            int(opcode7) & 0x7F,
+            per,
+        )
+        return last_events, False
+
     def send_and_collect(
         self,
         send_fn,
         collect_pred,
         *,
         expected: Optional[int] = None,
-        idle_timeout_s: float = 0.6,
-        max_timeout_s: float = 5.0,
+        idle_timeout_s: float = rf_timing.COLLECT_IDLE_TIMEOUT_S,
+        max_timeout_s: float = rf_timing.COLLECT_MAX_CEILING_S,
     ) -> list[dict]:
         """Broadcast-style collector with idle-based termination.
 
@@ -306,9 +427,9 @@ class GatewayService:
     def compute_collect_max_timeout(
         expected: int,
         *,
-        base_s: float = 1.0,
-        per_device_s: float = 0.15,
-        ceiling_s: float = 5.0,
+        base_s: float = rf_timing.COLLECT_BASE_S,
+        per_device_s: float = rf_timing.COLLECT_PER_DEVICE_S,
+        ceiling_s: float = rf_timing.COLLECT_MAX_CEILING_S,
     ) -> float:
         """Derive a max-timeout ceiling from the expected responder count.
 
@@ -319,7 +440,17 @@ class GatewayService:
         n = max(0, int(expected))
         return min(ceiling_s, base_s + n * float(per_device_s))
 
-    def send_config(self, option, data0=0, data1=0, data2=0, data3=0, recv3=b"\xFF\xFF\xFF", wait_for_ack: bool = False, timeout_s: float = 6.0):
+    def send_config(
+        self,
+        option,
+        data0=0,
+        data1=0,
+        data2=0,
+        data3=0,
+        recv3=b"\xFF\xFF\xFF",
+        wait_for_ack: bool = False,
+        timeout_s: Optional[float] = None,
+    ):
         transport = self.transport
         if transport is None:
             logger.warning("sendConfig: communicator not ready")
@@ -350,7 +481,17 @@ class GatewayService:
             if not dev:
                 _send()
                 return False
-            events, _ = self.send_and_wait_for_reply(recv3, LP.OPC_CONFIG, _send, timeout_s=timeout_s)
+            per_attempt = (
+                float(timeout_s)
+                if timeout_s is not None
+                else rf_timing.UNICAST_ATTEMPT_TIMEOUT_S
+            )
+            events, _ = self.send_and_wait_with_retries(
+                recv3,
+                LP.OPC_CONFIG,
+                _send,
+                per_attempt_timeout_s=per_attempt,
+            )
             if not events:
                 return False
             ev = events[-1]
@@ -358,13 +499,23 @@ class GatewayService:
         _send()
         return True
 
-    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF"):
+    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
         if not self.transport:
             logger.warning("sendSync: communicator not ready")
             return
-        self.transport.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF, brightness=int(brightness) & 0xFF)
+        from ..protocol.packets import SYNC_FLAG_TRIGGER_ARMED
+        flags = SYNC_FLAG_TRIGGER_ARMED if trigger_armed else 0
+        self.transport.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF,
+                                 brightness=int(brightness) & 0xFF, flags=flags)
 
-    def send_stream(self, payload: bytes, groupId: Optional[int] = None, device=None, retries: int = 2, timeout_s: float = 8.0) -> dict[str, int]:
+    def send_stream(
+        self,
+        payload: bytes,
+        groupId: Optional[int] = None,
+        device=None,
+        retries: int = rf_timing.STREAM_MAX_ATTEMPTS - 1,
+        timeout_s: float = rf_timing.STREAM_ATTEMPT_TIMEOUT_S,
+    ) -> dict[str, int]:
         transport = self.transport
         if transport is None:
             logger.warning("sendStream: communicator not ready")
@@ -447,13 +598,13 @@ class GatewayService:
                 lambda: transport.send_stream(recv3=recv3, payload=data),
                 _collect,
                 expected=expected,
-                idle_timeout_s=0.6,
+                idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
                 max_timeout_s=max_timeout,
             )
             if len(acked) >= expected:
                 break
             if attempt < int(retries):
-                time.sleep(0.1)
+                time.sleep(rf_timing.STREAM_RETRY_DELAY_S)
 
         return {"expected": expected, "acked": len(acked)}
 
@@ -474,11 +625,11 @@ class GatewayService:
           :class:`PendingRequestRegistry`),
         * :meth:`send_and_collect` for broadcast collectors (wall-clock based).
 
-        This function remains available for backwards compatibility and still
-        honours the original contract (returns on ``EV_RX_WINDOW_CLOSED`` or
-        on timeout, optionally short-circuiting on first match). It is used
-        only by the broadcast fallback path in :meth:`send_and_wait_for_reply`
-        and by a handful of third-party callers.
+        Batch B (2026-04-28) collapsed EV_RX_WINDOW_OPEN/CLOSED into
+        EV_STATE_CHANGED; the "window closed" signal is now an
+        EV_STATE_CHANGED transition out of the RX_WINDOW state byte. This
+        helper detects that transition while remaining backwards-compatible
+        with its (collected, got_closed) return tuple.
         """
         if not self.transport:
             return [], False
@@ -486,6 +637,13 @@ class GatewayService:
         transport = self.transport
         collected = []
         got_closed = False
+
+        def _is_window_closed_transition(ev: dict) -> bool:
+            # EV_STATE_CHANGED away from RX_WINDOW = the legacy "closed".
+            if ev.get("type") != EV_STATE_CHANGED:
+                return False
+            new_state = int(ev.get("state_byte", -1))
+            return new_state != GATEWAY_STATE_RX_WINDOW
 
         if hasattr(transport, "add_listener") and hasattr(transport, "remove_listener"):
             closed_ev = threading.Event()
@@ -495,7 +653,7 @@ class GatewayService:
                 try:
                     if not isinstance(ev, dict):
                         return
-                    if ev.get("type") == EV_RX_WINDOW_CLOSED:
+                    if _is_window_closed_transition(ev):
                         got_closed = True
                         closed_ev.set()
                         return
@@ -521,7 +679,7 @@ class GatewayService:
         t_end = time.time() + float(fail_safe_s)
         while time.time() < t_end:
             for ev in transport.drain_events(timeout_s=0.1):
-                if ev.get("type") == EV_RX_WINDOW_CLOSED:
+                if _is_window_closed_transition(ev):
                     got_closed = True
                     return collected, got_closed
                 if collect_pred and collect_pred(ev):
@@ -529,6 +687,98 @@ class GatewayService:
                     if stop_on_match:
                         return collected, got_closed
         return collected, got_closed
+
+    def query_state(self, *, timeout_s: float = 0.5) -> dict:
+        """Send GW_CMD_STATE_REQUEST and wait for the matching EV_STATE_REPORT.
+
+        Returns a dict with the same shape the SSE layer broadcasts:
+
+            {
+                "state": "IDLE" | "TX" | "RX_WINDOW" | "RX" | "ERROR" | "UNKNOWN",
+                "state_byte": int,
+                "state_metadata_ms": int,
+                "ok": bool,            # True iff a STATE_REPORT actually arrived
+            }
+
+        Used at startup (host-side seed of the master pill before any
+        spontaneous EV_STATE_CHANGED would have fired) and from the master-
+        pill ↻ refresh button. ``timeout_s`` is short by design — the round-
+        trip is a USB write + USB read with no LoRa airtime; 500 ms is
+        generous.
+        """
+        transport = self.transport
+        if transport is None:
+            return {
+                "ok": False,
+                "state": "UNKNOWN",
+                "state_byte": GATEWAY_STATE_UNKNOWN,
+                "state_metadata_ms": 0,
+            }
+
+        replied = threading.Event()
+        result: dict = {}
+
+        def _cb(ev: dict):
+            try:
+                if not isinstance(ev, dict):
+                    return
+                if ev.get("type") != EV_STATE_REPORT:
+                    return
+                result["state"] = ev.get("state") or GATEWAY_STATE_NAME.get(
+                    int(ev.get("state_byte", GATEWAY_STATE_UNKNOWN)), "UNKNOWN",
+                )
+                result["state_byte"] = int(ev.get("state_byte", GATEWAY_STATE_UNKNOWN))
+                result["state_metadata_ms"] = int(ev.get("state_metadata_ms", 0) or 0)
+                replied.set()
+            except Exception:
+                logger.debug("query_state callback raised", exc_info=True)
+
+        try:
+            transport.add_listener(_cb)
+        except Exception:
+            logger.debug("query_state: add_listener failed", exc_info=True)
+            # Fall through to write-and-snapshot — better than failing hard.
+
+        try:
+            ok_write = True
+            try:
+                send = getattr(transport, "send_state_request", None)
+                if callable(send):
+                    ok_write = bool(send())
+            except Exception:
+                logger.debug("query_state: send_state_request raised", exc_info=True)
+                ok_write = False
+
+            if ok_write:
+                replied.wait(timeout=float(timeout_s))
+        finally:
+            try:
+                transport.remove_listener(_cb)
+            except Exception:
+                logger.debug("query_state: remove_listener failed", exc_info=True)
+
+        if result:
+            result["ok"] = True
+            return result
+
+        # Fallback: report the transport's last-known state. Better than
+        # nothing — the operator at least sees whatever the pill mirror has.
+        snap = getattr(transport, "gateway_state_snapshot", None)
+        if callable(snap):
+            try:
+                snap_obj = snap()
+                if isinstance(snap_obj, dict):
+                    base: dict = dict(snap_obj)
+                    base["ok"] = False
+                    return base
+            except Exception:
+                logger.debug("query_state: snapshot raised", exc_info=True)
+        return {
+            "ok": False,
+            "state": "UNKNOWN",
+            "state_byte": GATEWAY_STATE_UNKNOWN,
+            "state_metadata_ms": 0,
+        }
 
     def opcode_name(self, opcode7: int) -> str:
         return protocol_opcode_name(int(opcode7) & 0x7F)
@@ -589,16 +839,23 @@ class GatewayService:
         if ev.get("reply"):
             logger.debug("RX %s from %s (opc=0x%02X)", ev.get("reply"), sender3_hex, opc)
 
-    def log_rx_window_event(self, ev: dict) -> None:
+    def log_state_event(self, ev: dict) -> None:
+        """Log a Batch-B EV_STATE_CHANGED / EV_STATE_REPORT event for diagnostics.
+
+        Replaces the pre-Batch-B ``log_rx_window_event``: the window-open /
+        window-closed pair is now expressed as transitions of the gateway's
+        single state byte. RX_WINDOW carries ``state_metadata_ms`` (the
+        ``min_ms`` window size); other states carry 0.
+        """
         t = ev.get("type")
-        if self.transport:
-            state = int(ev.get("rx_windows", getattr(self.transport, "rx_window_state", 0)) or 0)
+        if t not in (EV_STATE_CHANGED, EV_STATE_REPORT):
+            return
+        state_name = ev.get("state") or GATEWAY_STATE_NAME.get(int(ev.get("state_byte", -1)), "UNKNOWN")
+        meta_ms = int(ev.get("state_metadata_ms", 0) or 0)
+        if state_name == "RX_WINDOW":
+            logger.debug("Gateway state -> RX_WINDOW (min_ms=%s)", meta_ms)
         else:
-            state = int(ev.get("rx_windows", 0) or 0)
-        if t == EV_RX_WINDOW_OPEN:
-            logger.debug("RX window OPEN: state=%s min_ms=%s", state, ev.get("window_ms"))
-        elif t == EV_RX_WINDOW_CLOSED:
-            logger.debug("RX window CLOSED: state=%s delta=%s", state, ev.get("rx_count_delta"))
+            logger.debug("Gateway state -> %s", state_name)
 
     def handle_ack_event(self, ev: dict) -> None:
         try:
@@ -740,10 +997,30 @@ class GatewayService:
                 self.schedule_reconnect(reason)
                 return
 
-            if t in (EV_RX_WINDOW_OPEN, EV_RX_WINDOW_CLOSED):
-                self.log_rx_window_event(ev)
-                if t == EV_RX_WINDOW_CLOSED:
+            if t in (EV_STATE_CHANGED, EV_STATE_REPORT):
+                self.log_state_event(ev)
+                # Post-Batch-B: pending unicast requests time out via the
+                # registry's wall-clock deadline rather than via an explicit
+                # RX_WINDOW_CLOSED event. We still trigger the timeout-style
+                # pending_window_closed sweep on the RX_WINDOW -> non-window
+                # transition so the legacy "missing reply" path still fires
+                # for the broadcast-fallback callers that depend on it.
+                state_byte = int(ev.get("state_byte", -1))
+                if state_byte != GATEWAY_STATE_RX_WINDOW:
                     self.pending_window_closed(ev)
+                return
+
+            if t == EV_TX_REJECTED:
+                # Diagnostic surface only — _send_m2n's outcome wait already
+                # received this NACK and converted it to a SendOutcome.REJECTED.
+                # Logging keeps the failure observable for non-_send_m2n paths
+                # (e.g. orphan NACKs from gateway-internal auto-sync).
+                logger.debug(
+                    "EV_TX_REJECTED type=0x%02X opc=0x%02X reason=%s",
+                    int(ev.get("type_full", 0) or 0),
+                    int(ev.get("opc", 0) or 0),
+                    ev.get("reason_name") or ev.get("reason"),
+                )
                 return
 
             if t == EV_TX_DONE:
@@ -870,7 +1147,9 @@ class GatewayService:
         self._spawn_auto_reassign_worker(dev, stored_group=stored_group)
 
     def _spawn_auto_reassign_worker(self, dev, *, stored_group: int) -> None:
-        """Run ``setNodeGroupId(wait_for_ack=True)`` in a daemon thread."""
+        """Submit ``setNodeGroupId(wait_for_ack=True)`` to the bounded
+        auto-restore executor. The executor caps concurrency at 8
+        workers (see ``__init__``) and reuses threads across submits."""
         def _worker():
             try:
                 ok = self.controller.setNodeGroupId(
@@ -898,23 +1177,60 @@ class GatewayService:
                         getattr(dev, "addr", "?"),
                     )
 
-        worker = threading.Thread(
-            target=_worker,
-            name=f"racelink-auto-restore-{(dev.addr or '')[-6:].upper()}",
-            daemon=True,
-        )
         with self._auto_reassign_lock:
-            # Prune finished workers so the list does not grow unbounded.
-            self._auto_restore_workers = [t for t in self._auto_restore_workers if t.is_alive()]
-            self._auto_restore_workers.append(worker)
-        worker.start()
+            # Prune completed futures so the in-flight list stays
+            # bounded between submits. The executor itself manages
+            # the worker threads; this list is purely for the test
+            # join-hook below.
+            self._auto_restore_futures = [
+                f for f in self._auto_restore_futures if not f.done()
+            ]
+            try:
+                fut = self._auto_restore_executor.submit(_worker)
+            except RuntimeError:
+                # swallow-ok: executor was shut down (process is
+                # exiting). Nothing else to do — the auto-restore
+                # is best-effort.
+                logger.debug(
+                    "auto-restore executor refused submit (shut down?)",
+                    exc_info=True,
+                )
+                return
+            self._auto_restore_futures.append(fut)
 
     def _join_auto_restore_workers(self, timeout: float = 5.0) -> None:
-        """Wait for spawned auto-restore workers to complete (test hook)."""
+        """Wait for in-flight auto-restore workers to complete.
+
+        Test hook — production code never needs to join (the workers
+        are best-effort). Iterates over a snapshot of the futures so
+        a concurrent submit doesn't change what we're waiting on.
+        """
         with self._auto_reassign_lock:
-            workers = list(self._auto_restore_workers)
-        for t in workers:
-            t.join(timeout=timeout)
+            futs = list(self._auto_restore_futures)
+        for fut in futs:
+            try:
+                fut.result(timeout=timeout)
+            except Exception:
+                # swallow-ok: test hook just wants a deterministic
+                # "all in-flight work has finished" barrier.
+                # The worker itself logs any real failure.
+                logger.debug(
+                    "auto-restore worker future raised in test join",
+                    exc_info=True,
+                )
+
+    def shutdown(self) -> None:
+        """Release the auto-restore executor. Safe to call multiple
+        times. Called from ``RaceLink_Host.shutdown``; tests can also
+        invoke this to ensure the pool is gone before the test exits.
+        """
+        try:
+            self._auto_restore_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            # swallow-ok: shutdown is best-effort cleanup. ``shutdown``
+            # raises only if the executor is already in a broken
+            # state; nothing useful to do at that point.
+            logger.debug("auto-restore executor shutdown raised", exc_info=True)
 
     def _is_discovery_active(self) -> bool:
         checker = getattr(self.controller, "is_discovery_active", None)
@@ -977,7 +1293,9 @@ class GatewayService:
             finally:
                 self.controller._reconnect_in_progress = False
 
-        threading.Thread(target=_reconnect, daemon=True).start()
+        # A8: named so threading.enumerate() / py-spy outputs are
+        # legible during a reconnect storm.
+        threading.Thread(target=_reconnect, daemon=True, name="rl-reconnect").start()
 
     def pending_try_match(self, ev: dict) -> None:
         # A5: snapshot via the controller helper, then use compare-and-
