@@ -1,0 +1,101 @@
+/* RaceLink WebUI legacy stylesheet.
+ *
+ * Design tokens (color and spacing variables) are declared in
+ * styles/tailwind.css under @theme; importing tailwind.css before this
+ * file in main.ts guarantees the variables are in scope by the time
+ * the rules below resolve them.
+ *
+ * Scope: rules below back the components that have not yet been
+ * migrated to Tailwind utilities or shadcn-vue primitives. The
+ * inventory of remaining classes mirrors what is actually referenced
+ * in the Vue source tree; dead rules from the pre-Vue WebUI have been
+ * removed (cleanup section 4a, 2026-05-04). Per-section migration of
+ * the remaining rules to Tailwind utilities is tracked as section 4b.
+ *
+ * Cascade: every rule below sits in @layer base so Tailwind utility
+ * classes (in @layer utilities) win cleanly when a component opts in
+ * to inline utilities for the same element. Without this wrapper the
+ * unlayered class rules would shadow utilities of equal specificity
+ * (CSS spec: unlayered author rules beat any layered author rules,
+ * regardless of specificity).
+ */
+
+@layer base {
+*{ box-sizing:border-box; }
+body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--color-bg); color:var(--color-text); }
+
+/* ===== Device table ===================================================
+ *
+ * The device table keeps its CSS-component class because the rule set is
+ * a coherent layout (sticky thead, dense rows, larger checkboxes) that
+ * compresses to a single class far more readably than a soup of utility
+ * classes spread over every <th> and <td>. The class lives in the base
+ * layer so per-cell utility-class overrides still win when needed.
+ */
+.rl-table{ width:100%; border-collapse:collapse; }
+.rl-table th, .rl-table td{ text-align:left; padding:8px; border-bottom:1px solid #2a2a32; font-size:13px; }
+.rl-table thead th{ position:sticky; top:0; background:#1a1a21; z-index:1; cursor:pointer; }
+.rl-table input[type="checkbox"]{ transform:scale(1.2); }
+
+/* Live row-update flash animation. Triggered when a device's
+   ``last_seen_ts`` advances between renders (typically from a
+   STATUS_REPLY or IDENTIFY_REPLY arriving over SSE). The row briefly
+   brightens, then fades back to its normal background. The animation is
+   short (1.0 s) so a burst of replies during a bulk-status flow feels
+   live without strobing the entire table.
+   Selector targets the ``<li>`` directly (sidebar) and the ``<td>``
+   children of ``<tr class="rl-row-flash">`` (device table) — for table
+   rows the animation must hit the cells, since the row's own background
+   is hidden behind opaque cell backgrounds. */
+@keyframes rl-row-flash {
+  0%   { background-color: rgba(76, 139, 245, 0.32); }
+  60%  { background-color: rgba(76, 139, 245, 0.16); }
+  100% { background-color: transparent; }
+}
+li.rl-row-flash,
+tr.rl-row-flash > td {
+  animation: rl-row-flash 1.0s ease-out;
+}
+
+/* ===== Component-class utilities ===================================== *
+ * Small kept-as-classes for composability: ``.tag.ok/.off/.online`` is a
+ * three-variant chip used in many table cells, and ``.mono`` / ``.row`` /
+ * ``.inline`` are layout helpers used widely enough that inlining the
+ * utilities at every site would be noise.
+ */
+.mono{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; font-size:12px; }
+.tag{ padding:2px 6px; border-radius:10px; font-size:12px; border:1px solid #2a2a32; }
+.tag.ok{ color:#b6f5cf; border-color:#2d553f; background:#102017; }
+.tag.off{ color:#ffd8d8; border-color:#5a2a2a; background:#221314; }
+.tag.online{ color:#c8f0ff; border-color:#2a4459; background:#12202a; }
+.row{ display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; }
+.inline{ display:inline-flex; align-items:center; gap:6px; }
+
+/* ===== Generic form controls =========================================
+ * Site-wide skin for bare ``<button>`` / ``<select>`` / ``<input>``.
+ * Lives in @layer base so per-element Tailwind utility classes win
+ * cleanly. shadcn-vue primitives bring their own styles and override
+ * via class specificity (10) regardless of layer.
+ */
+button{ background:#232330; border:1px solid #2a2a32; color:var(--color-text); padding:6px 10px; border-radius:8px; cursor:pointer; }
+button:hover{ border-color:#3b3b44; }
+button:disabled{ opacity:.5; cursor:not-allowed; }
+select, input{ background:#1a1a23; color:var(--color-text); border:1px solid #2a2a32; border-radius:8px; padding:6px 8px; }
+
+/* ===== Toast ========================================================= */
+.rl-toast{
+  position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+  background:#2a4a2a; color:#e8ffe8;
+  border:1px solid #3a6a3a; border-radius:8px;
+  padding:8px 16px; font-size:13px; z-index:9999;
+  box-shadow:0 2px 8px rgba(0,0,0,0.3);
+  transition:opacity 0.3s;
+  max-width:min(90vw, 520px);
+  text-align:center;
+}
+.rl-toast.hidden{ display:none; }
+.rl-toast.rl-toast-error{
+  background:#4a1a1a; color:#ffeaea;
+  border-color:#7a2a2a;
+}
+}  /* end @layer base */

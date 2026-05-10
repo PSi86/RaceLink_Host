@@ -78,13 +78,199 @@ class SpecialsService:
             # swallow-ok: best-effort fallback; caller proceeds with safe default
             return default
 
-    def validate_option_value(self, option_info: dict, value_int: int) -> None:
+    def validate_option_value(self, option_info: dict, value) -> None:
+        """Range-check a value against an option's declared bounds.
+
+        Scalar options (``bytes`` 1 or 2) accept an int and validate
+        against ``min`` / ``max``. Pair options
+        (``shape == "uint16-pair"``) accept a dict keyed by the field
+        names declared in ``fields`` and validate each sub-value against
+        the matching per-field bounds.
+        """
+        if option_info.get("shape") == "uint16-pair":
+            if not isinstance(value, dict):
+                raise ValueError("value must be an object with start/stop")
+            for field in option_info.get("fields", []) or []:
+                name = field.get("name")
+                if not name:
+                    continue
+                if name not in value:
+                    raise ValueError(f"missing field {name!r}")
+                try:
+                    sub = int(value[name])
+                except (TypeError, ValueError) as ex:
+                    raise ValueError(f"invalid value for {name!r}") from ex
+                f_min = field.get("min")
+                f_max = field.get("max")
+                if f_min is not None and sub < int(f_min):
+                    raise ValueError(f"{name} must be >= {f_min}")
+                if f_max is not None and sub > int(f_max):
+                    raise ValueError(f"{name} must be <= {f_max}")
+            return
+
+        try:
+            value_int = int(value)
+        except (TypeError, ValueError) as ex:
+            raise ValueError("value must be an integer") from ex
         min_v = option_info.get("min")
         max_v = option_info.get("max")
         if min_v is not None and value_int < int(min_v):
             raise ValueError(f"value must be >= {min_v}")
         if max_v is not None and value_int > int(max_v):
             raise ValueError(f"value must be <= {max_v}")
+
+    @staticmethod
+    def pack_option_value(option_info: dict, value) -> tuple[int, int, int, int]:
+        """Pack a validated option value into the four ``OPC_CONFIG`` data bytes.
+
+        Layout per option ``bytes`` / ``shape``:
+
+        * ``bytes == 1`` → ``(value & 0xFF, 0, 0, 0)``
+        * ``bytes == 2`` → uint16 little-endian in ``data0..1``
+        * ``shape == "uint16-pair"`` → first field LE in ``data0..1``,
+          second field LE in ``data2..3``
+
+        Multi-byte ordering matches
+        ``RaceLink_Docs/docs/reference/wire-protocol.md`` §``P_Config``.
+        """
+        if option_info.get("shape") == "uint16-pair":
+            fields = option_info.get("fields") or []
+            if len(fields) != 2 or not isinstance(value, dict):
+                raise ValueError("uint16-pair requires {start, stop}")
+            a = int(value[fields[0]["name"]]) & 0xFFFF
+            b = int(value[fields[1]["name"]]) & 0xFFFF
+            return (a & 0xFF, (a >> 8) & 0xFF, b & 0xFF, (b >> 8) & 0xFF)
+
+        try:
+            value_int = int(value)
+        except (TypeError, ValueError) as ex:
+            raise ValueError("value must be an integer") from ex
+
+        bytes_ = int(option_info.get("bytes", 1) or 1)
+        if bytes_ == 1:
+            return (value_int & 0xFF, 0, 0, 0)
+        if bytes_ == 2:
+            return (value_int & 0xFF, (value_int >> 8) & 0xFF, 0, 0)
+        # No 3- or 4-byte scalar shape today; treat as data0..3 LE for safety.
+        return (
+            value_int & 0xFF,
+            (value_int >> 8) & 0xFF,
+            (value_int >> 16) & 0xFF,
+            (value_int >> 24) & 0xFF,
+        )
+
+    @staticmethod
+    def unpack_option_value(option_info: dict, data0: int, data1: int = 0, data2: int = 0, data3: int = 0):
+        """Inverse of :meth:`pack_option_value`.
+
+        Parses the four data bytes returned by ``OPC_GET_CONFIG`` (or
+        any caller carrying a ``P_Config``-shaped payload) back into
+        the schema's value shape:
+
+        * ``bytes == 1`` → ``int`` from ``data0``.
+        * ``bytes == 2`` → ``int`` from ``data0 | (data1 << 8)`` (LE).
+        * ``shape == "uint16-pair"`` → ``{"start": ..., "stop": ...}``
+          with each field LE-decoded from its byte slot.
+
+        Mirrors ``RaceLink_Docs/docs/reference/wire-protocol.md``
+        §``P_Config`` (LE for every multi-byte field).
+        """
+        if option_info.get("shape") == "uint16-pair":
+            fields = option_info.get("fields") or []
+            if len(fields) != 2:
+                raise ValueError("uint16-pair requires exactly two fields")
+            a = (int(data0) & 0xFF) | ((int(data1) & 0xFF) << 8)
+            b = (int(data2) & 0xFF) | ((int(data3) & 0xFF) << 8)
+            return {fields[0]["name"]: a, fields[1]["name"]: b}
+
+        bytes_ = int(option_info.get("bytes", 1) or 1)
+        if bytes_ == 1:
+            return int(data0) & 0xFF
+        if bytes_ == 2:
+            return (int(data0) & 0xFF) | ((int(data1) & 0xFF) << 8)
+        # 3- or 4-byte scalar — no schema uses this today, but mirror
+        # the pack-side fallback so encode/decode stay symmetric.
+        return (
+            (int(data0) & 0xFF)
+            | ((int(data1) & 0xFF) << 8)
+            | ((int(data2) & 0xFF) << 16)
+            | ((int(data3) & 0xFF) << 24)
+        )
+
+    @staticmethod
+    def write_specials(dev, option_info: dict, value) -> list[str]:
+        """Persist ``value`` into ``dev.specials`` for the given option.
+
+        Used by both the wire-write path (after a successful
+        ``OPC_CONFIG`` ACK) and the import path (operator chose to
+        adopt the device's reported value into the host db without
+        sending an OPC). Returns the list of flat keys that were
+        written, so callers can build a precise SSE / refresh hint.
+        """
+        if not hasattr(dev, "specials") or dev.specials is None:
+            dev.specials = {}
+        written: list[str] = []
+        if option_info.get("shape") == "uint16-pair":
+            for field in option_info.get("fields", []) or []:
+                name = field.get("name")
+                if not name:
+                    continue
+                flat = f"{option_info['key']}_{name}"
+                dev.specials[flat] = int(value[name]) & 0xFFFF
+                written.append(flat)
+        else:
+            key = option_info.get("key")
+            if key:
+                dev.specials[key] = int(value) & 0xFFFF
+                written.append(key)
+        return written
+
+    @staticmethod
+    def specials_keys_for_option(option_info: dict) -> list[str]:
+        """Return the ``dev.specials`` keys that store this option.
+
+        Scalar -> ``[option_info["key"]]``.
+        Pair -> ``["<key>_<field.name>", ...]``.
+        """
+        key = option_info.get("key")
+        if not key:
+            return []
+        if option_info.get("shape") == "uint16-pair":
+            return [f"{key}_{f['name']}" for f in (option_info.get("fields") or []) if f.get("name")]
+        return [key]
+
+    @staticmethod
+    def stored_value_from_specials(option_info: dict, specials: dict) -> object | None:
+        """Read the stored value for an option out of ``dev.specials``.
+
+        Returns ``None`` when no value is recorded; otherwise an ``int``
+        (scalar) or a ``{field: int, ...}`` dict (pair).
+        """
+        if option_info.get("shape") == "uint16-pair":
+            fields = option_info.get("fields") or []
+            key = option_info.get("key")
+            out: dict[str, int] = {}
+            for f in fields:
+                name = f.get("name")
+                if not name:
+                    continue
+                flat = f"{key}_{name}"
+                if flat not in specials:
+                    return None
+                try:
+                    out[name] = int(specials[flat])
+                except Exception:
+                    # swallow-ok: malformed persisted byte; treat the pair as absent.
+                    return None
+            return out
+        key = option_info.get("key")
+        if not key or key not in specials:
+            return None
+        try:
+            return int(specials[key])
+        except Exception:
+            # swallow-ok: malformed persisted byte; treat as absent.
+            return None
 
     @staticmethod
     def _coerce_color(raw) -> tuple[int, int, int]:
@@ -136,9 +322,9 @@ class SpecialsService:
         **Missing values are NOT defaulted** — if a var is absent from the
         request (typical for A12 when the WebUI hides effect-irrelevant fields),
         it stays out of the coerced dict. Downstream services can treat missing
-        keys as "leave that slot untouched" (see ``build_control_adv_body`` which
+        keys as "leave that slot untouched" (see ``build_control_body`` which
         emits fieldMask/extMask bits only for provided kwargs). Callers that
-        need a legacy default (e.g. ``send_wled_control``) already apply
+        need a legacy default (e.g. ``send_control``) already apply
         ``params.get(key, fallback)`` themselves.
         """
 

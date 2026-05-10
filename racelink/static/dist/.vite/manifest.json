@@ -1,0 +1,23 @@
+{
+  "index.html": {
+    "file": "assets/index-ehRxXpR5.js",
+    "name": "index",
+    "src": "index.html",
+    "isEntry": true,
+    "dynamicImports": [
+      "src/pages/ScenesPage.vue"
+    ],
+    "css": [
+      "assets/index-CuJpUG-x.css"
+    ]
+  },
+  "src/pages/ScenesPage.vue": {
+    "file": "assets/ScenesPage-BVnBr9bX.js",
+    "name": "ScenesPage",
+    "src": "src/pages/ScenesPage.vue",
+    "isDynamicEntry": true,
+    "imports": [
+      "index.html"
+    ]
+  }
+}

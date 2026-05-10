@@ -8,40 +8,21 @@ import tempfile
 import types
 import unittest
 
+from tests._flask_stub import install_flask
 from racelink.domain import RL_Device, RL_DeviceGroup, RL_Dev_Type
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _ensure_flask_stub():
-    if "flask" in sys.modules:
-        return
-
-    flask = types.ModuleType("flask")
-
-    class Blueprint:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-        def route(self, *args, **kwargs):
-            def _decorator(fn):
-                return fn
-
-            return _decorator
-
-    flask.Blueprint = Blueprint
-    flask.request = types.SimpleNamespace(get_json=lambda silent=True: {}, files={}, form={})
-    flask.jsonify = lambda payload: payload
-    flask.Response = type("Response", (), {})
-    flask.stream_with_context = lambda fn: fn
-    flask.templating = types.SimpleNamespace(render_template=lambda *args, **kwargs: {})
-    sys.modules["flask"] = flask
-
-
 def _import_api_module():
-    _ensure_flask_stub()
+    flask = install_flask()
+    # ``test_web_api_routes`` asserts on the raw payload returned from
+    # each route, so override the shared stub's ``jsonify`` to be the
+    # identity function. Each test that re-imports the api module also
+    # repeats this override against the fresh ``api_module.jsonify``
+    # binding.
+    flask.jsonify = lambda payload: payload
     sys.modules.pop("racelink.web.api", None)
     return importlib.import_module("racelink.web.api")
 
@@ -527,14 +508,26 @@ class WebApiScenesRouteTests(unittest.TestCase):
         kinds = {entry["kind"] for entry in payload["kinds"]}
         self.assertEqual(
             kinds,
-            {"rl_preset", "wled_preset", "wled_control", "startblock",
+            {"rl_preset", "rl_effect", "wled_preset", "startblock",
              "sync", "delay", "offset_group"},
         )
-        self.assertIn("flag_keys", payload)
-        # All four user-intent flags must be exposed
+        # ``flags`` carries ``[{key, label}]`` — same shape as
+        # /api/rl-presets/schema so the per-action override block
+        # renders the same labels as the preset editor (§13).
+        self.assertIn("flags", payload)
         self.assertEqual(
-            set(payload["flag_keys"]),
+            {entry["key"] for entry in payload["flags"]},
             {"arm_on_sync", "force_tt0", "force_reapply", "offset_mode"},
+        )
+        # Labels are non-empty strings — the prior shape returned bare
+        # keys and forced the client to humanise them.
+        for entry in payload["flags"]:
+            self.assertIsInstance(entry.get("label"), str)
+            self.assertTrue(entry["label"].strip())
+        self.assertNotIn(
+            "flag_keys",
+            payload,
+            "the deprecated flag_keys field was removed in §13",
         )
 
     # ---- list / get ---------------------------------------------------
@@ -587,19 +580,24 @@ class WebApiScenesRouteTests(unittest.TestCase):
         # scenes_service._canonical_target and the broadcast-ruleset doc.
         # If a future contributor accidentally reintroduces the legacy
         # values ("scope" / singular "group"), this test surfaces it.
+        # Post-§8b each entry is a ``{value, label}`` object (the
+        # operator-facing label rides alongside the wire value).
         payload = self._route("/api/scenes/editor-schema", "GET")()
         self.assertEqual(
-            payload["target_kinds"],
+            [k["value"] for k in payload["target_kinds"]],
             ["broadcast", "groups", "device"],
         )
         self.assertEqual(
-            payload["container_target_kinds"],
+            [k["value"] for k in payload["container_target_kinds"]],
             ["broadcast", "groups"],
         )
         self.assertEqual(
-            payload["offset_group"]["child_target_kinds"],
+            [k["value"] for k in payload["offset_group"]["child_target_kinds"]],
             ["broadcast", "groups", "device"],
         )
+        # Every entry carries a non-empty operator-facing label.
+        for kind in payload["target_kinds"]:
+            self.assertTrue(kind["label"], kind)
         self.assertTrue(payload["offset_group"]["supports_broadcast_target"])
 
     def test_estimate_for_saved_scene_returns_per_action_and_total(self):
@@ -633,7 +631,7 @@ class WebApiScenesRouteTests(unittest.TestCase):
                  "groups": "all",
                  "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                  "actions": [
-                     {"kind": "wled_control",
+                     {"kind": "rl_effect",
                       "target": {"kind": "scope"},
                       "params": {"mode": 5}},
                  ]},
@@ -691,7 +689,7 @@ class WebApiScenesRouteTests(unittest.TestCase):
                  "target": {"kind": "groups", "value": [1, 2, 3, 4, 5, 6, 7]},
                  "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                  "actions": [
-                     {"kind": "wled_control",
+                     {"kind": "rl_effect",
                       "target": {"kind": "broadcast"},
                       "params": {"mode": 5}},
                  ]},
@@ -841,10 +839,10 @@ class WebApiScenesRouteTests(unittest.TestCase):
     def test_run_emits_scene_progress_events_per_action(self):
         # Script the fake runner with two transitions per action × two actions.
         scripted = [
-            {"index": 0, "kind": "rl_preset", "status": "running"},
-            {"index": 0, "kind": "rl_preset", "status": "ok", "duration_ms": 12},
-            {"index": 1, "kind": "sync",      "status": "running"},
-            {"index": 1, "kind": "sync",      "status": "ok", "duration_ms": 1},
+            {"index": 0, "kind": "rl_preset", "state": "started"},
+            {"index": 0, "kind": "rl_preset", "state": "ok", "duration_ms": 12},
+            {"index": 1, "kind": "sync",      "state": "started"},
+            {"index": 1, "kind": "sync",      "state": "ok", "duration_ms": 1},
         ]
         runner = _FakeSceneRunner(progress_events=scripted)
         ctx = _SceneFakeContext(runner=runner, scenes_storage_path=self.scenes_path)
@@ -863,11 +861,11 @@ class WebApiScenesRouteTests(unittest.TestCase):
         payloads = [p for _, p in ctx.sse.broadcasts]
         # scene_key is added by the fake; also assert the payload pass-through.
         self.assertEqual([p["index"] for p in payloads], [0, 0, 1, 1])
-        self.assertEqual([p["status"] for p in payloads], ["running", "ok", "running", "ok"])
+        self.assertEqual([p["state"] for p in payloads], ["started", "ok", "started", "ok"])
         self.assertEqual([p["scene_key"] for p in payloads], ["x"] * 4)
 
     def test_run_with_unknown_scene_emits_no_progress(self):
-        scripted = [{"index": 0, "kind": "sync", "status": "running"}]
+        scripted = [{"index": 0, "kind": "sync", "state": "started"}]
         runner = _FakeSceneRunner(missing_keys={"missing"}, progress_events=scripted)
         ctx = _SceneFakeContext(runner=runner, scenes_storage_path=self.scenes_path)
         api = self.api_module

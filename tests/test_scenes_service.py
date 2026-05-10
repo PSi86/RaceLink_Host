@@ -14,7 +14,7 @@ from racelink.services.scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
     MAX_ACTIONS_PER_SCENE,
     MAX_DELAY_MS,
@@ -28,9 +28,13 @@ from racelink.services.scenes_service import (
 
 
 def _rl_preset_action(group_id=1, preset_slug="start_red", brightness=200, **flags):
+    # Helper emits the canonical target shape directly so tests using this
+    # fixture do not incidentally trigger the §14 legacy-target deprecation
+    # warning. Tests that specifically exercise legacy shapes inline build
+    # their target dict explicitly.
     return {
         "kind": KIND_RL_PRESET,
-        "target": {"kind": "group", "value": group_id},
+        "target": {"kind": "groups", "value": [group_id]},
         "params": {"presetId": preset_slug, "brightness": brightness},
         "flags_override": dict(flags),
     }
@@ -295,9 +299,9 @@ class SceneServiceValidationTests(unittest.TestCase):
 
     # ---- offset_group container ---------------------------------------
 
-    def _wled_control_child(self, target=None, params=None):
+    def _rl_effect_child(self, target=None, params=None):
         return {
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": target or {"kind": "scope"},
             "params": params or {"presetId": 1, "brightness": 200},
         }
@@ -316,7 +320,7 @@ class SceneServiceValidationTests(unittest.TestCase):
                     {"id": 3, "offset_ms": 100},
                 ],
             },
-            "actions": [self._wled_control_child()],
+            "actions": [self._rl_effect_child()],
         }])
         action = scene["actions"][0]
         self.assertEqual(action["kind"], KIND_OFFSET_GROUP)
@@ -332,7 +336,7 @@ class SceneServiceValidationTests(unittest.TestCase):
                 {"id": 5, "offset_ms": 250},
             ],
         })
-        self.assertEqual(action["actions"][0]["kind"], KIND_WLED_CONTROL)
+        self.assertEqual(action["actions"][0]["kind"], KIND_RL_EFFECT)
         self.assertEqual(action["actions"][0]["target"], {"kind": "broadcast"})
 
     def test_offset_group_linear_all_groups_canonicalises(self):
@@ -462,7 +466,7 @@ class SceneServiceValidationTests(unittest.TestCase):
                 }])
 
     def test_offset_group_caps_children_count(self):
-        too_many = [self._wled_control_child() for _ in range(MAX_OFFSET_GROUP_CHILDREN + 1)]
+        too_many = [self._rl_effect_child() for _ in range(MAX_OFFSET_GROUP_CHILDREN + 1)]
         with self.assertRaises(ValueError):
             self.svc.create(label="X", actions=[{
                 "kind": KIND_OFFSET_GROUP,
@@ -494,7 +498,7 @@ class SceneServiceValidationTests(unittest.TestCase):
                 "groups": [1, 3],
                 "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                 "actions": [{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "group", "value": 2},
                     "params": {"presetId": 1},
                 }],
@@ -506,7 +510,7 @@ class SceneServiceValidationTests(unittest.TestCase):
             "groups": [1, 3],
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "group", "value": 3},
                 "params": {"presetId": 1},
             }],
@@ -521,7 +525,7 @@ class SceneServiceValidationTests(unittest.TestCase):
             "groups": "all",
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "group", "value": 42},
                 "params": {"presetId": 1},
             }],
@@ -536,7 +540,7 @@ class SceneServiceValidationTests(unittest.TestCase):
             "groups": "all",
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "device", "value": "aabbccddeeff"},
                 "params": {"presetId": 1},
             }],
@@ -549,7 +553,7 @@ class SceneServiceValidationTests(unittest.TestCase):
                 "groups": "all",
                 "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                 "actions": [{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "device", "value": "ABCD"},
                     "params": {"presetId": 1},
                 }],
@@ -563,7 +567,7 @@ class SceneServiceValidationTests(unittest.TestCase):
             "kind": KIND_OFFSET_GROUP,
             "groups": "all",
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
-            "actions": [self._wled_control_child()],
+            "actions": [self._rl_effect_child()],
         }])
         self.assertEqual(scene["actions"][0]["kind"], KIND_OFFSET_GROUP)
 
@@ -584,15 +588,18 @@ class SceneServiceValidationTests(unittest.TestCase):
         # Pre-hierarchy shape: kind=rl_preset with target.kind=groups_offset.
         # The loader rewrites the whole action into an offset_group container
         # with a single broadcast-target child.
-        scene = self.svc.create(label="Legacy", actions=[{
-            "kind": KIND_RL_PRESET,
-            "target": {
-                "kind": "groups_offset",
-                "groups": "all",
-                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
-            },
-            "params": {"presetId": "start_red"},
-        }])
+        with self.assertLogs(
+            "racelink.services.scenes_service", level="WARNING"
+        ) as cm:
+            scene = self.svc.create(label="Legacy", actions=[{
+                "kind": KIND_RL_PRESET,
+                "target": {
+                    "kind": "groups_offset",
+                    "groups": "all",
+                    "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                },
+                "params": {"presetId": "start_red"},
+            }])
         action = scene["actions"][0]
         self.assertEqual(action["kind"], KIND_OFFSET_GROUP)
         self.assertEqual(action["target"], {"kind": "broadcast"})
@@ -603,28 +610,100 @@ class SceneServiceValidationTests(unittest.TestCase):
         self.assertEqual(child["kind"], KIND_RL_PRESET)
         self.assertEqual(child["target"], {"kind": "broadcast"})
         self.assertEqual(child["params"], {"presetId": "start_red"})
+        # §14 deprecation log fires on legacy shape encounter.
+        self.assertTrue(any(
+            "deprecated legacy" in msg and "target.kind=groups_offset" in msg
+            for msg in cm.output
+        ), f"expected groups_offset deprecation warning, got: {cm.output}")
 
     def test_legacy_groups_offset_pre_formula_shape_migrated(self):
         # The original {id, offset_ms} list (with optional ui_hints) also
         # round-trips into the new container form.
-        scene = self.svc.create(label="OldOld", actions=[{
-            "kind": KIND_WLED_CONTROL,
-            "target": {
-                "kind": "groups_offset",
-                "groups": [
-                    {"id": 1, "offset_ms": 0},
-                    {"id": 3, "offset_ms": 100},
-                ],
-                "ui_hints": {"mode": "linear", "base_ms": 0, "step_ms": 100},
-            },
-            "params": {"presetId": 7},
-        }])
+        with self.assertLogs(
+            "racelink.services.scenes_service", level="WARNING"
+        ) as cm:
+            scene = self.svc.create(label="OldOld", actions=[{
+                "kind": KIND_RL_EFFECT,
+                "target": {
+                    "kind": "groups_offset",
+                    "groups": [
+                        {"id": 1, "offset_ms": 0},
+                        {"id": 3, "offset_ms": 100},
+                    ],
+                    "ui_hints": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                },
+                "params": {"presetId": 7},
+            }])
         action = scene["actions"][0]
         self.assertEqual(action["kind"], KIND_OFFSET_GROUP)
         self.assertEqual(action["target"], {"kind": "groups", "value": [1, 3]})
         self.assertEqual(action["offset"],
                          {"mode": "linear", "base_ms": 0, "step_ms": 100})
-        self.assertEqual(action["actions"][0]["kind"], KIND_WLED_CONTROL)
+        self.assertEqual(action["actions"][0]["kind"], KIND_RL_EFFECT)
+        self.assertTrue(any(
+            "deprecated legacy" in msg and "target.kind=groups_offset" in msg
+            for msg in cm.output
+        ), f"expected groups_offset deprecation warning, got: {cm.output}")
+
+    def test_legacy_scope_target_migrated_with_warning(self):
+        # Child-target {kind: "scope"} on an offset_group child is auto-
+        # migrated to {kind: "broadcast"} and emits a §14 deprecation warning.
+        with self.assertLogs(
+            "racelink.services.scenes_service", level="WARNING"
+        ) as cm:
+            scene = self.svc.create(label="ScopeShim", actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "target": {"kind": "broadcast"},
+                "offset": {"mode": "none"},
+                "actions": [{
+                    "kind": KIND_RL_PRESET,
+                    "target": {"kind": "scope"},
+                    "params": {"presetId": "start_red"},
+                }],
+            }])
+        child = scene["actions"][0]["actions"][0]
+        self.assertEqual(child["target"], {"kind": "broadcast"})
+        self.assertTrue(any(
+            "deprecated legacy" in msg and "target.kind=scope" in msg
+            for msg in cm.output
+        ), f"expected scope deprecation warning, got: {cm.output}")
+
+    def test_legacy_singular_group_target_migrated_with_warning(self):
+        # Inline {kind: "group", value: <int>} target is auto-migrated to
+        # the canonical {kind: "groups", value: [<int>]} and warns.
+        with self.assertLogs(
+            "racelink.services.scenes_service", level="WARNING"
+        ) as cm:
+            scene = self.svc.create(label="GroupShim", actions=[{
+                "kind": KIND_RL_PRESET,
+                "target": {"kind": "group", "value": 1},
+                "params": {"presetId": "start_red"},
+                "flags_override": {},
+            }])
+        action = scene["actions"][0]
+        self.assertEqual(action["target"], {"kind": "groups", "value": [1]})
+        self.assertTrue(any(
+            "deprecated legacy" in msg and "target.kind=group" in msg
+            for msg in cm.output
+        ), f"expected singular-group deprecation warning, got: {cm.output}")
+
+    def test_legacy_offset_group_groups_field_migrated_with_warning(self):
+        # offset_group container without `target` but with legacy `groups`
+        # field is migrated to the unified target shape and warns.
+        with self.assertLogs(
+            "racelink.services.scenes_service", level="WARNING"
+        ) as cm:
+            scene = self.svc.create(label="GroupsField", actions=[{
+                "kind": KIND_OFFSET_GROUP,
+                "groups": "all",
+                "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
+                "actions": [],
+            }])
+        self.assertEqual(scene["actions"][0]["target"], {"kind": "broadcast"})
+        self.assertTrue(any(
+            "deprecated legacy" in msg and "offset_group.groups field" in msg
+            for msg in cm.output
+        ), f"expected offset_group.groups field deprecation warning, got: {cm.output}")
 
     def test_kind_with_target_requires_target(self):
         with self.assertRaises(ValueError):
@@ -924,7 +1003,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
 
     def test_top_level_new_groups_shape_round_trips(self):
         scene = self.svc.create(label="A", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [3, 1, 5]},
             "params": {"presetId": 7},
         }])
@@ -952,7 +1031,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
     def test_groups_target_rejects_empty_list(self):
         with self.assertRaises(ValueError):
             self.svc.create(label="X", actions=[{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": []},
                 "params": {"presetId": 1},
             }])
@@ -961,7 +1040,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
         # 255 is the broadcast sentinel; lists must not include it.
         with self.assertRaises(ValueError):
             self.svc.create(label="X", actions=[{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [1, 255]},
                 "params": {"presetId": 1},
             }])
@@ -969,7 +1048,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
     def test_groups_target_rejects_duplicate_ids(self):
         with self.assertRaises(ValueError):
             self.svc.create(label="X", actions=[{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [1, 1, 3]},
                 "params": {"presetId": 1},
             }])
@@ -1024,7 +1103,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
             "groups": "all",
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "scope"},
                 "params": {"presetId": 1},
             }],
@@ -1038,7 +1117,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
             "groups": [1, 3],
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "group", "value": 3},
                 "params": {"presetId": 1},
             }],
@@ -1055,7 +1134,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
                 "target": {"kind": "groups", "value": [1, 3]},
                 "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                 "actions": [{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "groups", "value": [2]},
                     "params": {"presetId": 1},
                 }],
@@ -1069,7 +1148,7 @@ class BroadcastUnificationMigrationTests(unittest.TestCase):
             "target": {"kind": "groups", "value": [1, 3]},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "broadcast"},
                 "params": {"presetId": 1},
             }],
@@ -1090,7 +1169,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
 
     def test_collapse_helper_groups_target_with_known_all_becomes_broadcast(self):
         actions = [{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2, 3]},
             "params": {},
         }]
@@ -1099,7 +1178,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
 
     def test_collapse_helper_groups_target_subset_unchanged(self):
         actions = [{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2]},
             "params": {},
         }]
@@ -1111,7 +1190,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
         # returns the input unchanged (collapsing to broadcast against an
         # empty universe would be misleading).
         actions = [{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2]},
             "params": {},
         }]
@@ -1124,7 +1203,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
             "target": {"kind": "groups", "value": [1, 2, 3]},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [1, 2, 3]},
                 "params": {},
             }],
@@ -1137,7 +1216,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
 
     def test_collapse_helper_broadcast_target_is_passthrough(self):
         actions = [{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "broadcast"},
             "params": {},
         }]
@@ -1146,7 +1225,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
 
     def test_collapse_helper_device_target_is_passthrough(self):
         actions = [{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "device", "value": "AABBCCDDEEFF"},
             "params": {},
         }]
@@ -1163,7 +1242,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
             known_group_ids_getter=lambda: [1, 2, 3],
         )
         scene = svc.create(label="A", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2, 3]},
             "params": {"presetId": 7},
         }])
@@ -1180,7 +1259,7 @@ class BroadcastSelectAllCollapseTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         svc = SceneService(storage_path=os.path.join(tmp.name, "scenes.json"))
         scene = svc.create(label="A", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2, 3]},
             "params": {"presetId": 7},
         }])

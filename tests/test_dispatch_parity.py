@@ -34,7 +34,7 @@ from racelink.services.scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
     SceneService,
 )
@@ -92,9 +92,9 @@ class _RecordingControlService:
         })
         return True
 
-    def send_wled_control(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
         self.calls.append({
-            "sender": "send_wled_control",
+            "sender": "send_control",
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
@@ -274,9 +274,9 @@ class TopLevelKindParityTests(unittest.TestCase):
             "params": {"presetId": 7, "brightness": 200},
         })
 
-    def test_wled_control_with_full_params_parity(self):
+    def test_rl_effect_with_full_params_parity(self):
         _assert_parity(self, {
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 2]},
             "params": {"mode": 5, "speed": 200, "brightness": 128,
                        "color1": [255, 0, 0]},
@@ -301,7 +301,7 @@ class TopLevelKindParityTests(unittest.TestCase):
     def test_device_target_parity(self):
         device = _FakeDevice("AABBCCDDEEFF", group_id=4)
         _assert_parity(self, {
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "device", "value": "AABBCCDDEEFF"},
             "params": {"mode": 5},
         }, devices=[device])
@@ -328,7 +328,7 @@ class OffsetGroupParityTests(unittest.TestCase):
             "target": {"kind": "broadcast"},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "broadcast"},
                 "params": {"mode": 5},
             }],
@@ -376,7 +376,7 @@ class OffsetGroupParityTests(unittest.TestCase):
             "target": {"kind": "broadcast"},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [1, 3]},
                 "params": {"mode": 5},
             }],

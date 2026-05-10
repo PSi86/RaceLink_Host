@@ -456,7 +456,20 @@ class RaceLink_Host:
                 if dev_type is None:
                     dev_type = device.get("caps", device.get("type", 0))
 
-                special_state = build_specials_state(int(dev_type or 0), device)
+                # ``build_specials_state`` expects the canonical specials
+                # sub-dict (keyed by flat option names). The persisted
+                # device record carries that sub-dict under
+                # ``device["specials"]``; passing the full record here
+                # used to silently drop every persisted special back to
+                # its schema default on every reload (iter-10 "Bug A").
+                # The defensive unwrap added to ``build_specials_state``
+                # in iter-10 makes both shapes work, but pass the
+                # explicit sub-dict here so the call site documents
+                # the actual contract.
+                special_state = build_specials_state(
+                    int(dev_type or 0),
+                    device.get("specials") or {},
+                )
                 loaded_devices.append(
                     create_device(
                         addr=str(device.get("addr", "")).upper(),
@@ -951,20 +964,107 @@ class RaceLink_Host:
         return self.control_service.send_group_preset(gcGroupId, gcFlags, gcPresetId, gcBrightness)
 
     def sendWledPreset(self, *, targetDevice=None, targetGroup=None, params=None):
-        """Apply a classical WLED preset (OPC_PRESET). Pre-rename: ``sendWledControl``."""
+        """Apply a classical WLED preset (OPC_PRESET)."""
         return self.control_service.send_wled_preset(
             targetDevice=targetDevice, targetGroup=targetGroup, params=params,
         )
 
-    def sendWledControl(self, *, targetDevice=None, targetGroup=None, params=None):
+    def sendWledResetOverrides(self, *, targetDevice=None, targetGroup=None, params=None) -> bool:
+        """Clear all host-set RaceLink overrides on a WLED device (OPC_CONFIG 0x0F).
+
+        Destructive: instructs the device to reset every
+        ``RaceLink.overrides.*`` flag in its persisted ``cfg.json``.
+        Policy A settings (FPS, ABL) revert to compile-time defaults
+        on next boot; Policy B settings (segment geometry, briS,
+        transition) revert to operator-saved cfg values. The host's
+        stored ``dev.specials[wled_*]`` are also reset to schema
+        defaults so the dialog rows no longer show a host-side
+        override after the action.
+
+        Unicast-only — OPC_CONFIG broadcasts are forbidden by design
+        (different device classes interpret options differently).
+        Group-target rejected. Non-WLED-capability devices rejected.
+
+        Returns ``True`` on a successful ACK + state reset, ``False``
+        otherwise. ``params`` is unused (the action carries no vars).
+        """
+        del params  # action has no vars
+        if targetGroup is not None:
+            return False
+        if not targetDevice:
+            return False
+
+        try:
+            from racelink.domain import get_dev_type_info  # type: ignore[no-redef]
+        except ImportError:  # pragma: no cover - package-style fallback
+            from .racelink.domain import get_dev_type_info  # type: ignore[no-redef]
+
+        dev_type = int(getattr(targetDevice, "dev_type", getattr(targetDevice, "caps", 0)) or 0)
+        caps = get_dev_type_info(dev_type).get("caps", []) or []
+        if "WLED" not in caps:
+            return False
+
+        addr = str(getattr(targetDevice, "addr", "") or "")
+        recv3 = mac_last3_from_hex(addr)
+        if not recv3 or recv3 == b"\xFF\xFF\xFF":
+            return False
+
+        ok = self.sendConfig(
+            option=0x0F,
+            data0=0, data1=0, data2=0, data3=0,
+            recv3=recv3,
+            wait_for_ack=True,
+            timeout_s=6.0,
+        )
+        if not ok:
+            logger.warning(
+                "RaceLink: sendWledResetOverrides ACK timeout for %s",
+                addr,
+            )
+            return False
+
+        # Reset host-side specials for the WLED options. Build a fresh
+        # WLED-only defaults dict and mirror its keys onto dev.specials,
+        # leaving non-WLED keys (e.g. STARTBLOCK slots/first_slot on a
+        # combined device) untouched.
+        try:
+            wled_defaults = build_specials_state(dev_type, stored={})
+            current = dict(getattr(targetDevice, "specials", {}) or {})
+            for key, default in wled_defaults.items():
+                if key.startswith("wled_"):
+                    current[key] = int(default) & 0xFFFF
+            targetDevice.specials = current
+            try:
+                self.save_to_db({"manual": True}, scopes={state_scope.DEVICE_SPECIALS})
+            except Exception:
+                # swallow-ok: in-memory reset already happened; SSE
+                # refresh fired by the route still notifies the UI.
+                logger.warning(
+                    "save_to_db after sendWledResetOverrides failed",
+                    exc_info=True,
+                )
+        except Exception:
+            logger.exception(
+                "RaceLink: sendWledResetOverrides reset of dev.specials raised for %s",
+                addr,
+            )
+        logger.info(
+            "RaceLink: sendWledResetOverrides OK for %s (host specials reset to defaults)",
+            addr,
+        )
+        return True
+
+    def sendRlPreset(self, *, targetDevice=None, targetGroup=None, params=None):
         """Apply a RaceLink-native preset (OPC_CONTROL) by its stable int id.
 
-        Phase D: this is the Specials/WebUI entry point for the "WLED Control"
-        action. ``params`` carries only ``{presetId, brightness}`` — full
-        14-parameter editing lives in the RL-preset editor, not here. The raw
-        direct-parameter send stays available on ``ControlService`` for
-        internal callers (``send_rl_preset_by_id`` uses it to dispatch
-        OPC_CONTROL with the resolved snapshot).
+        This is the Specials/WebUI entry point for the ``rl_preset`` action
+        (operator picks an RL preset id from the live preset list).
+        ``params`` carries only ``{presetId, brightness}``; the host
+        resolves the id via ``rl_presets_service`` before emitting
+        OPC_CONTROL. Full 14-field parameter editing lives in the
+        RL-preset editor (``dlgRlPresets``), not here. The raw
+        direct-parameter sender stays available on ``ControlService``
+        as :meth:`send_control` for internal callers.
         """
         params = params or {}
         preset_id = int(params.get("presetId", 0))

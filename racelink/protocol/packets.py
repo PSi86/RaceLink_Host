@@ -31,6 +31,16 @@ def build_config_body(option: int = 0, data0: int = 0, data1: int = 0, data2: in
     return struct.pack("<BBBBB", int(option) & 0xFF, int(data0) & 0xFF, int(data1) & 0xFF, int(data2) & 0xFF, int(data3) & 0xFF)
 
 
+def build_get_config_body(option: int = 0) -> bytes:
+    """Serialize an ``OPC_GET_CONFIG`` body (1 B fixed: option to read).
+
+    The reply reuses the 5-byte ``P_Config`` shape — see
+    :func:`racelink.protocol.codec.parse_reply_event` for the
+    ``GET_CONFIG_REPLY`` decoder.
+    """
+    return struct.pack("<B", int(option) & 0xFF)
+
+
 # OPC_SYNC flags. Mirrors ``SYNC_FLAG_TRIGGER_ARMED`` in ``racelink_proto.h``.
 # Bit 0 gates pending arm-on-sync materialisation device-side; without it,
 # OPC_SYNC only adjusts the device timebase. Autosync (gateway- or

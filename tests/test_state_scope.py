@@ -12,8 +12,9 @@ from racelink.domain.state_scope import (
     FULL,
     GROUPS,
     NONE,
-    PRESETS,
+    RL_PRESETS,
     SCENES,
+    WLED_PRESETS,
     normalize_scopes,
     sse_what_from_scopes,
 )
@@ -65,14 +66,26 @@ class SseTopicMappingTests(unittest.TestCase):
             ["devices"],
         )
 
-    def test_presets_emits_presets_topic(self):
-        self.assertEqual(sse_what_from_scopes([PRESETS]), ["presets"])
+    def test_rl_presets_emits_rl_presets_topic(self):
+        # RaceLink-native preset CRUD broadcasts under its own token —
+        # decoupled from the WLED-presets channel so the client can fan
+        # out only the dependents that actually changed.
+        self.assertEqual(sse_what_from_scopes([RL_PRESETS]), ["rl_presets"])
+
+    def test_wled_presets_emits_wled_presets_topic(self):
+        # Classical WLED preset upload/select. Independent of RL_PRESETS.
+        self.assertEqual(sse_what_from_scopes([WLED_PRESETS]), ["wled_presets"])
 
     def test_scenes_emits_scenes_topic(self):
         self.assertEqual(sse_what_from_scopes([SCENES]), ["scenes"])
 
-    def test_presets_and_scenes_emit_both_topics(self):
-        self.assertEqual(sse_what_from_scopes([PRESETS, SCENES]), ["presets", "scenes"])
+    def test_preset_tokens_independent_topics(self):
+        # The two preset tokens emit two distinct topics — RL preset
+        # mutations do not refresh WLED preset consumers and vice versa.
+        self.assertEqual(
+            sse_what_from_scopes([RL_PRESETS, WLED_PRESETS]),
+            ["rl_presets", "wled_presets"],
+        )
 
     def test_combined_scopes_preserve_order_devices_then_groups(self):
         self.assertEqual(

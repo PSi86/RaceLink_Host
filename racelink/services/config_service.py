@@ -13,6 +13,9 @@ Public API:
   gateway service. **Always unicast.** See
   :meth:`ConfigService.send_config` for the OPC_CONFIG broadcast
   design rule.
+* ``read_config(dev, option, ...)`` — emit one OPC_GET_CONFIG and
+  block until the reply lands (or per-attempt timeout). Returns
+  the parsed ``(option, data0..3)`` tuple or ``None`` on timeout.
 * ``apply_config_update(dev, option, data0)`` — invoked from
   :meth:`GatewayService.handle_ack_event` via the controller's
   ``_apply_config_update`` shim; pre-A3 this read the pending-
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..transport import LP, mac_last3_from_hex
 from . import rf_timing
 
 
@@ -82,6 +86,68 @@ class ConfigService:
             wait_for_ack=wait_for_ack,
             timeout_s=timeout_s,
         )
+
+    def read_config(
+        self,
+        dev,
+        option: int,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> Optional[tuple[int, int, int, int, int]]:
+        """Read one option's current device-side value via ``OPC_GET_CONFIG``.
+
+        Returns ``(option, data0, data1, data2, data3)`` on a successful
+        ``GET_CONFIG_REPLY`` or ``None`` on timeout / unknown reply.
+
+        Unicast-only — different device classes interpret options
+        differently, so a broadcast read would be ambiguous and the
+        firmware drops broadcast receivers for OPC_GET_CONFIG just
+        like it does for OPC_CONFIG. The ``recv3`` is derived from
+        ``dev.addr``; if that resolution fails we abort with ``None``.
+        """
+        if not self.gateway_service or not self.gateway_service.transport:
+            return None
+        addr = str(getattr(dev, "addr", "") or "")
+        if not addr:
+            return None
+        recv3 = mac_last3_from_hex(addr)
+        if not recv3 or recv3 == b"\xFF\xFF\xFF":
+            return None
+
+        if timeout_s is None:
+            timeout_s = rf_timing.UNICAST_ATTEMPT_TIMEOUT_S
+
+        opt_byte = int(option) & 0xFF
+
+        def _send():
+            self.gateway_service.transport.send_get_config(recv3, opt_byte)
+
+        # Pass the option byte as the registry's secondary discriminator.
+        # The codec parses ``option`` into the GET_CONFIG_REPLY event; the
+        # registry's ``expected_key2`` filter then ensures a reply for
+        # option X cannot accidentally wake a waiter that's pending for
+        # option Y on the same device (iteration-3 fix). Concurrent reads
+        # for different options now route their replies correctly.
+        replies, _had = self.gateway_service.send_and_wait_for_reply(
+            recv3, LP.OPC_GET_CONFIG, _send,
+            timeout_s=float(timeout_s),
+            discriminator=opt_byte,
+        )
+        for ev in replies:
+            if ev.get("reply") != "GET_CONFIG_REPLY":
+                continue
+            try:
+                return (
+                    int(ev["option"]) & 0xFF,
+                    int(ev.get("data0", 0)) & 0xFF,
+                    int(ev.get("data1", 0)) & 0xFF,
+                    int(ev.get("data2", 0)) & 0xFF,
+                    int(ev.get("data3", 0)) & 0xFF,
+                )
+            except (KeyError, TypeError, ValueError):
+                # swallow-ok: malformed reply event - treat as no-reply
+                return None
+        return None
 
     def apply_config_update(self, dev, option: int, data0: int) -> None:
         bit_map = {

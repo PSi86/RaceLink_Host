@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 # Diagnostic logger for the broad-except sweep (2026-04-27 cont.).
 # Most error paths in this module accumulate ``results["errors"]`` for
@@ -257,6 +258,37 @@ class OTAWorkflowService:
         if cfg_info:
             results["cfg"] = {k: cfg_info[k] for k in ("id", "name", "size", "sha256")}
 
+        total = len(macs)
+        # Authoritative per-device row state for the WebUI's progress
+        # panel. Mutated in place across the per-device loop; every
+        # ``emit()`` snapshots the latest values into the task meta so
+        # ``FwProgressPanel`` can render row state directly instead of
+        # heuristically inferring "everyone before addr is ok". See
+        # frontend/POST_MIGRATION_CLEANUP.md §9 for the prior heuristic.
+        addrs = [str(m) for m in macs]
+        device_state: dict[str, str] = {a: "queued" for a in addrs}
+
+        def _meta_base(**extras: Any) -> dict[str, Any]:
+            """Build a fresh meta dict carrying the workflow-wide fields
+            plus a point-in-time snapshot of ``device_state``.
+
+            The shallow copy is important: SSE broadcasts queue payload
+            references, not serialised bytes, so a slow client reading
+            the queue later would otherwise see a future mutation
+            aliased into an earlier event.
+            """
+            return {
+                "macs": addrs,
+                "total": total,
+                "retries": retries,
+                "baseUrl": base_url,
+                "deviceState": dict(device_state),
+                **extras,
+            }
+
+        def emit(stage: str, **extras: Any) -> None:
+            task_manager.update(meta=_meta_base(stage=stage, **extras))
+
         try:
             self._ensure_wifi_ready(
                 task_manager,
@@ -264,29 +296,34 @@ class OTAWorkflowService:
                 host_wifi_enable=host_wifi_enable,
                 host_wifi_initial=host_wifi_initial,
                 results=results,
-                meta={"index": 0, "total": len(macs)},
+                meta=_meta_base(index=0, addr=None),
             )
 
-            total = len(macs)
             for idx, addr in enumerate(macs, start=1):
-                expected_mac = self.ota.expected_mac_hex(str(addr))
+                addr_key = str(addr)
+                device_state[addr_key] = "running"
+                expected_mac = self.ota.expected_mac_hex(addr_key)
                 dev_res = {
                     "addr": addr,
                     "expectedMac": expected_mac,
-                    "groupId": self.ota.lookup_group_id_for_addr(str(addr), devices_provider()),
+                    "groupId": self.ota.lookup_group_id_for_addr(addr_key, devices_provider()),
                     "ok": False,
                     "error": None,
                 }
                 results["devices"].append(dev_res)
                 try:
-                    task_manager.update(meta={"stage": "RACELINK_AP_ON", "index": idx, "total": total, "addr": addr, "retries": retries, "message": "Enable WLED AP via RaceLink (waiting for ACK)"})
+                    emit(
+                        "RACELINK_AP_ON",
+                        index=idx, addr=addr,
+                        message="Enable WLED AP via RaceLink (waiting for ACK)",
+                    )
                     # W4: wait for the device to ACK the AP-enable before
                     # starting the WiFi scan/connect — otherwise the host
                     # races into an empty scan list when LoRa latency
                     # delays the device's AP bring-up.
                     ok_ap = rl_instance.sendConfig(
                         0x04, data0=1,
-                        recv3=self.ota.recv3_bytes_from_addr(str(addr)),
+                        recv3=self.ota.recv3_bytes_from_addr(addr_key),
                         wait_for_ack=True, timeout_s=8.0,
                     )
                     if not ok_ap:
@@ -300,12 +337,16 @@ class OTAWorkflowService:
                         host_wifi_enable=host_wifi_enable,
                         host_wifi_changed=results["hostWifi"]["enabled"] and not host_wifi_initial,
                         results=results,
-                        meta={"index": idx, "total": total, "addr": addr, "retries": retries},
+                        meta=_meta_base(index=idx, addr=addr),
                     )
                     last_connected_ssid = matched_ssid or last_connected_ssid
                     dev_res["ssid"] = matched_ssid
                     logger.info("OTA %s: connected to SSID %r", addr, matched_ssid)
-                    task_manager.update(meta={"stage": "WAIT_HTTP", "index": idx, "total": total, "addr": addr, "retries": retries, "message": f"Waiting for WLED /json/info mac to match {expected_mac}"})
+                    emit(
+                        "WAIT_HTTP",
+                        index=idx, addr=addr,
+                        message=f"Waiting for WLED /json/info mac to match {expected_mac}",
+                    )
                     info = self.ota.wait_for_expected_node(base_url, expected_mac, timeout_s=90.0, poll_s=1.0)
                     if not info:
                         raise RuntimeError(f"Timeout waiting for node (baseUrl={base_url}) to report expected mac {expected_mac}")
@@ -324,16 +365,11 @@ class OTAWorkflowService:
                         last_err = None
                         for attempt in range(1, retries + 1):
                             try:
-                                task_manager.update(
-                                    meta={
-                                        "stage": "UPLOAD_FW",
-                                        "index": idx,
-                                        "total": total,
-                                        "addr": addr,
-                                        "attempt": attempt,
-                                        "retries": retries,
-                                        "message": f"Uploading firmware (try {attempt}/{retries})",
-                                    }
+                                emit(
+                                    "UPLOAD_FW",
+                                    index=idx, addr=addr,
+                                    attempt=attempt,
+                                    message=f"Uploading firmware (try {attempt}/{retries})",
                                 )
                                 # 60 s reflects the real ESP flash + reboot
                                 # cycle better than the legacy 30 s default;
@@ -388,6 +424,12 @@ class OTAWorkflowService:
                         if not ok:
                             raise RuntimeError(f"Firmware upload failed: {last_err}")
                     dev_res["ok"] = True
+                    device_state[addr_key] = "ok"
+                    emit(
+                        "DEVICE_DONE",
+                        index=idx, addr=addr,
+                        message=f"{addr}: update complete",
+                    )
                     logger.info("OTA %s: completed successfully", addr)
                 except Exception as ex:
                     # Per-device failures are operator-actionable in the
@@ -401,6 +443,12 @@ class OTAWorkflowService:
                     # expected failure mode for half the fleet.
                     dev_res["error"] = f"{type(ex).__name__}: {ex}"
                     results["errors"].append(f"{type(ex).__name__}: {ex}")
+                    device_state[addr_key] = "error"
+                    emit(
+                        "DEVICE_ERROR",
+                        index=idx, addr=addr,
+                        message=f"{addr}: {type(ex).__name__}: {ex}",
+                    )
                     logger.warning("fw upload failed for %s: %s", addr, ex)
                     if stop_on_error:
                         raise

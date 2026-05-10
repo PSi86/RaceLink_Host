@@ -16,6 +16,7 @@ from racelink.domain import (
     RL_FLAG_HAS_BRI,
     RL_FLAG_OFFSET_MODE,
     RL_FLAG_POWER_ON,
+    USER_FLAG_DEFS,
     USER_FLAG_KEYS,
     build_flags_byte,
     flags_from_mapping,
@@ -47,6 +48,21 @@ class FlagConstantsTests(unittest.TestCase):
         self.assertEqual(set(USER_FLAG_KEYS), {
             "arm_on_sync", "force_tt0", "force_reapply", "offset_mode",
         })
+
+    def test_user_flag_defs_carries_label_per_key(self):
+        # USER_FLAG_DEFS is the single source of truth shared by the
+        # RL-preset editor schema and the scenes editor schema (§13).
+        # Both endpoints serve labels from it; if a label is missing or
+        # blank, the WebUI falls back to ugly defaults.
+        self.assertEqual(
+            tuple(d["key"] for d in USER_FLAG_DEFS),
+            USER_FLAG_KEYS,
+            "USER_FLAG_KEYS must mirror the order of USER_FLAG_DEFS",
+        )
+        for entry in USER_FLAG_DEFS:
+            self.assertIn("label", entry)
+            self.assertIsInstance(entry["label"], str)
+            self.assertTrue(entry["label"].strip())
 
 
 class BuildFlagsByteTests(unittest.TestCase):

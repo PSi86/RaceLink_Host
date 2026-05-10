@@ -30,6 +30,7 @@ from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
     build_config_body,
     build_control_body,
+    build_get_config_body,
     build_get_devices_body,
     build_offset_body,
     build_preset_body,
@@ -597,6 +598,18 @@ class GatewaySerialTransport:
     def send_config(self, recv3: bytes = b"\xFF\xFF\xFF", option: int = 0, data0: int = 0, data1: int = 0, data2: int = 0, data3: int = 0) -> SendOutcome:
         body = build_config_body(option=option, data0=data0, data1=data1, data2=data2, data3=data3)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONFIG), recv3, body)
+
+    def send_get_config(self, recv3: bytes, option: int) -> SendOutcome:
+        """Send an ``OPC_GET_CONFIG`` packet (1 B body: option to read).
+
+        Unicast-only — different device classes interpret options
+        differently, so a broadcast read would be ambiguous. Callers
+        must pass a concrete 3-byte ``recv3``; the broadcast sentinel
+        is rejected at the route boundary in ``api_specials_get``.
+        Reply (5 B ``P_Config``) is decoded by ``parse_reply_event``.
+        """
+        body = build_get_config_body(option=option)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_CONFIG), recv3, body)
 
     def send_sync(self, recv3: bytes = b"\xFF\xFF\xFF", ts24: int = 0, brightness: int = 0,
                   flags: int = 0) -> SendOutcome:

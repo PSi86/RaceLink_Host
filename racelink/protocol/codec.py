@@ -70,6 +70,23 @@ def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rss
             )
         else:
             ev.update({"reply": "STATUS_REPLY", "body_raw": body})
+    elif opc == 0x0A:
+        # GET_CONFIG reply: same 5-byte ``P_Config`` shape (option +
+        # data0..3) as the OPC_CONFIG write packet. The host's
+        # ``SpecialsService.unpack_option_value`` decodes the data
+        # bytes back into the schema's value shape (scalar uint8 /
+        # uint16 LE / uint16-pair).
+        if len(body) == 5:
+            ev.update({
+                "reply": "GET_CONFIG_REPLY",
+                "option": body[0],
+                "data0": body[1],
+                "data1": body[2],
+                "data2": body[3],
+                "data3": body[4],
+            })
+        else:
+            ev.update({"reply": "GET_CONFIG_REPLY", "body_raw": body})
     elif opc == 0x7E:
         if len(body) >= 2:
             ack_of = body[0] & 0x7F

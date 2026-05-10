@@ -21,7 +21,7 @@ from racelink.services.scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
 )
 
@@ -86,7 +86,7 @@ class TopLevelTargetShapeTests(unittest.TestCase):
     def test_broadcast_emits_one_op_with_target_group_255(self):
         plan = plan_action_dispatch(
             {
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "broadcast"},
                 "params": {"mode": 5},
             },
@@ -95,7 +95,7 @@ class TopLevelTargetShapeTests(unittest.TestCase):
         self.assertEqual(len(plan.ops), 1)
         op = plan.ops[0]
         self.assertEqual(op.target_group, 255)
-        self.assertEqual(op.sender, "send_wled_control")
+        self.assertEqual(op.sender, "send_control")
         self.assertEqual(op.payload["targetGroup"], 255)
         self.assertNotIn("targetDevice", op.payload)
 
@@ -117,7 +117,7 @@ class TopLevelTargetShapeTests(unittest.TestCase):
     def test_groups_lenN_emits_one_op_per_group(self):
         plan = plan_action_dispatch(
             {
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [1, 3, 5]},
                 "params": {"mode": 5},
             },
@@ -129,7 +129,7 @@ class TopLevelTargetShapeTests(unittest.TestCase):
     def test_device_target_resolves_via_lookup(self):
         plan = plan_action_dispatch(
             {
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "device", "value": "AABBCCDDEEFF"},
                 "params": {"mode": 5},
             },
@@ -147,7 +147,7 @@ class TopLevelTargetShapeTests(unittest.TestCase):
     def test_device_target_unresolved_degrades(self):
         plan = plan_action_dispatch(
             {
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "device", "value": "DEADBEEFCAFE"},
                 "params": {},
             },
@@ -231,7 +231,7 @@ class OffsetGroupStrategyTests(unittest.TestCase):
             self._container(
                 target={"kind": "broadcast"},
                 children=[{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "broadcast"},
                     "params": {"mode": 5},
                 }],
@@ -290,7 +290,7 @@ class OffsetGroupStrategyTests(unittest.TestCase):
             self._container(
                 target={"kind": "broadcast"},
                 children=[{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "broadcast"},
                     "params": {"mode": 5},
                 }],
@@ -309,7 +309,7 @@ class OffsetGroupStrategyTests(unittest.TestCase):
                 target={"kind": "broadcast"},
                 mode="none",
                 children=[{
-                    "kind": KIND_WLED_CONTROL,
+                    "kind": KIND_RL_EFFECT,
                     "target": {"kind": "broadcast"},
                     "params": {"mode": 5},
                 }],

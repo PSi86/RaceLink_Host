@@ -50,13 +50,15 @@ def _wheel_timestamp() -> tuple[int, int, int, int, int, int]:
 
 
 def _package_data_sources() -> list[tuple[Path, str]]:
+    """Walk the package's static/ tree for files to include in the wheel.
+
+    Phase 1 PoC removed the legacy ``racelink/pages/`` Jinja templates;
+    the SPA shell now lives at ``racelink/static/dist/index.html`` and
+    its hashed JS/CSS bundles under ``racelink/static/dist/assets/``.
+    Both are discovered by the recursive walk over ``static/``.
+    """
     sources: list[tuple[Path, str]] = []
     package_root = ROOT / "racelink"
-    sources.extend(
-        (path, f"racelink/pages/{path.relative_to(package_root / 'pages').as_posix()}")
-        for path in sorted((package_root / "pages").rglob("*"))
-        if path.is_file()
-    )
     sources.extend(
         (path, f"racelink/static/{path.relative_to(package_root / 'static').as_posix()}")
         for path in sorted((package_root / "static").rglob("*"))

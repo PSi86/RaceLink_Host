@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .device_types import RL_Dev_Type
+from .flags import USER_FLAG_DEFS
 from .models import RL_Device, RL_DeviceGroup
 from .wled_deterministic import is_deterministic
 from .wled_effects import WLED_EFFECTS
@@ -157,11 +158,51 @@ RL_SPECIALS = {
     },
     "WLED": {
         "label": "WLED",
-        "options": [],
+        # Per-device LED-config overrides (OPC_CONFIG 0x05..0x0A). Each
+        # entry has a ``default`` the dialog shows as helper text. The
+        # default also seeds ``dev.specials`` for new devices so every
+        # row always has a value to display / send. See
+        # ``RaceLink_Docs/docs/concepts/opcodes.md`` §"OPC_CONFIG —
+        # device configuration" for Policy A vs Policy B semantics; the
+        # device-side persistent storage is the source of truth, with
+        # ``OPC_GET_CONFIG`` available for live read-back to detect
+        # host-vs-device divergence.
+        "options": [
+            {"key": "wled_fps", "label": "Target Refresh Rate (fps)",
+             "option": 0x05, "bytes": 1, "min": 0, "max": 250, "default": 75},
+            {"key": "wled_abl_max_ma", "label": "ABL Max Current (mA, 0=off)",
+             "option": 0x08, "bytes": 2, "min": 0, "max": 65535, "default": 0},
+            {"key": "wled_briS", "label": "Default Brightness (briS)",
+             "option": 0x09, "bytes": 1, "min": 0, "max": 255, "default": 128},
+            {"key": "wled_transition_ms", "label": "Transition Duration (ms)",
+             "option": 0x0A, "bytes": 2, "min": 0, "max": 65535, "default": 700},
+            # Segment geometry: NO ``default`` on the per-field entries.
+            # The "RaceLink default" for a segment is a single seg[0]
+            # spanning the full strip (set by OPC_CONFIG 0x0F on the
+            # device side via ``strip.resetSegments()``), but the host
+            # cannot know the strip length reliably — different builds
+            # ship different LED counts. Skipping ``default`` suppresses
+            # the misleading "default: 0/0" helper text on these rows;
+            # the operator uses **Import device** after a Reset to
+            # adopt the device's actual segment values.
+            {"key": "wled_seg0", "label": "Segment 0 Geometry (start/stop)",
+             "option": 0x06, "bytes": 4, "shape": "uint16-pair",
+             "fields": [
+                 {"name": "start", "min": 0, "max": 65535},
+                 {"name": "stop", "min": 0, "max": 65535},
+             ]},
+            {"key": "wled_seg1", "label": "Segment 1 Geometry (start/stop)",
+             "option": 0x07, "bytes": 4, "shape": "uint16-pair",
+             "fields": [
+                 {"name": "start", "min": 0, "max": 65535},
+                 {"name": "stop", "min": 0, "max": 65535},
+             ]},
+        ],
         "functions": [
             {
-                # "WLED Preset" — classical numeric preset id, OPC_PRESET.
-                # Pre-rename: key="wled_control", label="WLED Control".
+                # "WLED Preset" — picks a classical WLED preset by numeric
+                # id (the preset must exist in the active presets.json on the
+                # device). Wire emission: OPC_PRESET, fixed 4 B body.
                 "key": "wled_preset",
                 "label": "WLED Preset",
                 "comm": "sendWledPreset",
@@ -174,15 +215,14 @@ RL_SPECIALS = {
                 "broadcast": True,
             },
             {
-                # "WLED Control" — applies a RaceLink-native preset (OPC_CONTROL,
-                # variable length) selected by its stable int id. Phase D:
-                # structurally identical to wled_preset above, only the preset
-                # source differs (RL presets via RLPresetsService instead of
-                # WLED presets.json). Direct 14-field parameter editing lives
-                # only in the RL-preset editor (dlgRlPresets), not here.
-                "key": "wled_control",
-                "label": "WLED Control",
-                "comm": "sendWledControl",
+                # "RaceLink Preset" — picks a RaceLink-native preset (RL preset)
+                # by its stable int id. The host resolves the id to the
+                # persisted 14-field parameter snapshot at dispatch time and
+                # emits OPC_CONTROL. Direct 14-field parameter editing lives
+                # in the RL-preset editor (``dlgRlPresets``), not here.
+                "key": "rl_preset",
+                "label": "RaceLink Preset",
+                "comm": "sendRlPreset",
                 "vars": ["presetId", "brightness"],
                 "ui": {
                     "presetId": {"widget": "select", "generator": rl_preset_select_options},
@@ -191,6 +231,42 @@ RL_SPECIALS = {
                 "unicast": True,
                 "broadcast": True,
             },
+            {
+                # "Reset to RaceLink defaults" — destructive maintenance
+                # action. Maps to OPC_CONFIG option 0x0F (clear all
+                # overrides). Policy A reverts the device to compile-time
+                # defaults; Policy B reverts to operator-saved cfg.json
+                # values. The host also resets ``dev.specials[wled_*]``
+                # to schema defaults so the dialog rows no longer show a
+                # host-side override after the action.
+                "key": "wled_reset_overrides",
+                "label": "Reset to RaceLink defaults",
+                "comm": "sendWledResetOverrides",
+                "vars": [],
+                "type": "action",
+                "unicast": True,
+                # OPC_CONFIG broadcasts are forbidden by design (different
+                # device classes interpret options differently).
+                "broadcast": False,
+                "destructive": {
+                    "message": (
+                        "Clear all host-set RaceLink overrides on this device?\n\n"
+                        "Policy A settings (FPS, ABL) revert to the firmware's "
+                        "compile-time defaults.\n"
+                        "Policy B settings (segment geometry, brightness, transition) "
+                        "revert to operator-saved cfg.json values.\n\n"
+                        "The host's stored values for this device will also reset "
+                        "to RaceLink defaults; the dialog will then re-read each "
+                        "option from the device."
+                    ),
+                },
+                # Tells the frontend to fire ``readActiveTab()`` after a
+                # successful action, in addition to the standard SSE-driven
+                # rebind. Used here because the reset touches every WLED
+                # property at once and the operator needs ground truth for
+                # the Policy B values that revert to operator-cfg.
+                "refresh": "active-tab",
+            },
         ],
     },
     "LEDMATRIX": {"label": "Matrix", "options": [], "functions": []},
@@ -198,14 +274,15 @@ RL_SPECIALS = {
 
 
 # ----------------------------------------------------------------------
-# RL-preset editor schema (Phase D)
+# RL-preset editor schema
 # ----------------------------------------------------------------------
-# The RL-preset editor in the WebUI (dlgRlPresets) builds a 14-field parameter
-# form using the same widget types as the Specials dialog. After Phase D the
-# Specials ``wled_control`` action no longer carries those vars (it is now a
-# preset picker), so the editor cannot reuse its schema. This standalone
-# constant defines the editor form independently; ``serialize_editor_schema``
-# resolves the generators into concrete options for the REST layer.
+# The RL-preset editor in the WebUI (``dlgRlPresets``) builds a 14-field
+# parameter form using the same widget types as the Specials dialog. The
+# Specials ``rl_preset`` action only carries the preset-picker vars, not
+# the underlying parameter set, so the editor cannot reuse its schema.
+# This standalone constant defines the editor form independently;
+# ``serialize_editor_schema`` resolves the generators into concrete
+# options for the REST layer.
 
 RL_PRESET_EDITOR_SCHEMA = {
     "vars": [
@@ -232,15 +309,12 @@ RL_PRESET_EDITOR_SCHEMA = {
         "color2":     {"widget": "color"},
         "color3":     {"widget": "color"},
     },
-    # User-intent flags persistable on an RL preset. Mirrors
-    # ``racelink.domain.flags.USER_FLAG_KEYS``; POWER_ON/HAS_BRI are
-    # derived host-side from brightness at emit-time and never stored.
-    "flags": [
-        {"key": "arm_on_sync",   "label": "Arm on SYNC"},
-        {"key": "force_tt0",     "label": "Force TT=0"},
-        {"key": "force_reapply", "label": "Force reapply"},
-        {"key": "offset_mode",   "label": "Offset mode"},
-    ],
+    # User-intent flags persistable on an RL preset. Sourced from
+    # ``racelink.domain.flags.USER_FLAG_DEFS`` so the scenes editor
+    # ``/api/scenes/editor-schema`` and this preset editor schema can
+    # never disagree on the labels. POWER_ON/HAS_BRI are derived
+    # host-side from brightness at emit-time and never stored.
+    "flags": USER_FLAG_DEFS,
 }
 
 

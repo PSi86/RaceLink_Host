@@ -1,0 +1,78 @@
+/*
+ * Tailwind v4 entry point + RaceLink design-token theme.
+ *
+ * Canonical home for the design tokens the WebUI consumes. Tokens are
+ * declared under ``@theme`` using the Tailwind-conventional names
+ * (``--color-bg`` -> ``bg-bg``/``text-bg``/``border-bg`` utility
+ * classes); ``racelink.css`` consumes the same names directly via
+ * ``var(--color-bg)`` etc.
+ *
+ * Layered import skips Tailwind's Preflight to keep the visual diff at
+ * zero — components opt into Preflight individually as their CSS
+ * rules in ``racelink.css`` are audited.
+ */
+
+@layer theme, base, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* tw-animate-css: drop-in replacement for the v3 ``tailwindcss-animate``
+ * plugin. Provides ``animate-in`` / ``fade-in-0`` / ``zoom-in-95`` /
+ * ``data-[state=*]:animate-*`` helpers consumed by the shadcn-vue
+ * Dialog primitives for enter/exit transitions. CSS-only, ~3 kB. */
+@import "tw-animate-css";
+
+@theme {
+  /* Spacing token (was ``--gap`` in racelink.css). Tailwind exposes it
+   * as ``--spacing-gap`` *and* makes it usable via the ``gap`` /
+   * ``p`` / ``m`` utility families. */
+  --spacing-gap: 12px;
+
+  /* RaceLink palette — inherited 1:1 from legacy racelink.css. Names
+   * line up with Tailwind's convention so the auto-generated utility
+   * classes read naturally:
+   *   bg-bg / text-bg            (page background)
+   *   bg-card / text-card        (panel surfaces)
+   *   text-text / bg-text        (default foreground)
+   *   text-muted                 (secondary copy, hints)
+   *   text-accent / bg-accent    (interactive highlights)
+   *   text-ok    / bg-ok         (success — connected, online)
+   *   text-warn  / bg-warn       (in-flight RX windows, partial state)
+   *   text-err   / bg-err        (failures, offline, validation errors)
+   */
+  --color-bg: #0e0e11;
+  --color-card: #17171c;
+  --color-text: #e7e7ec;
+  --color-muted: #9aa0a6;
+  --color-accent: #4c8bf5;
+  --color-ok: #1faa59;
+  --color-warn: #f2c037;
+  --color-err: #e84545;
+
+  /* shadcn-vue conventional tokens (Slice 3). Components under
+   * ``components/ui/`` reference these names directly — keep them
+   * mapped onto the RaceLink palette so the design system stays
+   * coherent. The tokens follow shadcn's surface/foreground pairs
+   * (e.g. ``bg-popover`` + ``text-popover-foreground``). */
+  --color-background: var(--color-bg);
+  --color-foreground: var(--color-text);
+  --color-card-foreground: var(--color-text);
+  --color-popover: var(--color-card);
+  --color-popover-foreground: var(--color-text);
+  --color-primary: var(--color-accent);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #232330;
+  --color-secondary-foreground: var(--color-text);
+  --color-muted-foreground: var(--color-muted);
+  --color-accent-foreground: var(--color-text);
+  --color-destructive: var(--color-err);
+  --color-destructive-foreground: #ffffff;
+  --color-border: #2a2a32;
+  --color-input: #2a2a32;
+  --color-ring: var(--color-accent);
+
+  /* Border-radius token consumed by shadcn components via ``rounded-md``
+   * (= calc(var(--radius) - 2px)) and ``rounded-lg`` (= var(--radius)). */
+  --radius: 0.5rem;
+}

@@ -95,8 +95,19 @@ def _canonical_params(raw: Optional[dict]) -> Dict[str, Any]:
 
 
 def _canonical_flags(raw: Optional[dict]) -> Dict[str, bool]:
-    raw = raw or {}
-    return {k: bool(raw.get(k, False)) for k in _FLAG_KEYS}
+    """Always returns an all-False flags dict.
+
+    Flags are now scene-action-only (configured in the Scene Editor's
+    flags-override per action). Legacy preset flags persisted in
+    ``rl_presets.json`` files from earlier versions are stripped here
+    on load; the next persisted write of any preset rewrites it
+    without flag values, so the file self-cleans over time.
+
+    The ``raw`` argument is ignored. It stays in the signature so the
+    on-disk schema and the ``create``/``update`` call sites don't have
+    to change in lockstep with this cleanup.
+    """
+    return {k: False for k in _FLAG_KEYS}
 
 
 class RLPresetsService:
