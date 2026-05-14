@@ -221,6 +221,9 @@ def create_racelink_web_blueprint(
             host_wifi_service=ctx.services["host_wifi"],
             presets_service=ctx.services["presets"],
         )
+    if "host_settings" not in ctx.services:
+        from ..services.host_settings_service import HostSettingsService
+        ctx.services["host_settings"] = HostSettingsService(controller=ctx.rl_instance)
 
     static_dir = _resolve_asset_dirs()
     bp = Blueprint(

@@ -8,6 +8,18 @@ from typing import Optional
 from .device_types import RL_FLAG_POWER_ON
 
 
+def default_device_name(mac: str) -> str:
+    """Default display name for a device, derived from its MAC.
+
+    Shared between the IDENTIFY path (first appearance) and the
+    rename-reset path (operator clears the name to revert to default).
+    The format is ``"WLED <12 hex chars upper>"``; non-hex separators
+    in ``mac`` (``:``, ``-``) are stripped before formatting.
+    """
+    cleaned = "".join(c for c in (mac or "") if c.isalnum()).upper()
+    return f"WLED {cleaned[-12:]}"
+
+
 class RL_Device:
     def __init__(
         self,

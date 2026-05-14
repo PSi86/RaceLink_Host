@@ -1,16 +1,26 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import AppHeader from '@/components/AppHeader.vue'
 import TransientBanner from '@/components/TransientBanner.vue'
 import GatewayBanner from '@/components/GatewayBanner.vue'
+import BatteryWarningBanner from '@/components/BatteryWarningBanner.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import ConfirmHost from '@/components/ConfirmHost.vue'
 import SpecialsDialog from '@/components/modals/SpecialsDialog.vue'
 import RlPresetsDialog from '@/components/modals/RlPresetsDialog.vue'
 import WledPresetsDialog from '@/components/modals/WledPresetsDialog.vue'
 import FwUpdateDialog from '@/components/modals/FwUpdateDialog.vue'
+import HostSettingsDialog from '@/components/modals/HostSettingsDialog.vue'
+import BatteryDevicesDialog from '@/components/modals/BatteryDevicesDialog.vue'
+// Resort dialog imports ``vuedraggable`` (~100 kB through Sortable.js).
+// Lazy-load so we only pay that cost when the operator actually opens
+// the dialog — otherwise it would land in the main bundle on every
+// page load.
+const ResortGroupsDialog = defineAsyncComponent(
+  () => import('@/components/modals/ResortGroupsDialog.vue'),
+)
 import { useUiBus } from '@/composables/useUiBus'
 
 import { useGatewayStore } from '@/stores/gateway'
@@ -59,6 +69,21 @@ watch(ui.fwUpdateRequest, () => {
   fwUpdateOpen.value = true
 })
 
+const hostSettingsOpen = ref(false)
+watch(ui.hostSettingsRequest, () => {
+  hostSettingsOpen.value = true
+})
+
+const batteryDevicesOpen = ref(false)
+watch(ui.batteryDevicesRequest, () => {
+  batteryDevicesOpen.value = true
+})
+
+const resortGroupsOpen = ref(false)
+watch(ui.resortGroupsRequest, () => {
+  resortGroupsOpen.value = true
+})
+
 // Initialise SSE once for the whole app. ``useRaceLinkEvents`` registers
 // onScopeDispose, so when this component unmounts (full-page navigation
 // away) the EventSource is closed synchronously — the structural fix for
@@ -100,14 +125,26 @@ onMounted(async () => {
 </script>
 
 <template>
-  <AppHeader :route="route" />
-  <TransientBanner :visible="transientBannerVisible" :message="transientBannerMessage" />
-  <GatewayBanner />
+  <!-- Flex column on the app root so banners + header take what they
+       need and the routed page fills the remaining viewport. The
+       page's <main> uses h-full + overflow-hidden, and its inner
+       panels scroll independently rather than the body. -->
+  <div class="flex h-screen min-h-0 flex-col">
+    <AppHeader :route="route" />
+    <TransientBanner :visible="transientBannerVisible" :message="transientBannerMessage" />
+    <GatewayBanner />
+    <BatteryWarningBanner />
+    <div class="min-h-0 flex-1 overflow-hidden">
+      <router-view />
+    </div>
+  </div>
   <ToastHost />
   <ConfirmHost />
   <SpecialsDialog />
   <RlPresetsDialog v-model:open="rlPresetsOpen" />
   <WledPresetsDialog v-model:open="wledPresetsOpen" />
   <FwUpdateDialog v-model:open="fwUpdateOpen" />
-  <router-view />
+  <HostSettingsDialog v-model:open="hostSettingsOpen" />
+  <BatteryDevicesDialog v-model:open="batteryDevicesOpen" />
+  <ResortGroupsDialog v-model:open="resortGroupsOpen" />
 </template>

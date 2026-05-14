@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import type { RouteLocationNormalizedLoaded } from 'vue-router'
 
 import MasterBar from '@/components/MasterBar.vue'
@@ -15,6 +15,27 @@ const gateway = useGatewayStore()
 const devices = useDevicesStore()
 const toast = useToast()
 const ui = useUiBus()
+
+// Surface the per-device retry stats from the StatusService when a
+// "Get Status (All)" run finishes. ``retried`` is the count of
+// previously-online devices that the broadcast missed and the
+// status_service re-queried unicast; ``retried_success`` is how many
+// of those answered the second time.
+watch(
+  () => gateway.task.state,
+  (state, prev) => {
+    if (prev !== 'running' || state !== 'done') return
+    if (gateway.task.name !== 'status') return
+    const result = gateway.task.result as Record<string, unknown> | null
+    if (!result) return
+    const updated = Number(result.updated ?? 0)
+    const retried = Number(result.retried ?? 0)
+    const retriedSuccess = Number(result.retried_success ?? 0)
+    if (retried > 0) {
+      toast.show(`Status: ${updated} online (${retriedSuccess}/${retried} via retry).`)
+    }
+  },
+)
 
 const isDevicesPage = computed(() => props.route.name === 'devices')
 const selectionSize = computed(() => devices.selected.size)
@@ -48,6 +69,10 @@ function onOpenFwUpdate() {
 
 function onOpenResync() {
   ui.requestResync()
+}
+
+function onOpenHostSettings() {
+  ui.requestHostSettings()
 }
 
 async function onStatusSelection() {
@@ -117,6 +142,13 @@ async function onStatusAll() {
         </button>
         <button :disabled="gateway.busy" @click="onSave">Save</button>
         <button :disabled="gateway.busy" @click="onReload">Reload</button>
+        <button
+          title="Host settings (battery thresholds, …)"
+          aria-label="Settings"
+          @click="onOpenHostSettings"
+        >
+          ⚙
+        </button>
       </template>
       <template v-else>
         <router-link to="/" class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-[#232330] px-2.5 py-1.5 text-sm text-text no-underline hover:border-[#3b3b44] hover:text-[#cfe0ff]">← Devices</router-link>

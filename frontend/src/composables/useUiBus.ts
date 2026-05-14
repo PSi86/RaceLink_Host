@@ -15,6 +15,9 @@ const newGroupRequest = ref(0)
 const rlPresetsRequest = ref(0)
 const wledPresetsRequest = ref(0)
 const fwUpdateRequest = ref(0)
+const hostSettingsRequest = ref(0)
+const batteryDevicesRequest = ref(0)
+const resortGroupsRequest = ref(0)
 
 export function useUiBus() {
   return {
@@ -24,6 +27,9 @@ export function useUiBus() {
     rlPresetsRequest,
     wledPresetsRequest,
     fwUpdateRequest,
+    hostSettingsRequest,
+    batteryDevicesRequest,
+    resortGroupsRequest,
     requestDiscover() {
       discoverRequest.value += 1
     },
@@ -41,6 +47,15 @@ export function useUiBus() {
     },
     requestFwUpdate() {
       fwUpdateRequest.value += 1
+    },
+    requestHostSettings() {
+      hostSettingsRequest.value += 1
+    },
+    requestBatteryDevices() {
+      batteryDevicesRequest.value += 1
+    },
+    requestResortGroups() {
+      resortGroupsRequest.value += 1
     },
   }
 }

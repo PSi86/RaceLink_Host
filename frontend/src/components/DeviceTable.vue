@@ -10,10 +10,14 @@ import {
   type SortingState,
 } from '@tanstack/vue-table'
 
+import { Pencil } from 'lucide-vue-next'
+
 import { useDevicesStore } from '@/stores/devices'
 import { useConfigDisplay } from '@/composables/useConfigDisplay'
 import { useRlPresetsStore } from '@/stores/rl_presets'
 import SpecialsLinkButton from '@/components/SpecialsLinkButton.vue'
+import { apiPost } from '@/api/client'
+import { useToast } from '@/composables/useToast'
 import type { Device } from '@/api/types'
 
 const { CONFIG_BITS, isVisible, bitOn } = useConfigDisplay()
@@ -39,6 +43,67 @@ function configCell(configByte: number): ConfigCellInfo {
 
 const devices = useDevicesStore()
 const rlPresets = useRlPresetsStore()
+const toast = useToast()
+
+// Inline-edit state for the Name column. Empty value on commit
+// triggers the backend reset path → default "WLED <mac12>".
+const editingAddr = ref<string | null>(null)
+const editDraft = ref<string>('')
+const editSaving = ref(false)
+
+function startEditName(addr: string, currentName: string) {
+  editingAddr.value = addr
+  editDraft.value = currentName ?? ''
+}
+
+function cancelEditName() {
+  editingAddr.value = null
+  editDraft.value = ''
+}
+
+async function commitEditName(addr: string, originalName: string) {
+  if (editingAddr.value !== addr) return
+  // Enter-key path: keydown.enter triggers the first commit, which
+  // flips editSaving → :disabled on the input → the browser blurs the
+  // now-disabled element → @blur fires the SAME handler again. Bail
+  // re-entrant calls so a single Enter doesn't double-POST update-meta.
+  if (editSaving.value) return
+  const next = editDraft.value.trim()
+  if (next === (originalName ?? '').trim()) {
+    cancelEditName()
+    return
+  }
+  editSaving.value = true
+  try {
+    const r = await apiPost('/api/devices/update-meta', { macs: [addr], name: next })
+    if (!r?.ok) {
+      toast.error(`Rename failed: ${r?.error || 'unknown'}`)
+      return
+    }
+    toast.show(next ? `Renamed to "${next}".` : 'Reset to default name.')
+  } finally {
+    editSaving.value = false
+    cancelEditName()
+  }
+}
+
+function onEditInputMount(el: unknown) {
+  if (!(el instanceof HTMLInputElement)) return
+  // Function refs in v-for fire on every patch, not just on mount.
+  // The ``activeElement`` guard keeps the focus call idempotent so
+  // keystrokes don't refocus mid-edit.
+  if (document.activeElement === el) return
+  el.focus()
+  // No ``.select()`` on purpose: the operator usually appends or
+  // corrects rather than overwrites, so the browser-default end-of-
+  // text caret is the friendlier default.
+  //
+  // Timing caveat: ``.select()`` / ``.setSelectionRange()`` called
+  // synchronously here are a no-op in practice because Vue's render
+  // flush runs inside the click-event tail and the browser settles the
+  // selection state afterwards. If those calls ever come back, wrap
+  // them in ``nextTick(() => …)`` so they run on the next microtask.
+}
 
 // Iteration 8: the device table's "Effect" column shows the decoded
 // WLED effect-mode name from ``dev.effectId`` (the active segment
@@ -234,7 +299,32 @@ function onRowSelect(addr: string, ev: Event) {
             @change="(ev) => onRowSelect(row.original.addr, ev)"
           />
         </td>
-        <td>{{ row.original.name ?? '' }}</td>
+        <td class="rl-name-cell group">
+          <input
+            v-if="editingAddr === row.original.addr"
+            :ref="onEditInputMount"
+            v-model="editDraft"
+            type="text"
+            class="rl-name-input"
+            :disabled="editSaving"
+            @click.stop
+            @keydown.enter.prevent="commitEditName(row.original.addr, row.original.name ?? '')"
+            @keydown.esc.prevent="cancelEditName"
+            @blur="commitEditName(row.original.addr, row.original.name ?? '')"
+          />
+          <div v-else class="flex items-center gap-1.5">
+            <span class="truncate">{{ row.original.name ?? '' }}</span>
+            <button
+              type="button"
+              class="invisible flex-none cursor-pointer rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground hover:text-accent group-hover:visible"
+              title="Rename device (empty input resets to default)"
+              aria-label="Rename device"
+              @click.stop="startEditName(row.original.addr, row.original.name ?? '')"
+            >
+              <Pencil class="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </td>
         <td class="mono">{{ row.original.addr }}</td>
         <td>{{ row.original.groupId }}</td>
         <td>

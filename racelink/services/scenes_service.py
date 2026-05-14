@@ -1201,6 +1201,49 @@ class SceneService:
             stop_on_error=src.get("stop_on_error", True),
         )
 
+    def remap_group_ids(self, mapping: Dict[int, int]) -> int:
+        """Apply an old→new groupId mapping to every scene action.
+
+        Sibling of :meth:`renumber_group_references`. Where the
+        post-delete shift is implicit (``deleted_gid`` plus the
+        ``higher→down-by-one`` rule), the resort flow needs an
+        explicit permutation map. Both walk the same four reference
+        sites — top-level target, offset_group container target,
+        offset_group child targets (recursive), explicit-offset
+        per-group entries — through sibling helpers
+        :func:`_remap_action` / :func:`_remap_actions_for_mapping`.
+
+        Identity mappings (``{1: 1, 2: 2}``) are no-ops: nothing is
+        re-canonicalised and ``_fire_changed`` does not fire. Re-
+        applying the same mapping is therefore safe.
+
+        Returns the count of scenes whose actions were modified.
+        """
+        if not mapping:
+            return 0
+        changed = 0
+        with self._lock:
+            items = list(self._items())
+            new_items: List[dict] = []
+            for scene in items:
+                new_actions, was_changed = _remap_actions_for_mapping(
+                    scene["actions"], mapping,
+                )
+                if was_changed:
+                    changed += 1
+                    new_entry = dict(scene)
+                    new_entry["actions"] = _canonical_actions(new_actions)
+                    new_entry["updated"] = _now_iso()
+                    new_items.append(new_entry)
+                else:
+                    new_items.append(scene)
+            if changed:
+                self._write_atomic(new_items)
+                self._invalidate()
+        if changed:
+            self._fire_changed()
+        return changed
+
     def renumber_group_references(self, deleted_gid: int) -> int:
         """Rewrite every scene's group references after a group deletion.
 
@@ -1438,6 +1481,144 @@ def _renumber_action(
         if new_offset is not action.get("offset"):
             new_action["offset"] = new_offset
     return new_action, True
+
+
+# ---------------------------------------------------------------------
+# Resort sibling: explicit old→new groupId mapping (not a delete-shift)
+# ---------------------------------------------------------------------
+#
+# The functions below mirror ``_renumber_*`` / ``_shift_*`` but take an
+# explicit ``Dict[int, int]`` mapping instead of a single deleted index.
+# Used by :meth:`SceneService.remap_group_ids` for the operator-driven
+# group resort flow. Same four reference sites, same dedup discipline,
+# same defensive-copy contract — only the per-id rule differs.
+
+def _map_group_value(value: int, mapping: Dict[int, int]) -> int:
+    """Look up ``value`` in the mapping; unmapped ids pass through."""
+    return mapping.get(int(value), int(value))
+
+
+def _map_target_groups_list(
+    target: Dict[str, Any], mapping: Dict[int, int],
+) -> tuple[Dict[str, Any], bool]:
+    """Apply :func:`_map_group_value` to every id in a
+    ``target.kind == "groups"`` list. Dedupes (a mapping may collide
+    two old ids onto the same new id; the dedup keeps the list valid).
+
+    Returns ``(new_target, changed)``; the target is a fresh dict only
+    when ``changed`` is True.
+    """
+    if target.get("kind") != "groups":
+        return target, False
+    raw_value = target.get("value")
+    if not isinstance(raw_value, list):
+        return target, False
+    mapped_list = [_map_group_value(int(g), mapping) for g in raw_value]
+    seen: set[int] = set()
+    deduped: List[int] = []
+    for g in mapped_list:
+        if g not in seen:
+            seen.add(g)
+            deduped.append(g)
+    if deduped == list(raw_value):
+        return target, False
+    new_target = dict(target)
+    new_target["value"] = deduped
+    return new_target, True
+
+
+def _remap_action(
+    action: Dict[str, Any],
+    mapping: Dict[int, int],
+) -> tuple[Dict[str, Any], bool]:
+    """Rewrite group references in one action via an explicit
+    ``{old_gid: new_gid}`` mapping. Mirror of :func:`_renumber_action`
+    — same four reference sites, same fresh-dict contract.
+    """
+    kind = action.get("kind")
+    changed = False
+
+    target = action.get("target")
+    new_target = target
+    if isinstance(target, dict):
+        new_target, t_changed = _map_target_groups_list(target, mapping)
+        if t_changed:
+            changed = True
+
+    new_children = action.get("actions")
+    if kind == KIND_OFFSET_GROUP and isinstance(new_children, list):
+        rewritten_children, children_changed = _remap_actions_for_mapping(
+            new_children, mapping,
+        )
+        if children_changed:
+            new_children = rewritten_children
+            changed = True
+
+    offset_block = action.get("offset")
+    new_offset = offset_block
+    if (
+        kind == KIND_OFFSET_GROUP
+        and isinstance(offset_block, dict)
+        and offset_block.get("mode") == "explicit"
+        and isinstance(offset_block.get("values"), list)
+    ):
+        rewritten_values: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        offset_changed = False
+        for entry in offset_block["values"]:
+            try:
+                old = int(entry.get("id"))
+            except (TypeError, ValueError):
+                rewritten_values.append(entry)
+                continue
+            mapped = _map_group_value(old, mapping)
+            if mapped != old:
+                offset_changed = True
+            if mapped in seen_ids:
+                # Collision after remap — drop the duplicate. The
+                # canonical pass on save sorts by id; first-write-wins
+                # matches the dedup order in the target-list helper.
+                offset_changed = True
+                continue
+            seen_ids.add(mapped)
+            new_entry = dict(entry)
+            new_entry["id"] = mapped
+            rewritten_values.append(new_entry)
+        if offset_changed:
+            new_offset = dict(offset_block)
+            new_offset["values"] = rewritten_values
+            changed = True
+
+    if not changed:
+        return action, False
+
+    new_action = dict(action)
+    if new_target is not action.get("target"):
+        new_action["target"] = new_target
+    if kind == KIND_OFFSET_GROUP:
+        if new_children is not action.get("actions"):
+            new_action["actions"] = new_children
+        if new_offset is not action.get("offset"):
+            new_action["offset"] = new_offset
+    return new_action, True
+
+
+def _remap_actions_for_mapping(
+    actions: List[Dict[str, Any]],
+    mapping: Dict[int, int],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Walk a scene's actions, applying :func:`_remap_action` to each.
+    Returns ``(new_actions, changed)`` with the same defensive-copy
+    contract as :func:`_renumber_actions_for_deleted_group`.
+    """
+    changed = False
+    new_actions: List[Dict[str, Any]] = []
+    for action in actions:
+        new_action, action_changed = _remap_action(action, mapping)
+        if action_changed:
+            changed = True
+        new_actions.append(new_action)
+    return (new_actions if changed else actions), changed
 
 
 def _clone_scene(scene: dict) -> dict:

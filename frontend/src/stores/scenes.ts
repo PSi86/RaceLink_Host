@@ -151,6 +151,29 @@ export function emitAction(action: SceneAction): SceneAction {
   return out
 }
 
+/** Deep clone an action for the inline-duplicate flow. Drops the
+ *  server-assigned ``id`` so the clone presents as a fresh row (the
+ *  save path mirrors how ``addAction`` doesn't set ``id``).
+ *
+ *  Uses a JSON round-trip because ``structuredClone`` throws on Vue 3
+ *  reactive proxies in some browsers — the editor draft is stored in
+ *  a reactive ref, and ``structuredClone`` failing silently was the
+ *  reason the duplicate flow appeared as a no-op in the UI. Every
+ *  shape an action can hold (``params`` primitives, ``target`` union
+ *  with arrays, ``flags_override`` record, ``offset`` config, nested
+ *  ``actions`` for offset_group) is plain JSON, so the round-trip is
+ *  lossless. */
+export function cloneActionForInsert(src: SceneAction): SceneAction {
+  const clone = JSON.parse(JSON.stringify(src)) as SceneAction
+  delete clone.id
+  // offset_group children also carry server-assigned ids — strip them
+  // recursively so the entire branch reads as fresh.
+  if (clone.kind === 'offset_group' && Array.isArray(clone.actions)) {
+    for (const child of clone.actions) delete child.id
+  }
+  return clone
+}
+
 /** Port of ``racelink/domain/offset_formula.py``. Both sides have to
  *  produce byte-identical results — used here for the live preview in
  *  the offset_group editor. */
@@ -439,6 +462,26 @@ export const useScenesStore = defineStore('scenes', () => {
     draft.value.actions.push(defaultActionForKind(kind, schema.value))
   }
 
+  function insertAction(index: number, kind: SceneActionKind): void {
+    // Insert a fresh action at position ``index``, pushing the rest
+    // down. ``index`` is clamped to the inclusive range so callers
+    // (hover-zones) don't need to bounds-check the array length.
+    if (!draft.value) return
+    const clamped = Math.max(0, Math.min(index, draft.value.actions.length))
+    draft.value.actions.splice(clamped, 0, defaultActionForKind(kind, schema.value))
+  }
+
+  function duplicateAction(index: number): void {
+    // Insert a deep clone of the action at ``index`` directly after
+    // the original. The clone carries every field except the server-
+    // assigned ``id`` — ``cloneActionForInsert`` handles the recursive
+    // strip for offset_group children too.
+    if (!draft.value) return
+    if (index < 0 || index >= draft.value.actions.length) return
+    const clone = cloneActionForInsert(draft.value.actions[index]!)
+    draft.value.actions.splice(index + 1, 0, clone)
+  }
+
   function removeAction(index: number): void {
     if (!draft.value) return
     if (index < 0 || index >= draft.value.actions.length) return
@@ -483,6 +526,25 @@ export const useScenesStore = defineStore('scenes', () => {
     const list = _parentChildren(parentIndex)
     if (!list) return
     list.push(defaultActionForKind(kind, schema.value))
+  }
+
+  function insertChildAction(
+    parentIndex: number,
+    childIndex: number,
+    kind: SceneActionKind,
+  ): void {
+    const list = _parentChildren(parentIndex)
+    if (!list) return
+    const clamped = Math.max(0, Math.min(childIndex, list.length))
+    list.splice(clamped, 0, defaultActionForKind(kind, schema.value))
+  }
+
+  function duplicateChildAction(parentIndex: number, childIndex: number): void {
+    const list = _parentChildren(parentIndex)
+    if (!list) return
+    if (childIndex < 0 || childIndex >= list.length) return
+    const clone = cloneActionForInsert(list[childIndex]!)
+    list.splice(childIndex + 1, 0, clone)
   }
 
   function removeChildAction(parentIndex: number, childIndex: number): void {
@@ -728,10 +790,14 @@ export const useScenesStore = defineStore('scenes', () => {
     select,
     startNew,
     addAction,
+    insertAction,
+    duplicateAction,
     removeAction,
     moveAction,
     changeActionKind,
     addChildAction,
+    insertChildAction,
+    duplicateChildAction,
     removeChildAction,
     moveChildAction,
     changeChildKind,

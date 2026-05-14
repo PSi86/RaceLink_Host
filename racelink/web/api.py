@@ -17,6 +17,7 @@ from flask import jsonify, request
 logger = logging.getLogger(__name__)
 
 from ..domain import (
+    default_device_name,
     rl_preset_select_options,
     serialize_rl_preset_editor_schema,
     state_scope,
@@ -69,6 +70,7 @@ def _apply_device_meta_updates(
     macs: list,
     new_group,
     new_name,
+    names: dict | None = None,
     progress_cb=None,
 ) -> dict:
     """Apply rename + regroup updates (plan P2-4, deadlock-fix; 2026-04-29 bulk-task refactor).
@@ -112,8 +114,22 @@ def _apply_device_meta_updates(
             dev = ctx.rl_instance.getDeviceFromAddress(mac)
             if dev is None:
                 continue
-            if new_name and isinstance(new_name, str) and len(macs) == 1:
-                dev.name = new_name
+            # Bulk-rename path: per-MAC names supplied by the
+            # ``BulkRenameDialog`` after pattern expansion. An empty
+            # string is the explicit reset marker — restore the default
+            # ``"WLED <mac12>"`` shape used by the IDENTIFY path.
+            if names is not None and mac in names:
+                raw = names.get(mac)
+                resolved = raw.strip() if isinstance(raw, str) else ""
+                dev.name = resolved if resolved else default_device_name(mac)
+                changed += 1
+            elif new_name is not None and isinstance(new_name, str) and len(macs) == 1:
+                # Single-rename inline-edit path. Empty input is the
+                # reset marker — same semantics as the bulk path so the
+                # operator can revert an individual device by clearing
+                # its inline-edit field.
+                stripped = new_name.strip()
+                dev.name = stripped if stripped else default_device_name(mac)
                 changed += 1
             if new_group is None:
                 continue
@@ -353,6 +369,7 @@ def register_api_routes(bp, ctx):
     rl_presets_service = ctx.services.get("rl_presets")
     scenes_service = ctx.services.get("scenes")
     scene_runner_service = ctx.services.get("scene_runner")
+    host_settings_service = ctx.services.get("host_settings")
     specials_service = SpecialsService(rl_instance=ctx.rl_instance)
     ota_workflows = OTAWorkflowService(
         host_wifi_service=host_wifi_service,
@@ -364,7 +381,10 @@ def register_api_routes(bp, ctx):
     @bp.route("/api/devices", methods=["GET"])
     def api_devices():
         with ctx.rl_lock:
-            rows = [serialize_device(device) for device in ctx.devices()]
+            rows = [
+                serialize_device(device, battery_helper=host_settings_service)
+                for device in ctx.devices()
+            ]
         return jsonify({"ok": True, "devices": rows})
 
     @bp.route("/api/specials", methods=["GET"])
@@ -575,24 +595,69 @@ def register_api_routes(bp, ctx):
 
         def do_status():
             updated = 0
+            retried = 0
+            retried_success = 0
+            status_service = getattr(ctx.rl_instance, "status_service", None)
             if selection:
-                if hasattr(ctx.rl_instance, "getStatusSelection"):
-                    updated = int(ctx.rl_instance.getStatusSelection(selection) or 0)
-                else:
-                    for mac in selection:
-                        dev = ctx.rl_instance.getDeviceFromAddress(mac)
-                        if dev:
-                            updated += int(ctx.rl_instance.getStatus(targetDevice=dev) or 0)
-            elif group_id is not None:
-                updated = int(ctx.rl_instance.getStatus(groupFilter=int(group_id)) or 0)
+                # Selection-based "Get Status" is already a per-device
+                # series of unicasts — no retry pass needed (each
+                # device gets its full idle-timeout window already).
+                for mac in selection:
+                    dev = ctx.rl_instance.getDeviceFromAddress(mac)
+                    if dev:
+                        updated += int(ctx.rl_instance.getStatus(targetDevice=dev) or 0)
             else:
-                updated = int(ctx.rl_instance.getStatus(groupFilter=255) or 0)
-            return {"updated": updated, "groupId": group_id, "selectionCount": len(selection) if selection else 0}
+                group_filter = int(group_id) if group_id is not None else 255
+                if status_service is not None:
+                    result = status_service.get_status(group_filter=group_filter) or {}
+                    updated = int(result.get("updated") or 0)
+                    retried = int(result.get("retried") or 0)
+                    rr = result.get("retried_responders")
+                    if isinstance(rr, set):
+                        retried_success = len(rr)
+                else:
+                    updated = int(ctx.rl_instance.getStatus(groupFilter=group_filter) or 0)
+            return {
+                "updated": updated,
+                "retried": retried,
+                "retried_success": retried_success,
+                "groupId": group_id,
+                "selectionCount": len(selection) if selection else 0,
+            }
 
         task = ctx.tasks.start("status", do_status, meta={"groupId": group_id, "selectionCount": len(selection) if selection else 0})
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/host-settings", methods=["GET"])
+    def api_host_settings_get():
+        if host_settings_service is None:
+            return jsonify({"ok": False, "error": "host-settings service unavailable"}), 500
+        return jsonify({
+            "ok": True,
+            "battery": host_settings_service.get_battery_thresholds(),
+        })
+
+    @bp.route("/api/host-settings", methods=["POST"])
+    def api_host_settings_post():
+        if host_settings_service is None:
+            return jsonify({"ok": False, "error": "host-settings service unavailable"}), 500
+        body = request.get_json(silent=True) or {}
+        battery = body.get("battery") or {}
+        try:
+            updated = host_settings_service.set_battery_thresholds(
+                mv_2s=battery.get("mV_2s"),
+                mv_6s=battery.get("mV_6s"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        # The DTO bakes ``battery_low`` from the live threshold, so a
+        # change requires the frontend to re-fetch /api/devices. Reuse
+        # the existing ``devices`` SSE topic instead of inventing a new
+        # one — the banner reads ``battery_low`` from devices.
+        _sse_refresh(ctx, {state_scope.DEVICES})
+        return jsonify({"ok": True, "battery": updated})
 
     @bp.route("/api/devices/update-meta", methods=["POST"])
     def api_devices_update_meta():
@@ -618,14 +683,17 @@ def register_api_routes(bp, ctx):
         macs = body.get("macs") or []
         new_group = body.get("groupId", None)
         new_name = body.get("name", None)
+        raw_names = body.get("names")
+        names = raw_names if isinstance(raw_names, dict) else None
 
         # Pure rename: keep the synchronous path. No RF I/O, no need
         # for the TaskManager wrapper.
         if new_group is None:
             result = _apply_device_meta_updates(
-                ctx, macs=macs, new_group=None, new_name=new_name,
+                ctx, macs=macs, new_group=None, new_name=new_name, names=names,
             )
-            scopes = {state_scope.DEVICES} if new_name is not None else {state_scope.NONE}
+            renamed = new_name is not None or names is not None
+            scopes = {state_scope.DEVICES} if renamed else {state_scope.NONE}
             try:
                 ctx.rl_instance.save_to_db({"manual": True}, scopes=scopes)
             except Exception as ex:
@@ -643,7 +711,7 @@ def register_api_routes(bp, ctx):
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
 
         scopes_set = {state_scope.DEVICE_MEMBERSHIP}
-        if new_name is not None:
+        if new_name is not None or names is not None:
             scopes_set.add(state_scope.DEVICES)
         target_group = int(new_group)
 
@@ -659,7 +727,7 @@ def register_api_routes(bp, ctx):
         def _runner():
             outcome = _apply_device_meta_updates(
                 ctx, macs=macs, new_group=new_group, new_name=new_name,
-                progress_cb=_progress,
+                names=names, progress_cb=_progress,
             )
             try:
                 ctx.rl_instance.save_to_db({"manual": True}, scopes=scopes_set)
@@ -744,6 +812,121 @@ def register_api_routes(bp, ctx):
             _save_groups_quietly("rename")
         _sse_refresh(ctx, {state_scope.GROUPS})
         return jsonify({"ok": True})
+
+    @bp.route("/api/groups/resort", methods=["POST"])
+    def api_groups_resort():
+        """Re-order user groups.
+
+        Body: ``{order: [<group_id>, ...], carry_scene_references: bool}``.
+        The ``order`` list contains every current group id exactly once,
+        in the desired new sequence. Group 0 (Unconfigured) and any
+        static group keep their existing index — the dialog enforces
+        this client-side and the route rejects any payload that moves
+        them.
+
+        Behaviour:
+        * The group repository is reordered.
+        * Every device's ``groupId`` is rewritten through the
+          ``{old_gid: new_gid}`` mapping so the host's view of "which
+          group is each device in" tracks the new ids.
+        * When ``carry_scene_references`` is true (default), the same
+          mapping is applied to every scene's group references via
+          :meth:`SceneService.remap_group_ids` — operator intent
+          ("scene targets the same physical group") is preserved.
+        * When false, scene group ids stay numerically frozen, which
+          means they now target whatever group ended up in those
+          slots. Operator-footgun by design.
+        """
+        body = request.get_json(silent=True) or {}
+        raw_order = body.get("order")
+        carry_refs = bool(body.get("carry_scene_references", True))
+
+        if not isinstance(raw_order, list):
+            return jsonify({
+                "ok": False, "error": "order must be a list of group ids",
+            }), 400
+        try:
+            new_order = [int(g) for g in raw_order]
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False, "error": "order entries must be integers",
+            }), 400
+
+        scenes_changed = 0
+        mapping: dict[int, int] = {}
+        with ctx.rl_lock:
+            groups_list = ctx.groups()
+            current_ids = list(range(len(groups_list)))
+            if sorted(new_order) != current_ids:
+                return jsonify({
+                    "ok": False,
+                    "error": "order must be a permutation of all current group ids",
+                }), 400
+
+            # Group 0 (Unconfigured) is the anchor; any static group
+            # must keep its index too.
+            for new_idx, old_gid in enumerate(new_order):
+                old_group = groups_list[old_gid]
+                if old_gid == 0 and new_idx != 0:
+                    return jsonify({
+                        "ok": False,
+                        "error": "group 0 (Unconfigured) must stay at the top",
+                    }), 400
+                if getattr(old_group, "static_group", 0) and new_idx != old_gid:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"static group {old_gid} cannot be moved",
+                    }), 400
+
+            mapping = {old_gid: new_idx for new_idx, old_gid in enumerate(new_order)}
+            if all(old == new for old, new in mapping.items()):
+                # Identity permutation — nothing to do. Return success
+                # without re-broadcasting SSE so the operator-facing
+                # event stream stays calm.
+                return jsonify({"ok": True, "scenes_changed": 0, "mapping": {}})
+
+            new_groups = [groups_list[old_gid] for old_gid in new_order]
+            if ctx.group_repo is not None:
+                ctx.group_repo.replace_all(new_groups)
+            else:
+                ctx.rl_grouplist[:] = new_groups
+
+            for device in ctx.devices():
+                try:
+                    cur = int(getattr(device, "groupId", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                new_gid = mapping.get(cur, cur)
+                if new_gid != cur:
+                    device.groupId = new_gid
+
+            if carry_refs and scenes_service is not None:
+                try:
+                    scenes_changed = scenes_service.remap_group_ids(mapping)
+                except Exception:
+                    # swallow-ok: groups + devices are the critical
+                    # path; a failed scene rewrite leaves stale refs
+                    # but doesn't block the resort. Logged for diag.
+                    logger.warning(
+                        "remap_group_ids failed during group resort",
+                        exc_info=True,
+                    )
+
+            _save_groups_quietly("resort")
+
+        scopes = {state_scope.GROUPS, state_scope.DEVICE_MEMBERSHIP}
+        if scenes_changed > 0:
+            scopes.add(state_scope.SCENES)
+        _sse_refresh(ctx, scopes)
+
+        # JSON object keys must be strings; only emit pairs that
+        # actually moved so the client can render a concise summary.
+        moved = {str(old): new for old, new in mapping.items() if old != new}
+        return jsonify({
+            "ok": True,
+            "scenes_changed": scenes_changed,
+            "mapping": moved,
+        })
 
     @bp.route("/api/groups/delete", methods=["POST"])
     def api_groups_delete():

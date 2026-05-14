@@ -40,7 +40,13 @@ class StatusService:
         transport = self.transport
         if transport is None:
             logger.warning("getStatus: communicator not ready")
-            return {"updated": 0, "responders": set(), "got_closed": False}
+            return {
+                "updated": 0,
+                "responders": set(),
+                "got_closed": False,
+                "retried": 0,
+                "retried_responders": set(),
+            }
 
         self.gateway_service.install_transport_hooks()
 
@@ -55,6 +61,30 @@ class StatusService:
 
         updated = 0
         responders = set()
+
+        # Snapshot of devices believed online BEFORE the broadcast.
+        # Only these are candidates for the post-broadcast per-device
+        # retry (2026-05-13). Operators previously had to manually
+        # click "Get Status" on each previously-online device that
+        # the broadcast missed; the retry pass automates that one
+        # extra round-trip without spamming devices that were
+        # already offline.
+        snapshot_targets: list = []
+        was_online_before: set[str] = set()
+        if target_device is None:
+            if group_filter == 255:
+                snapshot_targets = list(self.controller.device_repository.list())
+            else:
+                snapshot_targets = [
+                    dev
+                    for dev in self.controller.device_repository.list()
+                    if int(getattr(dev, "groupId", 0)) == int(group_filter)
+                ]
+            for dev in snapshot_targets:
+                if bool(getattr(dev, "link_online", False)):
+                    mac = (getattr(dev, "addr", "") or "").upper()
+                    if mac:
+                        was_online_before.add(mac)
 
         def _collect(ev: dict) -> bool:
             nonlocal updated
@@ -113,6 +143,48 @@ class StatusService:
             max_timeout_s=max_timeout_s,
         )
 
+        # Per-device retry pass for broadcast/group polls. Targets that
+        # were online before the broadcast but didn't reply get one
+        # unicast retry each — reusing this same method via
+        # ``target_device=dev`` keeps the wire path identical to the
+        # operator clicking "Get Status" on a single row. Long-offline
+        # devices are intentionally skipped: their ``link_online`` flag
+        # is already False, so they are not in ``was_online_before``.
+        retried = 0
+        retried_responders: set[str] = set()
+        if target_device is None and snapshot_targets:
+            missing: list = []
+            for dev in snapshot_targets:
+                mac = (getattr(dev, "addr", "") or "").upper()
+                if not mac:
+                    continue
+                if mac not in was_online_before:
+                    continue
+                if mac in responders or mac[-6:] in responders:
+                    continue
+                missing.append(dev)
+            for dev in missing:
+                try:
+                    sub = self.get_status(target_device=dev)
+                except Exception:
+                    logger.debug(
+                        "RaceLink: per-device status retry failed for %r",
+                        getattr(dev, "addr", "?"),
+                        exc_info=True,
+                    )
+                    continue
+                retried += 1
+                sub_resp = sub.get("responders") if isinstance(sub, dict) else None
+                if isinstance(sub_resp, set) and sub_resp:
+                    retried_responders |= sub_resp
+                    # Fold into the outer ``responders`` so the
+                    # mark_offline block below correctly skips the
+                    # device on a successful retry. ``updated`` also
+                    # picks up the reply for accurate counts in the
+                    # operator toast.
+                    responders |= sub_resp
+                    updated += int(sub.get("updated") or 0)
+
         # After the collection window, any device in the targeted set that
         # did not respond is considered offline. This logic used to be gated
         # on ``got_closed`` -- now that the Host owns the clock, the window
@@ -132,15 +204,10 @@ class StatusService:
                         exc_info=True,
                     )
         else:
-            if group_filter == 255:
-                targets = list(self.controller.device_repository.list())
-            else:
-                targets = [
-                    dev
-                    for dev in self.controller.device_repository.list()
-                    if int(getattr(dev, "groupId", 0)) == int(group_filter)
-                ]
-            for dev in targets:
+            # Reuse the same snapshot the retry pass built so device
+            # repository churn between the broadcast send and this
+            # tail can't add or drop rows mid-decision.
+            for dev in snapshot_targets:
                 try:
                     mac = (dev.addr or "").upper()
                     if not mac:
@@ -157,4 +224,10 @@ class StatusService:
                         exc_info=True,
                     )
 
-        return {"updated": updated, "responders": responders, "got_closed": True}
+        return {
+            "updated": updated,
+            "responders": responders,
+            "got_closed": True,
+            "retried": retried,
+            "retried_responders": retried_responders,
+        }

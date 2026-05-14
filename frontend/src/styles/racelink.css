@@ -37,6 +37,17 @@ body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif
 .rl-table thead th{ position:sticky; top:0; background:#1a1a21; z-index:1; cursor:pointer; }
 .rl-table input[type="checkbox"]{ transform:scale(1.2); }
 
+/* Inline-rename: the Name cell hosts a pencil button (lucide-vue
+   Pencil) that becomes visible on row hover via the Tailwind ``group``
+   utility. Clicking the button swaps the cell for ``.rl-name-input``;
+   the input fills the cell so the value stays positionally stable
+   between view and edit modes. */
+.rl-name-input{
+  width:100%; min-width:0; padding:2px 6px;
+  background:#101015; color:inherit; font:inherit;
+  border:1px solid #4c8bf5; border-radius:4px; outline:none;
+}
+
 /* Live row-update flash animation. Triggered when a device's
    ``last_seen_ts`` advances between renders (typically from a
    STATUS_REPLY or IDENTIFY_REPLY arriving over SSE). The row briefly

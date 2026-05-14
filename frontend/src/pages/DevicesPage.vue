@@ -33,9 +33,9 @@ watch(ui.newGroupRequest, () => {
 </script>
 
 <template>
-  <main class="grid grid-cols-[260px_1fr] gap-3 p-3">
+  <main class="grid h-full min-h-0 grid-cols-[260px_1fr] gap-3 overflow-hidden p-3">
     <DevicesSidebar />
-    <section class="overflow-auto rounded-[10px] border border-border bg-card p-2.5">
+    <section class="min-h-0 overflow-auto rounded-[10px] border border-border bg-card p-2.5">
       <BulkActionsToolbar />
       <NodeConfigToolbar />
       <ConfigDisplayToolbar />

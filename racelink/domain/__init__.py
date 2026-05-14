@@ -21,7 +21,7 @@ from .flags import (
     build_flags_byte,
     flags_from_mapping,
 )
-from .models import RL_Device, RL_DeviceGroup
+from .models import RL_Device, RL_DeviceGroup, default_device_name
 from .specials import (
     RL_PRESET_EDITOR_SCHEMA,
     RL_SPECIALS,
@@ -55,6 +55,7 @@ __all__ = [
     "RL_SPECIALS",
     "build_specials_state",
     "create_device",
+    "default_device_name",
     "get_dev_type_info",
     "get_special_keys_for_caps",
     "get_specials_config",

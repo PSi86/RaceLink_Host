@@ -5,6 +5,7 @@ import { useDevicesStore } from '@/stores/devices'
 import { useGroupsStore } from '@/stores/groups'
 import { useGatewayStore } from '@/stores/gateway'
 import { useToast } from '@/composables/useToast'
+import BulkRenameDialog from '@/components/modals/BulkRenameDialog.vue'
 
 const devices = useDevicesStore()
 const groups = useGroupsStore()
@@ -12,6 +13,7 @@ const gateway = useGatewayStore()
 const toast = useToast()
 
 const targetGroup = ref<number | null>(null)
+const renameDialogOpen = ref(false)
 
 const selectableGroups = computed(() => groups.selectableGroups)
 
@@ -70,6 +72,14 @@ const disabled = computed(() => gateway.busy || sending.value || devices.selecte
     >
       Move
     </button>
+    <button
+      :disabled="devices.selected.size === 0"
+      title="Bulk-rename every selected device using a pattern (e.g. WLED {n:03d}). Single rename: click the Name cell in the table."
+      @click="renameDialogOpen = true"
+    >
+      Rename…
+    </button>
     <span class="text-muted-foreground">{{ devices.selected.size }} selected</span>
   </div>
+  <BulkRenameDialog v-model:open="renameDialogOpen" />
 </template>

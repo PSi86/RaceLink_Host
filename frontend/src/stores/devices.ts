@@ -82,6 +82,10 @@ export const useDevicesStore = defineStore('devices', () => {
     selected.value = new Set(filteredDevices.value.map((d) => d.addr))
   }
 
+  function setSelection(macs: Iterable<string>) {
+    selected.value = new Set(macs)
+  }
+
   function setSort(key: keyof Device) {
     if (sort.value.key === key) {
       sort.value = { key, dir: (sort.value.dir === 1 ? -1 : 1) as 1 | -1 }
@@ -94,6 +98,12 @@ export const useDevicesStore = defineStore('devices', () => {
     return apiPost('/api/devices/update-meta', { macs, groupId })
   }
 
+  async function bulkRename(macs: string[], names: Record<string, string>) {
+    // Empty-string values are the explicit reset marker — the backend
+    // restores the IDENTIFY-default "WLED <mac12>" for those entries.
+    return apiPost('/api/devices/update-meta', { macs, names })
+  }
+
   return {
     devices,
     filteredDevices,
@@ -102,7 +112,9 @@ export const useDevicesStore = defineStore('devices', () => {
     load,
     toggle,
     selectAll,
+    setSelection,
     setSort,
     bulkSetGroup,
+    bulkRename,
   }
 })

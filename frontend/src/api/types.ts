@@ -101,8 +101,21 @@ export interface Device {
   last_ack?: string | null
   caps: number
   specials?: Record<string, number>
+  // Battery classification baked into the DTO so the warning banner
+  // doesn't have to re-derive the rule on every device list refresh.
+  battery_class?: '2s' | '6s' | 'unknown'
+  battery_low?: boolean
   // Special-key flat fields appended by ``serialize_device``
   [key: string]: unknown
+}
+
+export interface HostBatterySettings {
+  mV_2s: number
+  mV_6s: number
+}
+
+export interface HostSettings {
+  battery: HostBatterySettings
 }
 
 export interface Group {
@@ -398,7 +411,7 @@ export interface FwUploadResponse {
   file: FwUploadInfo
 }
 
-export type FwTargetMode = 'selected' | 'filtered' | 'all'
+export type FwTargetMode = 'selected' | 'filtered' | 'all' | 'type'
 
 export interface FwStartBody {
   macs: string[]

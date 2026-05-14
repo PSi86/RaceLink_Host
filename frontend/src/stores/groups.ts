@@ -66,6 +66,17 @@ export const useGroupsStore = defineStore('groups', () => {
     return false
   }
 
+  async function renameGroup(id: number, name: string): Promise<{ ok: boolean; error?: string }> {
+    const res = await apiPost('/api/groups/rename', { id, name })
+    if (!res?.ok) {
+      return { ok: false, error: typeof res?.error === 'string' ? res.error : 'Rename failed.' }
+    }
+    // Server broadcasts ``refresh groups`` SSE; the bus handler in
+    // ``useRaceLinkEvents`` reloads the list. No defensive ``load()``
+    // here — it would double-fetch ``/api/groups``.
+    return { ok: true }
+  }
+
   return {
     groups,
     selGroupId,
@@ -74,5 +85,6 @@ export const useGroupsStore = defineStore('groups', () => {
     selectGroup,
     createGroup,
     deleteGroup,
+    renameGroup,
   }
 })

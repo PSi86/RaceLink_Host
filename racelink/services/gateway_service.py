@@ -36,7 +36,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
-from ..domain import create_device, get_dev_type_info
+from ..domain import create_device, default_device_name, get_dev_type_info
 from ..protocol import opcode_name as protocol_opcode_name
 from ..protocol import request_direction, response_opcode, response_policy, rules as protocol_rules
 from ..transport.framing import mac_last3_from_hex
@@ -1095,7 +1095,7 @@ class GatewayService:
                         is_known_device = dev is not None
                         if not dev:
                             dev_type = ev.get("caps", 0)
-                            dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=f"WLED {mac12}")
+                            dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=default_device_name(mac12))
                             self.controller.device_repository.append(dev)
 
                         dev.update_from_identify(

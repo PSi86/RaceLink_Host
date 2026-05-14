@@ -11,11 +11,20 @@ from ..domain import (
 )
 
 
-def serialize_device(dev):
-    """Make an RL_Device JSON-serializable for the UI table."""
+def serialize_device(dev, *, battery_helper=None):
+    """Make an RL_Device JSON-serializable for the UI table.
+
+    ``battery_helper`` is an optional object exposing
+    ``classify_voltage(mV) -> str`` and ``is_low(mV) -> bool``
+    (typically a :class:`HostSettingsService` instance). When supplied,
+    the serialized device gains ``battery_class`` and ``battery_low``
+    so the frontend can render the weak-battery banner without
+    re-deriving the rule.
+    """
     online = bool(getattr(dev, "link_online", False))
     dev_type = int(getattr(dev, "dev_type", getattr(dev, "caps", 0)) or 0)
     type_info = get_dev_type_info(dev_type)
+    voltage_mV = int(getattr(dev, "voltage_mV", 0) or 0)
 
     data = {
         "addr": getattr(dev, "addr", None),
@@ -28,7 +37,7 @@ def serialize_device(dev):
         "effectId": int(getattr(dev, "effectId", 0) or 0),
         "brightness": int(getattr(dev, "brightness", 0) or 0),
         "specials": dict(getattr(dev, "specials", {}) or {}),
-        "voltage_mV": int(getattr(dev, "voltage_mV", 0) or 0),
+        "voltage_mV": voltage_mV,
         "node_rssi": int(getattr(dev, "node_rssi", 0) or 0),
         "node_snr": int(getattr(dev, "node_snr", 0) or 0),
         "host_rssi": int(getattr(dev, "host_rssi", 0) or 0),
@@ -41,6 +50,15 @@ def serialize_device(dev):
         "last_ack": getattr(dev, "last_ack", None),
         "online": online,
     }
+    if battery_helper is not None:
+        try:
+            data["battery_class"] = battery_helper.classify_voltage(voltage_mV)
+            data["battery_low"] = bool(battery_helper.is_low(voltage_mV))
+        except Exception:
+            # swallow-ok: missing helper attrs degrade to "no warning";
+            # the operator can still read voltage_mV directly.
+            data["battery_class"] = "unknown"
+            data["battery_low"] = False
     special_keys = get_special_keys_for_caps(type_info.get("caps", []))
     specials = getattr(dev, "specials", {}) or {}
     for key in special_keys:

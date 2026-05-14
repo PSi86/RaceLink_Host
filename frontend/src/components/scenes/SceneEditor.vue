@@ -211,7 +211,7 @@ function onAddAction() {
 </script>
 
 <template>
-  <section class="flex min-h-[60vh] flex-col gap-4 rounded-md border border-border bg-card/40 p-4">
+  <section class="flex h-full min-h-0 flex-col gap-4 overflow-auto rounded-[10px] border border-border bg-card p-2.5">
     <p v-if="!draft" class="text-sm text-muted-foreground">
       Pick a scene on the left, or click <strong>+ New</strong> to create one.
     </p>
@@ -249,7 +249,10 @@ function onAddAction() {
 
         <draggable
           v-model="actionsList"
-          :item-key="(_el: SceneAction, idx: number) => `top-${idx}`"
+          :item-key="
+            (_el: SceneAction, idx: number) =>
+              `${scenes.selectedKey ?? 'new'}-top-${idx}`
+          "
           handle=".rl-action-grip"
           animation="150"
           class="flex flex-col gap-2"

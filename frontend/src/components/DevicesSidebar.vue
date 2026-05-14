@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { ArrowUpDown, Pencil } from 'lucide-vue-next'
 
 import { useGroupsStore } from '@/stores/groups'
 import { useDevicesStore } from '@/stores/devices'
@@ -107,15 +108,97 @@ function onNewGroup() {
   // free of modal state.
   ui.requestNewGroup()
 }
+
+function onReorderGroups() {
+  ui.requestResortGroups()
+}
+
+// Inline-rename for group names. Same hover-pencil pattern the
+// DeviceTable uses for device names: pencil button is invisible
+// outside the row hover state, click swaps the name span for an input.
+// Empty trim cancels (groups have no default-name fallback — backend
+// rejects the empty-name update, so a no-op is the right semantic).
+const editingGroupId = ref<number | null>(null)
+const editGroupDraft = ref<string>('')
+const editGroupSaving = ref(false)
+
+function canRenameGroup(g: Group): boolean {
+  return !g.static && Number(g.id) !== 0
+}
+
+function startEditGroup(g: Group, ev: MouseEvent) {
+  ev.stopPropagation()
+  editingGroupId.value = g.id
+  editGroupDraft.value = g.name ?? ''
+}
+
+function cancelEditGroup() {
+  editingGroupId.value = null
+  editGroupDraft.value = ''
+}
+
+async function commitEditGroup(g: Group) {
+  if (editingGroupId.value !== g.id) return
+  // Re-entry guard mirrors the DeviceTable inline-edit: Enter triggers
+  // the first commit, the disabled state forces the input to blur,
+  // blur would fire the same handler a second time without this.
+  if (editGroupSaving.value) return
+  const next = editGroupDraft.value.trim()
+  const current = (g.name ?? '').trim()
+  if (next === current || next === '') {
+    cancelEditGroup()
+    return
+  }
+  editGroupSaving.value = true
+  try {
+    const r = await groups.renameGroup(g.id, next)
+    if (!r.ok) {
+      toast.error(`Rename failed: ${r.error || 'unknown'}`)
+      return
+    }
+    toast.show(`Renamed group to "${next}".`)
+  } finally {
+    editGroupSaving.value = false
+    cancelEditGroup()
+  }
+}
+
+function onEditGroupInputMount(el: unknown) {
+  if (!(el instanceof HTMLInputElement)) return
+  // Function refs in v-for fire on every patch, not just on mount.
+  // The ``activeElement`` guard keeps the focus call idempotent so
+  // keystrokes don't refocus mid-edit.
+  if (document.activeElement === el) return
+  el.focus()
+  // No ``.select()`` on purpose: matches the DeviceTable rename — the
+  // operator appends/corrects rather than overwrites, so the browser-
+  // default end-of-text caret wins.
+  //
+  // Timing caveat: ``.select()`` / ``.setSelectionRange()`` called
+  // synchronously here are a no-op in practice because Vue's render
+  // flush runs inside the click-event tail and the browser settles the
+  // selection state afterwards. If those calls ever come back, wrap
+  // them in ``nextTick(() => …)`` so they run on the next microtask.
+}
 </script>
 
 <template>
-  <aside class="rounded-[10px] border border-border bg-card p-2.5">
-    <div class="mb-1.5 flex items-center justify-between">
+  <aside class="flex h-full min-h-0 flex-col rounded-[10px] border border-border bg-card p-2.5">
+    <div class="mb-1.5 flex shrink-0 items-center justify-between">
       <span>Groups</span>
-      <button title="Create group" @click="onNewGroup">+</button>
+      <div class="flex items-center gap-1">
+        <button
+          type="button"
+          title="Reorder groups"
+          aria-label="Reorder groups"
+          @click="onReorderGroups"
+        >
+          <ArrowUpDown class="h-4 w-4" />
+        </button>
+        <button title="Create group" @click="onNewGroup">+</button>
+      </div>
     </div>
-    <ul class="m-0 max-h-[calc(100vh-220px)] list-none overflow-auto p-0">
+    <ul class="m-0 min-h-0 flex-1 list-none overflow-auto p-0">
       <li
         v-for="g in groups.groups"
         :key="g.id"
@@ -128,7 +211,45 @@ function onNewGroup() {
         ]"
         @click="selectGroup(g)"
       >
-        <span class="min-w-0 flex-auto truncate">{{ g.name || `Group ${g.id}` }}</span>
+        <!-- Edit mode: input replaces name + pencil. ``@click.stop`` on
+             the input keeps a stray click from re-selecting the group
+             row (which would not be a bug per se, but feels jittery). -->
+        <input
+          v-if="editingGroupId === g.id"
+          :ref="onEditGroupInputMount"
+          v-model="editGroupDraft"
+          type="text"
+          maxlength="32"
+          class="rl-name-input min-w-0 flex-auto"
+          :disabled="editGroupSaving"
+          @click.stop
+          @keydown.enter.prevent="commitEditGroup(g)"
+          @keydown.esc.prevent="cancelEditGroup"
+          @blur="commitEditGroup(g)"
+        />
+        <template v-else>
+          <span class="min-w-0 flex-auto truncate">{{ g.name || `Group ${g.id}` }}</span>
+          <button
+            v-if="canRenameGroup(g)"
+            type="button"
+            class="invisible flex-none cursor-pointer rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground hover:text-accent group-hover:visible"
+            :title="`Rename group ${g.name}`"
+            aria-label="Rename group"
+            @click.stop="(ev) => startEditGroup(g, ev)"
+          >
+            <Pencil class="h-3.5 w-3.5" />
+          </button>
+          <button
+            v-else
+            type="button"
+            class="pointer-events-none invisible flex-none rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground"
+            tabindex="-1"
+            aria-hidden="true"
+            disabled
+          >
+            <Pencil class="h-3.5 w-3.5" />
+          </button>
+        </template>
         <span
           class="flex-none text-xs text-muted-foreground"
           :title="

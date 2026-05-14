@@ -45,6 +45,7 @@ const toast = useToast()
 
 // ---- form state ----------------------------------------------------
 const target = ref<FwTargetMode>('selected')
+const selectedType = ref<string>('')
 const doFirmware = ref(true)
 const doPresets = ref(false)
 const doCfg = ref(false)
@@ -77,6 +78,20 @@ const filteredCount = computed(() => devices.filteredDevices.length)
 const selectionCount = computed(() => devices.selected.size)
 const allCount = computed(() => allDevices.value.length)
 
+const availableTypes = computed<string[]>(() => {
+  const set = new Set<string>()
+  for (const dev of allDevices.value) {
+    const name = dev.dev_type_name
+    if (name) set.add(name)
+  }
+  return Array.from(set).sort()
+})
+
+const typeMatchCount = computed<number>(() => {
+  if (!selectedType.value) return 0
+  return allDevices.value.filter((d) => d.dev_type_name === selectedType.value).length
+})
+
 const targetMacs = computed<string[]>(() => {
   if (target.value === 'selected') return Array.from(devices.selected)
   if (target.value === 'filtered') {
@@ -89,7 +104,24 @@ const targetMacs = computed<string[]>(() => {
       .map((d) => d.addr)
       .filter(Boolean)
   }
+  if (target.value === 'type') {
+    if (!selectedType.value) return []
+    return allDevices.value
+      .filter((d) => d.dev_type_name === selectedType.value)
+      .map((d) => d.addr)
+      .filter(Boolean)
+  }
   return allDevices.value.map((d) => d.addr).filter(Boolean)
+})
+
+// Auto-pick the first available type when the operator switches to
+// "By type" if no type is selected yet. Keeps the dropdown from
+// showing an empty value with a zero device count.
+watch(target, (next) => {
+  if (next !== 'type') return
+  if (!selectedType.value && availableTypes.value.length > 0) {
+    selectedType.value = availableTypes.value[0]!
+  }
 })
 
 const fwTaskRunning = computed(
@@ -320,6 +352,20 @@ function fmtSize(n: number): string {
             <label class="inline-flex items-center gap-2">
               <input v-model="target" type="radio" value="all" class="accent-primary" />
               <span>All (<span class="tabular-nums">{{ allCount }}</span>)</span>
+            </label>
+            <label class="inline-flex items-center gap-2">
+              <input v-model="target" type="radio" value="type" class="accent-primary" />
+              <span>By type</span>
+              <select
+                v-model="selectedType"
+                :disabled="target !== 'type' || availableTypes.length === 0"
+                class="h-7 rounded-md border border-input bg-background px-2 text-xs disabled:opacity-50"
+                @click.stop
+              >
+                <option v-if="availableTypes.length === 0" value="">No known types</option>
+                <option v-for="t in availableTypes" :key="t" :value="t">{{ t }}</option>
+              </select>
+              <span class="tabular-nums text-xs text-muted-foreground">({{ typeMatchCount }})</span>
             </label>
             <span class="ml-auto text-xs text-muted-foreground">
               {{ targetMacs.length }} device{{ targetMacs.length === 1 ? '' : 's' }} planned

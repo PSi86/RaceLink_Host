@@ -5,12 +5,13 @@
 // and the row is more compact since it's nested.
 
 import { computed } from 'vue'
-import { ChevronDown, ChevronUp, GripVertical, X } from 'lucide-vue-next'
+import { ChevronDown, ChevronUp, Copy, GripVertical, X } from 'lucide-vue-next'
 
 import { Button } from '@/components/ui/button'
 import SceneActionBody from './SceneActionBody.vue'
 import SceneFlagsOverride from './SceneFlagsOverride.vue'
 import SceneTargetPicker from './SceneTargetPicker.vue'
+import ActionInsertZone from './ActionInsertZone.vue'
 import { useScenesStore } from '@/stores/scenes'
 import type { SceneAction, SceneActionKind, SceneTarget } from '@/api/types'
 
@@ -49,7 +50,16 @@ const moveDownDisabled = computed(() => props.index >= props.total - 1)
 </script>
 
 <template>
-  <div class="rounded-md border border-border bg-background/40 p-2.5">
+  <!-- ``relative`` anchors the absolutely-positioned ActionInsertZone
+       (which sits over the gap above this child row). -->
+  <div class="relative rounded-md border border-border bg-background/40 p-2.5">
+    <!-- Hover-zone insert above this child. Restricted to the
+         offset_group child-kinds — same kind picker the bottom
+         "Add child" select offers. -->
+    <ActionInsertZone
+      :kinds="allowedKinds"
+      @insert="(k) => scenes.insertChildAction(parentIndex, index, k)"
+    />
     <div class="flex flex-wrap items-start gap-2">
       <div class="flex flex-col items-center gap-1 pt-1 text-muted-foreground">
         <span class="og-child-grip cursor-grab select-none" title="Drag to reorder">
@@ -96,6 +106,15 @@ const moveDownDisabled = computed(() => props.index >= props.total - 1)
           @click="scenes.moveChildAction(parentIndex, index, 1)"
         >
           <ChevronDown class="h-4 w-4" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          title="Duplicate child (insert a copy below)"
+          @click="scenes.duplicateChildAction(parentIndex, index)"
+        >
+          <Copy class="h-4 w-4" />
         </Button>
         <Button
           type="button"

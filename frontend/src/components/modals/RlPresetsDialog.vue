@@ -58,7 +58,12 @@ function onNew() {
 
 <template>
   <Dialog :open="open" @update:open="(v) => emit('update:open', v)">
-    <DialogContent class="w-[min(960px,96vw)]">
+    <!-- Override DialogContent defaults: the two-column layout needs to
+         clip at the dialog edge and have its panels scroll
+         independently. Default ``overflow-y-auto`` + ``gap-4`` + ``p-6``
+         is the single-column dialog shape; this one is two-column with
+         h=auto rows ``[header_1fr_footer]``. -->
+    <DialogContent class="grid h-[min(90vh,720px)] w-[min(960px,96vw)] grid-rows-[auto_1fr_auto] gap-3 overflow-hidden p-4">
       <DialogHeader>
         <DialogTitle>RaceLink Presets</DialogTitle>
         <DialogDescription>
@@ -67,25 +72,24 @@ function onNew() {
         </DialogDescription>
       </DialogHeader>
 
-      <div class="grid gap-4 sm:grid-cols-[minmax(180px,240px)_1fr]">
-        <!-- Sidebar: preset list + new button -->
-        <aside class="flex flex-col gap-2 rounded-md border border-border bg-card/40 p-2">
-          <div class="flex items-center justify-between gap-2">
-            <span class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Presets
-            </span>
+      <div class="grid min-h-0 gap-3 sm:grid-cols-[260px_1fr]">
+        <!-- Sidebar: preset list + new button. Same shell + scroll
+             pattern as DevicesSidebar / ScenesSidebar. -->
+        <aside class="flex h-full min-h-0 flex-col rounded-[10px] border border-border bg-card p-2.5">
+          <div class="mb-1.5 flex shrink-0 items-center justify-between gap-2">
+            <span>Presets</span>
             <Button type="button" size="sm" variant="secondary" @click="onNew">+ New</Button>
           </div>
-          <ul v-if="items.length > 0" class="flex max-h-[55vh] flex-col gap-0.5 overflow-y-auto">
+          <ul v-if="items.length > 0" class="m-0 min-h-0 flex-1 list-none overflow-auto p-0">
             <li
               v-for="p in items"
               :key="p.key"
               :class="
                 cn(
-                  'cursor-pointer truncate rounded-md px-2.5 py-1.5 text-sm transition-colors',
+                  'cursor-pointer truncate rounded-lg px-2.5 py-2 text-[13px] transition-colors hover:bg-[#1f1f28]',
                   p.key === selectedKey
-                    ? 'bg-primary/15 text-foreground shadow-[inset_2px_0_0_var(--color-primary)]'
-                    : 'hover:bg-secondary/60',
+                    ? 'bg-[#2a2d40] text-[#cfe0ff] shadow-[inset_2px_0_0_var(--color-accent)]'
+                    : '',
                 )
               "
               :title="p.label"
@@ -94,13 +98,13 @@ function onNew() {
               {{ p.label || p.key }}
             </li>
           </ul>
-          <p v-else class="px-2 py-3 text-center text-xs text-muted-foreground">
+          <p v-else class="shrink-0 px-1 py-3 text-center text-xs text-muted-foreground">
             No presets yet.
           </p>
         </aside>
 
         <!-- Editor body -->
-        <section class="rounded-md border border-border bg-card/40 p-3">
+        <section class="min-h-0 overflow-auto rounded-[10px] border border-border bg-card p-2.5">
           <RlPresetEditor />
         </section>
       </div>
