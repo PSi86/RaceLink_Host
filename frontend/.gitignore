@@ -1,0 +1,27 @@
+# npm install output — reproducible from package-lock.json on every
+# clone. The 4800+ files inside would otherwise dwarf the actual
+# source in `git status` and make every commit list unreviewable.
+node_modules/
+
+# Vite build artefacts. The production bundle DOES ship to git, but
+# at ../racelink/static/dist/ — handled at the repo-root .gitignore.
+# Inside frontend/ there's no local dist; ignore it defensively in
+# case Vite's outDir config ever shifts.
+dist/
+
+# Vite's persistent dev-server cache (deps pre-bundle). Always local.
+.vite/
+.vite-cache/
+
+# npm / yarn / pnpm runtime logs.
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Vitest coverage output (when --coverage is enabled).
+coverage/
+
+# Local env overrides.
+*.local
+.env.local

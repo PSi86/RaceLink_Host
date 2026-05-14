@@ -37,12 +37,21 @@ FLAG_BITS: dict[str, int] = {
 # The four user-intent flags that are persisted on an RL preset and
 # surfaced in the editor UI. POWER_ON and HAS_BRI are derived host-side
 # from the brightness value and never stored.
-USER_FLAG_KEYS: tuple[str, ...] = (
-    "arm_on_sync",
-    "force_tt0",
-    "force_reapply",
-    "offset_mode",
+#
+# ``USER_FLAG_DEFS`` carries the display label alongside each key so
+# both schema endpoints (``/api/rl-presets/schema`` for the preset
+# editor, ``/api/scenes/editor-schema`` for the per-action override
+# block) serve the same ``[{key, label}]`` shape from a single source
+# — see frontend/POST_MIGRATION_CLEANUP.md §13 for the prior split.
+USER_FLAG_DEFS: tuple[dict[str, str], ...] = (
+    {"key": "arm_on_sync",   "label": "Arm on SYNC"},
+    {"key": "force_tt0",     "label": "Force TT=0"},
+    {"key": "force_reapply", "label": "Force reapply"},
+    {"key": "offset_mode",   "label": "Offset mode"},
 )
+
+# Derived from USER_FLAG_DEFS so the two stay in lockstep automatically.
+USER_FLAG_KEYS: tuple[str, ...] = tuple(d["key"] for d in USER_FLAG_DEFS)
 
 
 def build_flags_byte(
@@ -90,6 +99,7 @@ __all__ = [
     "RL_FLAG_FORCE_REAPPLY",
     "RL_FLAG_OFFSET_MODE",
     "FLAG_BITS",
+    "USER_FLAG_DEFS",
     "USER_FLAG_KEYS",
     "build_flags_byte",
     "flags_from_mapping",

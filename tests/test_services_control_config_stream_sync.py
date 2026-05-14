@@ -179,12 +179,12 @@ class ActiveSendServiceTests(unittest.TestCase):
         # brightness=0 -> no POWER_ON. HAS_BRI always set. OFFSET_MODE bit 5.
         self.assertEqual(call["flags"], 0x04 | 0x20)
 
-    def test_send_wled_control_unifies_flag_emission(self):
+    def test_send_control_unifies_flag_emission(self):
         controller = FakeController()
         gateway = FakeGateway()
         service = ControlService(controller, gateway)
 
-        service.send_wled_control(
+        service.send_control(
             targetDevice=controller.devices[0],
             params={
                 "brightness": 200, "mode": 12,
@@ -213,7 +213,7 @@ class ActiveSendServiceTests(unittest.TestCase):
             targetDevice=controller.devices[0],
             params={**common, "presetId": 5},
         )
-        service.send_wled_control(
+        service.send_control(
             targetDevice=controller.devices[1],
             params={**common, "mode": 9},
         )

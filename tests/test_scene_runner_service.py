@@ -12,7 +12,7 @@ from racelink.services.scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
     SceneService,
 )
@@ -65,13 +65,13 @@ class _RecordingControlService:
         })
         return "wled_preset" not in self._fail_kinds
 
-    def send_wled_control(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
         self.control_calls.append({
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
         })
-        return "wled_control" not in self._fail_kinds
+        return "rl_effect" not in self._fail_kinds
 
     def send_offset(self, *, targetDevice=None, targetGroup=None, mode="none", **mode_params):
         self.offset_calls.append({
@@ -139,7 +139,7 @@ class SceneRunnerDispatchTests(_SceneFixture):
         self.assertEqual(result.error, "scene_not_found")
         self.assertEqual(result.actions, [])
 
-    def test_rl_preset_dispatches_via_send_wled_control(self):
+    def test_rl_preset_dispatches_via_send_control(self):
         rl = _StubRlPresets([{
             "id": 7,
             "key": "start_red",
@@ -277,9 +277,9 @@ class SceneRunnerDispatchTests(_SceneFixture):
         self.assertEqual(call["params"]["presetId"], 5)
         self.assertTrue(call["params"]["force_reapply"])
 
-    def test_wled_control_dispatches_via_send_wled_control(self):
+    def test_rl_effect_dispatches_via_send_control(self):
         self.scenes.create(label="C", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "group", "value": 4},
             "params": {"mode": 9, "brightness": 200},
             "flags_override": {},
@@ -364,15 +364,15 @@ class SceneRunnerDispatchTests(_SceneFixture):
         ``stop_on_error=False`` per scene (Batch A, 2026-04-28). With
         the new default ``True``, this scene would abort at action #2;
         the test pins the opt-out path."""
-        # Make wled_control fail; preceding wled_preset and following sync still run.
+        # Make rl_effect fail; preceding wled_preset and following sync still run.
         self.scenes.create(label="X", actions=[
             {"kind": KIND_WLED_PRESET, "target": {"kind": "group", "value": 1},
              "params": {"presetId": 1, "brightness": 50}},
-            {"kind": KIND_WLED_CONTROL, "target": {"kind": "group", "value": 2},
+            {"kind": KIND_RL_EFFECT, "target": {"kind": "group", "value": 2},
              "params": {"mode": 5}},
             {"kind": KIND_SYNC},
         ], stop_on_error=False)
-        ctrl = _RecordingControlService(fail_kinds={"wled_control"})
+        ctrl = _RecordingControlService(fail_kinds={"rl_effect"})
         sync = _RecordingSyncService()
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl, sync_service=sync)
         result = runner.run("x")
@@ -514,12 +514,12 @@ class SceneRunnerProgressCallbackTests(_SceneFixture):
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl)
         runner.run("p", progress_cb=events.append)
 
-        # Two events per action (running + terminal) in strict order.
-        statuses = [(e["index"], e["status"]) for e in events]
+        # Two events per action (started + terminal) in strict order.
+        statuses = [(e["index"], e["state"]) for e in events]
         self.assertEqual(statuses, [
-            (0, "running"), (0, "ok"),
-            (1, "running"), (1, "ok"),
-            (2, "running"), (2, "ok"),
+            (0, "started"), (0, "ok"),
+            (1, "started"), (1, "ok"),
+            (2, "started"), (2, "ok"),
         ])
         # scene_key + kind round-trip.
         self.assertTrue(all(e["scene_key"] == "p" for e in events))
@@ -545,17 +545,17 @@ class SceneRunnerProgressCallbackTests(_SceneFixture):
         self.scenes.create(label="MixErr", actions=[
             {"kind": KIND_WLED_PRESET, "target": {"kind": "group", "value": 1},
              "params": {"presetId": 1, "brightness": 50}},
-            {"kind": KIND_WLED_CONTROL, "target": {"kind": "group", "value": 2},
+            {"kind": KIND_RL_EFFECT, "target": {"kind": "group", "value": 2},
              "params": {"mode": 5}},
             {"kind": KIND_RL_PRESET, "target": {"kind": "device", "value": "AABBCCDDEEFF"},
              "params": {"presetId": "p"}},
         ], stop_on_error=False)
-        ctrl = _RecordingControlService(fail_kinds={"wled_control"})
+        ctrl = _RecordingControlService(fail_kinds={"rl_effect"})
         events = []
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl, rl_presets=rl, devices=[])
         runner.run("mixerr", progress_cb=events.append)
-        terminals = [e for e in events if e["status"] != "running"]
-        self.assertEqual([t["status"] for t in terminals], ["ok", "error", "degraded"])
+        terminals = [e for e in events if e["state"] != "started"]
+        self.assertEqual([t["state"] for t in terminals], ["ok", "error", "degraded"])
 
     def test_progress_cb_exception_does_not_break_run(self):
         self.scenes.create(label="X", actions=[
@@ -566,7 +566,7 @@ class SceneRunnerProgressCallbackTests(_SceneFixture):
 
         def boom(payload):
             calls.append(payload["index"])
-            if payload["status"] == "running" and payload["index"] == 1:
+            if payload["state"] == "started" and payload["index"] == 1:
                 raise RuntimeError("listener crash")
 
         runner, _ = _make_runner(scenes=self.scenes, sync_service=sync)
@@ -614,9 +614,9 @@ class OffsetGroupContainerTests(_SceneFixture):
             "actions": children,
         }
 
-    def _wled_control_child(self, target=None, params=None):
+    def _rl_effect_child(self, target=None, params=None):
         return {
-            "kind": "wled_control",
+            "kind": "rl_effect",
             "target": target or {"kind": "scope"},
             "params": params or {"mode": 5, "brightness": 200},
         }
@@ -628,7 +628,7 @@ class OffsetGroupContainerTests(_SceneFixture):
             self._container(
                 groups="all",
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         ctrl = _RecordingControlService()
@@ -666,7 +666,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                         {"id": 5, "offset_ms": 250},
                     ],
                 },
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         ctrl = _RecordingControlService()
@@ -690,7 +690,7 @@ class OffsetGroupContainerTests(_SceneFixture):
             self._container(
                 groups="all",
                 offset={"mode": "vshape", "base_ms": 0, "step_ms": 50, "center": 8},
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         ctrl = _RecordingControlService()
@@ -709,7 +709,7 @@ class OffsetGroupContainerTests(_SceneFixture):
             self._container(
                 groups=[1, 5],
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         ctrl = _RecordingControlService()
@@ -728,7 +728,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups="all",
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
                 children=[{
-                    "kind": "wled_control",
+                    "kind": "rl_effect",
                     "target": {"kind": "scope"},
                     "params": {"mode": 5},
                     "flags_override": {"offset_mode": False, "arm_on_sync": True},
@@ -752,7 +752,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups=[1, 3],
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
                 children=[{
-                    "kind": "wled_control",
+                    "kind": "rl_effect",
                     "target": {"kind": "group", "value": 3},
                     "params": {"mode": 5},
                 }],
@@ -799,7 +799,7 @@ class OffsetGroupContainerTests(_SceneFixture):
         ctrl = _RecordingControlService()
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl, rl_presets=rl)
         runner.run("x")
-        # rl_preset goes through send_wled_control with the resolved preset's params.
+        # rl_preset goes through send_control with the resolved preset's params.
         self.assertEqual(len(ctrl.control_calls), 1)
         call = ctrl.control_calls[0]
         self.assertEqual(call["params"]["mode"], 1)            # from preset
@@ -814,13 +814,13 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups="all",
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
                 children=[
-                    {"kind": "wled_control",
+                    {"kind": "rl_effect",
                      "target": {"kind": "scope"},
                      "params": {"mode": 1}},
                     {"kind": "wled_preset",
                      "target": {"kind": "scope"},
                      "params": {"presetId": 7, "brightness": 128}},
-                    {"kind": "wled_control",
+                    {"kind": "rl_effect",
                      "target": {"kind": "scope"},
                      "params": {"mode": 9}},
                 ],
@@ -850,7 +850,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                         {"id": 2, "offset_ms": 100},
                     ],
                 },
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         ctrl = _RecordingControlService(fail_offsets_for=[2])
@@ -870,7 +870,7 @@ class OffsetGroupContainerTests(_SceneFixture):
             self._container(
                 groups="all",
                 offset={"mode": "linear", "base_ms": 500, "step_ms": 200},
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         reloaded = SceneService(storage_path=self.scenes.path)
@@ -895,7 +895,7 @@ class OffsetGroupContainerTests(_SceneFixture):
             self._container(
                 groups="all",
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 100},
-                children=[self._wled_control_child()],
+                children=[self._rl_effect_child()],
             ),
         ])
         sync = _RecordingSyncService()
@@ -916,7 +916,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups="all",
                 offset={"mode": "none"},
                 children=[{
-                    "kind": "wled_control",
+                    "kind": "rl_effect",
                     "target": {"kind": "scope"},
                     "params": {"mode": 0, "brightness": 100},
                 }],
@@ -951,7 +951,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups="all",
                 offset={"mode": "none"},
                 children=[{
-                    "kind": "wled_control",
+                    "kind": "rl_effect",
                     "target": {"kind": "scope"},
                     "params": {"mode": 0},
                     "flags_override": {"offset_mode": True, "arm_on_sync": True},
@@ -976,7 +976,7 @@ class OffsetGroupContainerTests(_SceneFixture):
                 groups="all",
                 offset={"mode": "linear", "base_ms": 0, "step_ms": 50},
                 children=[{
-                    "kind": "wled_control",
+                    "kind": "rl_effect",
                     "target": {"kind": "scope"},
                     "params": {"mode": 5},
                     "flags_override": {"offset_mode": False},
@@ -1011,7 +1011,7 @@ class OffsetGroupContainerTests(_SceneFixture):
         result = runner.run("l")
         self.assertTrue(result.ok)
         # Migrated to offset_group container with one rl_preset child →
-        # one broadcast OPC_OFFSET + one OPC_CONTROL via send_wled_control.
+        # one broadcast OPC_OFFSET + one OPC_CONTROL via send_control.
         self.assertEqual(len(ctrl.offset_calls), 1)
         self.assertEqual(ctrl.offset_calls[0]["mode"], "linear")
         self.assertEqual(len(ctrl.control_calls), 1)
@@ -1046,7 +1046,7 @@ class StopOnErrorTests(_SceneFixture):
             ],
             stop_on_error=stop_on_error,
         )
-        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        ctrl = _RecordingControlService(fail_kinds=("rl_effect",))
         runner, _ = _make_runner(
             scenes=self.scenes, control_service=ctrl, rl_presets=rl,
         )
@@ -1098,7 +1098,7 @@ class StopOnErrorTests(_SceneFixture):
                 {"kind": KIND_SYNC},
             ],
         )
-        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        ctrl = _RecordingControlService(fail_kinds=("rl_effect",))
         runner, _ = _make_runner(
             scenes=self.scenes, control_service=ctrl, rl_presets=rl,
         )
@@ -1141,7 +1141,7 @@ class StopOnErrorTests(_SceneFixture):
         self.assertTrue(result.actions[1].ok)
 
     def test_aborted_run_emits_skipped_progress_events(self):
-        """The progress_cb receives ``status='skipped'`` for actions
+        """The progress_cb receives ``state='skipped'`` for actions
         that were aborted — used by the SSE bridge to colour rows."""
         rl = _StubRlPresets([{
             "id": 1, "key": "p", "label": "P",
@@ -1160,18 +1160,18 @@ class StopOnErrorTests(_SceneFixture):
             ],
             stop_on_error=True,
         )
-        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        ctrl = _RecordingControlService(fail_kinds=("rl_effect",))
         runner, _ = _make_runner(
             scenes=self.scenes, control_service=ctrl, rl_presets=rl,
         )
         events = []
         runner.run("prog", progress_cb=events.append)
-        statuses = [(e["index"], e["status"]) for e in events]
-        # First action: running → error.
-        self.assertIn((0, "running"), statuses)
+        statuses = [(e["index"], e["state"]) for e in events]
+        # First action: started → error.
+        self.assertIn((0, "started"), statuses)
         self.assertIn((0, "error"), statuses)
         # Subsequent actions: emit a single 'skipped' event (no
-        # 'running' because they never started).
+        # 'started' because they never ran).
         skipped = [s for s in statuses if s[1] == "skipped"]
         self.assertEqual({s[0] for s in skipped}, {1, 2})
 
@@ -1187,7 +1187,7 @@ class TopLevelTargetArmsTests(_SceneFixture):
         # ``target.kind == "broadcast"`` → one packet with
         # targetGroup=255 (recv3=FFFFFF + groupId=255 — every device acts).
         self.scenes.create(label="B", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "broadcast"},
             "params": {"presetId": 7, "brightness": 200},
         }])
@@ -1203,7 +1203,7 @@ class TopLevelTargetArmsTests(_SceneFixture):
         # ``target.kind == "groups", value: [N]`` → one packet with
         # targetGroup=N (group-scoped broadcast at the wire).
         self.scenes.create(label="G", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [3]},
             "params": {"presetId": 7},
         }])
@@ -1219,7 +1219,7 @@ class TopLevelTargetArmsTests(_SceneFixture):
         # for an explicit subset). The runner fans out — N kwargs from
         # ``_resolve_target`` → N send_X calls.
         self.scenes.create(label="GN", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 3, 5]},
             "params": {"presetId": 7},
         }])
@@ -1236,11 +1236,11 @@ class TopLevelTargetArmsTests(_SceneFixture):
         # (but the remaining packets still emit — this matches the
         # transport's "fire and forget" semantics for non-ACK kinds).
         self.scenes.create(label="GN", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 3]},
             "params": {"presetId": 7},
         }])
-        ctrl = _RecordingControlService(fail_kinds=("wled_control",))
+        ctrl = _RecordingControlService(fail_kinds=("rl_effect",))
         runner, _ = _make_runner(scenes=self.scenes, control_service=ctrl)
         result = runner.run("gn")
         self.assertFalse(result.ok)
@@ -1255,7 +1255,7 @@ class TopLevelTargetArmsTests(_SceneFixture):
         and device state instead of masking it."""
         device = _FakeDevice("AABBCCDDEEFF", group_id=4)
         self.scenes.create(label="D", actions=[{
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "device", "value": "AABBCCDDEEFF"},
             "params": {"presetId": 7},
         }])
@@ -1289,7 +1289,7 @@ class OffsetGroupChildTargetArmsTests(_SceneFixture):
     def test_child_broadcast_target_emits_targetgroup_255(self):
         self.scenes.create(label="C", actions=[self._container(
             children=[{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "broadcast"},
                 "params": {"presetId": 7},
             }],
@@ -1306,7 +1306,7 @@ class OffsetGroupChildTargetArmsTests(_SceneFixture):
         self.scenes.create(label="C", actions=[self._container(
             target={"kind": "groups", "value": [1, 3]},
             children=[{
-                "kind": KIND_WLED_CONTROL,
+                "kind": KIND_RL_EFFECT,
                 "target": {"kind": "groups", "value": [3]},
                 "params": {"presetId": 7},
             }],
@@ -1317,6 +1317,63 @@ class OffsetGroupChildTargetArmsTests(_SceneFixture):
         # The child's group-3 packet is what we're asserting on; the
         # parent's OPC_OFFSET sequence is irrelevant to this case.
         self.assertEqual(ctrl.control_calls[-1]["targetGroup"], 3)
+
+
+class SceneRunnerTotalDurationTests(_SceneFixture):
+    """Verifies SceneRunResult.total_duration_ms is tracked from run-entry
+    to result-construction and surfaced via to_dict() so the editor's
+    SceneCostBadge can show "actual: NNNms"."""
+
+    def _stepping_clock(self, step_ms: int = 5):
+        ticks = [0]
+        def _now():
+            v = ticks[0]
+            ticks[0] += step_ms
+            return v
+        return _now
+
+    def test_total_duration_ms_present_and_emitted_in_to_dict(self):
+        rl = _StubRlPresets([{
+            "id": 1, "key": "p", "label": "x",
+            "params": {"mode": 1},
+            "flags": {"arm_on_sync": False, "force_tt0": False,
+                      "force_reapply": False, "offset_mode": False},
+        }])
+        self.scenes.create(label="T", actions=[{
+            "kind": KIND_RL_PRESET,
+            "target": {"kind": "group", "value": 1},
+            "params": {"presetId": "p"},
+        }])
+        runner, _ = _make_runner(
+            scenes=self.scenes, rl_presets=rl,
+            fake_clock=self._stepping_clock(step_ms=5),
+        )
+        result = runner.run("t")
+        self.assertTrue(result.ok)
+        # Outer span must include every per-action duration_ms (and any
+        # inter-action bookkeeping ticks).
+        self.assertGreaterEqual(
+            result.total_duration_ms,
+            sum(a.duration_ms for a in result.actions),
+        )
+        self.assertGreater(result.total_duration_ms, 0)
+        emitted = result.to_dict()
+        self.assertIn("total_duration_ms", emitted)
+        self.assertEqual(emitted["total_duration_ms"], result.total_duration_ms)
+
+    def test_total_duration_ms_reported_on_scene_not_found(self):
+        # Even the early-return error path carries the (small) elapsed
+        # time so the frontend doesn't have to special-case missing
+        # values.
+        runner, _ = _make_runner(
+            scenes=self.scenes,
+            fake_clock=self._stepping_clock(step_ms=3),
+        )
+        result = runner.run("nope")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "scene_not_found")
+        self.assertGreaterEqual(result.total_duration_ms, 0)
+        self.assertIn("total_duration_ms", result.to_dict())
 
 
 if __name__ == "__main__":

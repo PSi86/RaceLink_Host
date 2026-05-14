@@ -38,12 +38,28 @@ RESP_SPECIFIC = 2
 
 @dataclass
 class PendingRequest:
-    """State for a single outstanding unicast request."""
+    """State for a single outstanding unicast request.
+
+    ``expected_key2`` is an optional secondary discriminator on the
+    parsed reply event. When set, ``matches()`` also requires
+    ``ev.get(<discriminator_field>) == expected_key2``. The discriminator
+    field is selected by the policy:
+
+    * ``RESP_SPECIFIC`` — discriminator field is ``ev["option"]`` (the
+      payload byte that GET_CONFIG_REPLY echoes back). This is the
+      case the discriminator was added for: two GET_CONFIG requests
+      for different options would otherwise wake on FIFO order without
+      regard to which option's reply actually arrived.
+
+    Existing callers that pass ``expected_key2=None`` (the default)
+    behave exactly as before — no per-candidate filter applied.
+    """
 
     sender_last3: bytes
     expected_key: int  # opcode7 for RESP_ACK (matched against ack_of) or response_opcode for RESP_SPECIFIC
     policy: int
     timeout_s: float
+    expected_key2: Optional[int] = None
     done: threading.Event = field(default_factory=threading.Event)
     reply: Optional[dict] = None
     registered_ts: float = field(default_factory=time.monotonic)
@@ -57,13 +73,26 @@ class PendingRequest:
                 return False
             opc = int(ev.get("opc", -1)) & 0x7F
             if self.policy == RESP_ACK:
-                return opc == int(LP.OPC_ACK) and int(ev.get("ack_of", -1)) == self.expected_key
-            if self.policy == RESP_SPECIFIC:
-                return opc == self.expected_key
+                if opc != int(LP.OPC_ACK) or int(ev.get("ack_of", -1)) != self.expected_key:
+                    return False
+            elif self.policy == RESP_SPECIFIC:
+                if opc != self.expected_key:
+                    return False
+            else:
+                return False
+            if self.expected_key2 is not None:
+                # Currently only RESP_SPECIFIC uses a discriminator
+                # (the OPC_GET_CONFIG ``option`` byte). Generalises
+                # cleanly if other reply types ever carry a sub-key.
+                ev_key2 = ev.get("option")
+                if ev_key2 is None:
+                    return False
+                if int(ev_key2) != int(self.expected_key2):
+                    return False
+            return True
         except Exception:
             # swallow-ok: malformed event dispatched to us -> "not a match"
             return False
-        return False
 
 
 class PendingRequestRegistry:
@@ -88,22 +117,25 @@ class PendingRequestRegistry:
         expected_key: int,
         policy: int,
         timeout_s: float,
+        expected_key2: Optional[int] = None,
     ) -> PendingRequest:
         req = PendingRequest(
             sender_last3=bytes(sender_last3),
             expected_key=int(expected_key),
             policy=int(policy),
             timeout_s=float(timeout_s),
+            expected_key2=None if expected_key2 is None else int(expected_key2),
         )
         key = (req.sender_last3, req.policy, req.expected_key)
         with self._lock:
             self._by_key.setdefault(key, []).append(req)
             pending_total = sum(len(b) for b in self._by_key.values())
         logger.debug(
-            "registry.register sender=%s policy=%d expected_key=0x%02X timeout=%.3fs pending_total=%d",
+            "registry.register sender=%s policy=%d expected_key=0x%02X%s timeout=%.3fs pending_total=%d",
             req.sender_last3.hex().upper(),
             req.policy,
             req.expected_key,
+            "" if req.expected_key2 is None else f" expected_key2=0x{req.expected_key2:02X}",
             req.timeout_s,
             pending_total,
         )

@@ -1,39 +1,19 @@
 import contextlib
 import importlib
 import sys
-import types
 import unittest
 from pathlib import Path
 
+from tests._flask_stub import install_flask
 from racelink.domain import RL_DeviceGroup
 
 
 def _ensure_flask_stub():
-    flask = sys.modules.get("flask")
-    if flask is None:
-        flask = types.ModuleType("flask")
-        sys.modules["flask"] = flask
-
-    class Blueprint:
-        def __init__(self, name, import_name, **kwargs):
-            self.name = name
-            self.import_name = import_name
-            self.kwargs = kwargs
-            self.routes = {}
-
-        def route(self, rule, methods=None):
-            def _decorator(fn):
-                self.routes[(rule, tuple(methods or ("GET",)))] = fn
-                return fn
-
-            return _decorator
-
-    flask.Blueprint = Blueprint
-    flask.request = types.SimpleNamespace(get_json=lambda silent=True: {}, files={}, form={})
+    flask = install_flask()
+    # ``test_web_registration`` reads payloads as raw dicts (its
+    # ``jsonify`` stub is the identity function); the shared default
+    # wraps args+kwargs which would break the assertions below.
     flask.jsonify = lambda payload: payload
-    flask.Response = type("Response", (), {})
-    flask.stream_with_context = lambda fn: fn
-    flask.templating = types.SimpleNamespace(render_template=lambda *args, **kwargs: {"args": args, "kwargs": kwargs})
 
 
 class _FakeApp:
@@ -99,17 +79,24 @@ class WebRegistrationTests(unittest.TestCase):
         self.assertIn(("/api/events", ("GET",)), bp.routes)
 
     def test_asset_dirs_resolve_to_existing_paths(self):
+        # The SPA shell is rendered via render_template_string, so no
+        # Jinja templates remain — ``_resolve_asset_dirs`` returns only
+        # ``static_dir`` (resolves to ``racelink/static``) for the
+        # blueprint's ``static_folder`` hand-off.
         blueprint = importlib.import_module("racelink.web.blueprint")
-        template_dir, static_dir = blueprint._resolve_asset_dirs()
+        static_dir = blueprint._resolve_asset_dirs()
 
-        self.assertTrue(Path(template_dir).is_dir())
         self.assertTrue(Path(static_dir).is_dir())
-        self.assertEqual(Path(template_dir).name, "pages")
         self.assertEqual(Path(static_dir).name, "static")
-        self.assertEqual(Path(template_dir).parent.name, "racelink")
         self.assertEqual(Path(static_dir).parent.name, "racelink")
+        # Sanity: the SPA shell shipped by Vite must be present.
+        self.assertTrue((Path(static_dir) / "dist" / "index.html").is_file())
 
     def test_root_render_injects_base_and_static_paths(self):
+        # Phase 1 PoC: the route now invokes render_template_string with
+        # the SPA shell's HTML source. The stub captures kwargs verbatim
+        # so we can still assert that ``rl_base_path`` and
+        # ``rl_static_path`` are injected with the expected url_prefix.
         app = _FakeApp()
         runtime = _FakeRuntime()
         bp = self.web.register_racelink_web(app, runtime, url_prefix="/shared-ui")
@@ -119,6 +106,10 @@ class WebRegistrationTests(unittest.TestCase):
 
         self.assertEqual(kwargs["rl_base_path"], "/shared-ui")
         self.assertEqual(kwargs["rl_static_path"], "/shared-ui/static")
+        # The source is the literal SPA shell read from disk; sanity
+        # check that the Jinja placeholders survive into the template
+        # source (Flask's render path substitutes them server-side).
+        self.assertIn("{{ rl_base_path }}", rendered["source"])
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ from racelink.services.scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
 )
 
@@ -199,14 +199,14 @@ class ActionCostTests(unittest.TestCase):
         # P_Preset body is 4 B (groupId, flags, presetId, brightness).
         self.assertEqual(cost.bytes, 4 + RADIO_HEADER_BYTES + USB_FRAMING_BYTES)
 
-    def test_wled_control_packet_size_grows_with_params(self):
+    def test_rl_effect_packet_size_grows_with_params(self):
         no_params = estimate_action({
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1]},
             "params": {},
         })
         with_params = estimate_action({
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1]},
             "params": {"mode": 5, "brightness": 200, "color1": [255, 0, 0]},
         })
@@ -284,7 +284,7 @@ class OffsetGroupCostTests(unittest.TestCase):
             "target": {"kind": "broadcast"},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [
-                {"kind": KIND_WLED_CONTROL, "target": {"kind": "broadcast"},
+                {"kind": KIND_RL_EFFECT, "target": {"kind": "broadcast"},
                  "params": {"mode": 5}},
                 {"kind": KIND_WLED_PRESET, "target": {"kind": "broadcast"},
                  "params": {"presetId": 7, "brightness": 128}},
@@ -310,7 +310,7 @@ class OffsetGroupCostTests(unittest.TestCase):
                 ],
             },
             "actions": [
-                {"kind": KIND_WLED_CONTROL, "target": {"kind": "broadcast"},
+                {"kind": KIND_RL_EFFECT, "target": {"kind": "broadcast"},
                  "params": {"mode": 5}},
             ],
         }
@@ -343,7 +343,7 @@ class TopLevelGroupsFanoutCostTests(unittest.TestCase):
 
     def test_top_level_broadcast_is_one_packet(self):
         cost = estimate_action({
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "broadcast"},
             "params": {},
         })
@@ -351,7 +351,7 @@ class TopLevelGroupsFanoutCostTests(unittest.TestCase):
 
     def test_top_level_groups_len1_is_one_packet(self):
         cost = estimate_action({
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [3]},
             "params": {},
         })
@@ -364,7 +364,7 @@ class TopLevelGroupsFanoutCostTests(unittest.TestCase):
         # the save-time collapse + this fan-out together fix the
         # estimate to match the wire).
         cost = estimate_action({
-            "kind": KIND_WLED_CONTROL,
+            "kind": KIND_RL_EFFECT,
             "target": {"kind": "groups", "value": [1, 3, 5]},
             "params": {},
         })
@@ -394,7 +394,7 @@ class TopLevelGroupsFanoutCostTests(unittest.TestCase):
         self.assertEqual(cost.packets, 1)
 
     def test_top_level_groups_lenN_applies_to_every_per_group_kind(self):
-        for kind in (KIND_WLED_PRESET, KIND_WLED_CONTROL, KIND_RL_PRESET, KIND_STARTBLOCK):
+        for kind in (KIND_WLED_PRESET, KIND_RL_EFFECT, KIND_RL_PRESET, KIND_STARTBLOCK):
             with self.subTest(kind=kind):
                 cost = estimate_action({
                     "kind": kind,
@@ -422,7 +422,7 @@ class OffsetGroupSelectAllCollapseCostTests(unittest.TestCase):
             "target": {"kind": "broadcast"},
             "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
             "actions": [
-                {"kind": KIND_WLED_CONTROL,
+                {"kind": KIND_RL_EFFECT,
                  "target": {"kind": "broadcast"},
                  "params": {"mode": 5}},
             ],
@@ -476,7 +476,7 @@ class SceneCostTests(unittest.TestCase):
                  "target": {"kind": "broadcast"},
                  "offset": {"mode": "linear", "base_ms": 0, "step_ms": 100},
                  "actions": [
-                     {"kind": KIND_WLED_CONTROL,
+                     {"kind": KIND_RL_EFFECT,
                       "target": {"kind": "broadcast"},
                       "params": {"mode": 5}},
                  ]},

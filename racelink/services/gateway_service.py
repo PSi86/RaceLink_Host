@@ -133,6 +133,7 @@ class GatewayService:
         opcode7: int,
         send_fn,
         timeout_s: float = rf_timing.UNICAST_ATTEMPT_TIMEOUT_S,
+        discriminator: Optional[int] = None,
     ) -> tuple[list[dict], bool]:
         """Unicast request/response helper (plan Transport Redesign Phase B).
 
@@ -145,6 +146,12 @@ class GatewayService:
         Broadcast requests (``recv3 == FFFFFF``) do not register -- callers
         should use :meth:`send_and_collect` instead, which is the right
         primitive for "N unknown responders within a time window".
+
+        ``discriminator`` is an optional secondary match key forwarded to
+        :class:`PendingRequest.expected_key2`. For ``OPC_GET_CONFIG`` the
+        caller passes the option byte so two simultaneous reads on the
+        same device but for different options cannot wake each other's
+        waiter (iteration-3 fix).
         """
         if not self.transport:
             return [], False
@@ -212,6 +219,7 @@ class GatewayService:
             expected_key=expected_key,
             policy=registry_policy,
             timeout_s=timeout_s,
+            expected_key2=discriminator,
         )
         opcode_name = self.opcode_name(opcode7)
         t0 = time.monotonic()
@@ -1069,6 +1077,15 @@ class GatewayService:
                             ev.get("host_rssi"),
                             ev.get("host_snr"),
                         )
+            elif int(opc) == int(LP.OPC_GET_CONFIG) and ev.get("reply") == "GET_CONFIG_REPLY":
+                # Pending-registry match above already handed the parsed
+                # event to the waiting ``ConfigService.read_config``
+                # caller; no further state mutation here. The host
+                # deliberately does NOT auto-update ``dev.specials`` —
+                # the operator drives import via the dialog's
+                # divergence-resolution buttons (POST
+                # /api/specials/config/import).
+                pass
             elif int(opc) == int(LP.OPC_DEVICES) and ev.get("reply") == "IDENTIFY_REPLY":
                 mac6 = ev.get("mac6")
                 if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:

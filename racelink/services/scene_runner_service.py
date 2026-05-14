@@ -34,7 +34,7 @@ from .scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
 )
 
@@ -55,11 +55,29 @@ class ActionResult:
     duration_ms: int = 0
     detail: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def state(self) -> str:
+        """Terminal state used by SSE progress events and the editor's
+        per-action status border. The editor consumes a unified
+        ``state`` enum (``"started" | "ok" | "error" | "degraded" |
+        "skipped"``) for both live progress and the post-run snapshot —
+        this property derives the post-run value from ``ok``,
+        ``degraded``, and the ``"skipped: aborted"`` placeholder error.
+        """
+        if self.error == "skipped: aborted":
+            return "skipped"
+        if self.degraded:
+            return "degraded"
+        if self.ok:
+            return "ok"
+        return "error"
+
     def to_dict(self) -> Dict[str, Any]:
         out = {
             "index": self.index,
             "kind": self.kind,
             "ok": self.ok,
+            "state": self.state,
             "duration_ms": self.duration_ms,
         }
         if self.error is not None:
@@ -84,12 +102,19 @@ class SceneRunResult:
     # aborted"`` so the UI can show why they didn't run. ``None`` when
     # the run completed every action (whether ok or not).
     aborted_at_index: Optional[int] = None
+    # Wall-clock duration of the entire run (from ``run()`` entry to the
+    # construction of this result), in milliseconds. Always ≥ the sum
+    # of per-action ``duration_ms`` because it includes inter-action
+    # bookkeeping. Surfaced by the editor's SceneCostBadge as
+    # "actual: NNNms" alongside the projected airtime estimate.
+    total_duration_ms: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
             "scene_key": self.scene_key,
             "ok": self.ok,
             "actions": [a.to_dict() for a in self.actions],
+            "total_duration_ms": int(self.total_duration_ms),
         }
         if self.error is not None:
             out["error"] = self.error
@@ -144,8 +169,15 @@ class SceneRunnerService:
         """Run a scene and optionally emit per-action progress events.
 
         ``progress_cb`` (when supplied) is invoked twice per action:
-        - once with ``status="running"`` before the action dispatches, and
-        - once with ``status="ok" | "error" | "degraded"`` after it returns.
+        - once with ``state="started"`` before the action dispatches, and
+        - once with ``state="ok" | "error" | "degraded"`` after it returns.
+
+        The aborted-tail placeholders fire one event per skipped action
+        with ``state="skipped"`` (no preceding "started" because they
+        never ran). The unified ``state`` field name + enum mirrors the
+        ``SceneProgressEvent`` type contract on the frontend — same shape
+        whether the row's status arrives via SSE during the run or via
+        ``SceneRunResult.actions[].state`` after it finishes.
 
         Callback exceptions are swallowed so an SSE outage on the consumer
         side cannot abort the run. The synchronous ``SceneRunResult`` is
@@ -161,10 +193,16 @@ class SceneRunnerService:
         canonical form (validated via ``_canonical_actions``); the runner
         does not re-validate.
         """
+        run_started_ms = self._clock_ms()
         if scene is None:
             scene = self.scenes_service.get(scene_key)
             if scene is None:
-                return SceneRunResult(scene_key=scene_key, ok=False, error="scene_not_found")
+                return SceneRunResult(
+                    scene_key=scene_key,
+                    ok=False,
+                    error="scene_not_found",
+                    total_duration_ms=self._clock_ms() - run_started_ms,
+                )
 
         # Batch A (2026-04-28): per-scene stop-on-error gate. Default
         # True for both legacy scenes (loaded without the field) and
@@ -181,21 +219,15 @@ class SceneRunnerService:
                 "scene_key": scene_key,
                 "index": index,
                 "kind": action.get("kind"),
-                "status": "running",
+                "state": "started",
             })
             result = self._dispatch(index, action)
             results.append(result)
-            if result.degraded:
-                terminal = "degraded"
-            elif result.ok:
-                terminal = "ok"
-            else:
-                terminal = "error"
             self._emit_progress(progress_cb, {
                 "scene_key": scene_key,
                 "index": index,
                 "kind": result.kind,
-                "status": terminal,
+                "state": result.state,
                 "error": result.error,
                 "duration_ms": result.duration_ms,
             })
@@ -224,7 +256,7 @@ class SceneRunnerService:
                         "scene_key": scene_key,
                         "index": skipped_idx,
                         "kind": skipped_result.kind,
-                        "status": "skipped",
+                        "state": "skipped",
                         "error": skipped_result.error,
                         "duration_ms": 0,
                     })
@@ -238,6 +270,7 @@ class SceneRunnerService:
             ok=ok,
             actions=results,
             aborted_at_index=aborted_at_index,
+            total_duration_ms=self._clock_ms() - run_started_ms,
         )
 
     @staticmethod
@@ -260,8 +293,8 @@ class SceneRunnerService:
                 return self._run_rl_preset(index, action, started)
             if kind == KIND_WLED_PRESET:
                 return self._run_wled_preset(index, action, started)
-            if kind == KIND_WLED_CONTROL:
-                return self._run_wled_control(index, action, started)
+            if kind == KIND_RL_EFFECT:
+                return self._run_rl_effect(index, action, started)
             if kind == KIND_STARTBLOCK:
                 return self._run_startblock(index, action, started)
             if kind == KIND_SYNC:
@@ -341,8 +374,8 @@ class SceneRunnerService:
             return bool(self.control_service.send_offset(
                 targetGroup=op.target_group, **payload,
             ))
-        if sender == "send_wled_control":
-            return bool(self.control_service.send_wled_control(**payload))
+        if sender == "send_control":
+            return bool(self.control_service.send_control(**payload))
         if sender == "send_wled_preset":
             return bool(self.control_service.send_wled_preset(**payload))
         if sender == "send_sync":
@@ -419,8 +452,8 @@ class SceneRunnerService:
     def _run_wled_preset(self, index: int, action: dict, started: int) -> ActionResult:
         return self._plan_and_execute(KIND_WLED_PRESET, index, action, started)
 
-    def _run_wled_control(self, index: int, action: dict, started: int) -> ActionResult:
-        return self._plan_and_execute(KIND_WLED_CONTROL, index, action, started)
+    def _run_rl_effect(self, index: int, action: dict, started: int) -> ActionResult:
+        return self._plan_and_execute(KIND_RL_EFFECT, index, action, started)
 
     def _run_offset_group(self, index: int, action: dict, started: int) -> ActionResult:
         """Dispatch an ``offset_group`` container action.

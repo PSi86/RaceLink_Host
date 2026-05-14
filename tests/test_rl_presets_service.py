@@ -19,7 +19,10 @@ class RLPresetsServiceTests(unittest.TestCase):
         self.assertEqual(self.svc.list(), [])
         self.assertFalse(os.path.exists(self.path))
 
-    def test_create_persists_with_canonical_params_and_flags(self):
+    def test_create_persists_canonical_params_and_strips_flags(self):
+        # Flags moved out of the preset editor (scene-action-only). Any
+        # ``flags`` argument to ``create()`` is a legacy no-op: the
+        # canonicaliser forces all four user-intent flags to False.
         preset = self.svc.create(
             label="Start Red",
             params={
@@ -33,33 +36,37 @@ class RLPresetsServiceTests(unittest.TestCase):
         self.assertEqual(preset["params"]["mode"], 1)
         self.assertEqual(preset["params"]["color1"], [255, 0, 0])
         self.assertTrue(preset["params"]["check1"])
-        # unspecified keys are filled with None
-        self.assertIsNone(preset["params"]["mode"] if preset["params"]["mode"] is None else None)
         self.assertIsNone(preset["params"]["custom2"])
-        self.assertTrue(preset["flags"]["arm_on_sync"])
-        self.assertFalse(preset["flags"]["force_tt0"])
-        # file written atomically
+        # Strip-on-save: even though arm_on_sync=True was passed in,
+        # the persisted preset has all-False flags.
+        for key in ("arm_on_sync", "force_tt0", "force_reapply", "offset_mode"):
+            self.assertFalse(preset["flags"][key])
         self.assertTrue(os.path.isfile(self.path))
         with open(self.path) as fh:
             data = json.load(fh)
         self.assertEqual(data["schema_version"], SCHEMA_VERSION)
         self.assertEqual(len(data["presets"]), 1)
+        # File-side: stored shape mirrors the all-False contract.
+        for key in ("arm_on_sync", "force_tt0", "force_reapply", "offset_mode"):
+            self.assertFalse(data["presets"][0]["flags"][key])
 
-    def test_create_persists_offset_mode_flag(self):
+    def test_offset_mode_flag_stripped_on_create(self):
         preset = self.svc.create(
             label="Staggered",
             params={"mode": 2, "brightness": 128},
             flags={"arm_on_sync": True, "offset_mode": True},
         )
-        self.assertTrue(preset["flags"]["arm_on_sync"])
-        self.assertTrue(preset["flags"]["offset_mode"])
-        self.assertFalse(preset["flags"]["force_tt0"])
-        self.assertFalse(preset["flags"]["force_reapply"])
+        for key in ("arm_on_sync", "force_tt0", "force_reapply", "offset_mode"):
+            self.assertFalse(preset["flags"][key])
         reloaded = self.svc.get(preset["key"])
-        self.assertTrue(reloaded["flags"]["offset_mode"])
+        for key in ("arm_on_sync", "force_tt0", "force_reapply", "offset_mode"):
+            self.assertFalse(reloaded["flags"][key])
 
-    def test_legacy_three_key_flags_read_missing_offset_as_false(self):
-        # Simulate a pre-unification preset file (v2 with 3-key flags only).
+    def test_legacy_persisted_flags_are_stripped_on_load(self):
+        # Pre-cleanup preset file with arm_on_sync=True saved on disk.
+        # After load, every user-intent flag must read as False — the
+        # source of truth for flags is now the per-action override in
+        # the Scene Editor.
         pre_file = {
             "schema_version": SCHEMA_VERSION,
             "next_id": 1,
@@ -72,9 +79,9 @@ class RLPresetsServiceTests(unittest.TestCase):
                 "params": {},
                 "flags": {
                     "arm_on_sync": True,
-                    "force_tt0": False,
+                    "force_tt0": True,
                     "force_reapply": False,
-                    # no offset_mode key
+                    "offset_mode": True,
                 },
             }],
         }
@@ -83,9 +90,9 @@ class RLPresetsServiceTests(unittest.TestCase):
         fresh = RLPresetsService(storage_path=self.path)
         got = fresh.get("old_preset")
         self.assertIsNotNone(got)
-        self.assertTrue(got["flags"]["arm_on_sync"])
-        self.assertIn("offset_mode", got["flags"])
-        self.assertFalse(got["flags"]["offset_mode"])
+        for key in ("arm_on_sync", "force_tt0", "force_reapply", "offset_mode"):
+            self.assertIn(key, got["flags"])
+            self.assertFalse(got["flags"][key])
 
     def test_slug_collision_appends_suffix(self):
         a = self.svc.create(label="Start Red")

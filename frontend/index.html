@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RaceLink</title>
+</head>
+<!-- ``data-rl-base-path`` is rewritten by Flask's Jinja render of this file at
+     request time. In dev, Vite serves it as a literal ``{{ rl_base_path }}``
+     placeholder; the dev fallback in ``src/api/client.ts`` recognises the
+     placeholder and substitutes ``/racelink``. -->
+<body data-rl-base-path="{{ rl_base_path }}" data-rl-static-path="{{ rl_static_path }}">
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

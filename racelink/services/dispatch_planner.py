@@ -71,7 +71,7 @@ from .scenes_service import (
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
     KIND_SYNC,
-    KIND_WLED_CONTROL,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
 )
 
@@ -163,7 +163,7 @@ def plan_action_dispatch(
             rl_preset_lookup=rl_preset_lookup,
             device_lookup=device_lookup,
         )
-    if kind in (KIND_RL_PRESET, KIND_WLED_PRESET, KIND_WLED_CONTROL,
+    if kind in (KIND_RL_PRESET, KIND_WLED_PRESET, KIND_RL_EFFECT,
                 KIND_STARTBLOCK):
         return _plan_effect(
             action,
@@ -299,7 +299,7 @@ def _plan_effect(
     force_offset_flag: Optional[bool],
 ) -> ActionDispatchPlan:
     """Top-level / offset_group-child plan for the four per-group
-    effect kinds (rl_preset / wled_preset / wled_control /
+    effect kinds (rl_preset / wled_preset / rl_effect /
     startblock). Each emits one WireOp per resolved target."""
     target = action.get("target") or {}
     target_kwargs_list = _resolve_target(target, device_lookup=device_lookup)
@@ -325,7 +325,7 @@ def _plan_effect(
                 error=f"preset_not_found: {preset_ref!r}",
             )
         base_params, persisted_flags, preset_detail = materialised
-    elif kind in (KIND_WLED_PRESET, KIND_WLED_CONTROL):
+    elif kind in (KIND_WLED_PRESET, KIND_RL_EFFECT):
         base_params = dict(action.get("params") or {})
         persisted_flags = {}
         preset_detail = {}
@@ -389,9 +389,9 @@ def _build_effect_op(
             sender="send_wled_preset",
             detail=dict(preset_detail),
         )
-    # rl_preset / wled_control / startblock → OPC_CONTROL-shaped
+    # rl_preset / rl_effect / startblock → OPC_CONTROL-shaped
     body_len = _control_body_len(merged_params)
-    sender = "send_startblock" if kind == KIND_STARTBLOCK else "send_wled_control"
+    sender = "send_startblock" if kind == KIND_STARTBLOCK else "send_control"
     op_detail = dict(preset_detail)
     if kind == KIND_STARTBLOCK:
         # Body sizing for startblock is approximate — we treat it
@@ -528,7 +528,7 @@ def _materialize_rl_preset(
 def _control_body_len(params: Mapping[str, Any]) -> int:
     """Approximate body length of an OPC_CONTROL with the given
     params dict — uses the canonical builder so the prediction
-    matches what ``ControlService.send_wled_control`` would emit.
+    matches what ``ControlService.send_control`` would emit.
     Single source of truth (today this lives in both the estimator
     and is mirrored by the runner via the actual builder); now
     here only.

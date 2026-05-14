@@ -113,7 +113,8 @@ class InstalledArtifactSmokeTests(unittest.TestCase):
                 flask.Flask = Flask
                 flask.Blueprint = Blueprint
                 flask.templating = types.SimpleNamespace(
-                    render_template=lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
+                    render_template=lambda *args, **kwargs: {"args": args, "kwargs": kwargs},
+                    render_template_string=lambda source, **kwargs: source,
                 )
                 flask.request = types.SimpleNamespace(args={}, json=None, form={}, files={}, get_json=lambda silent=True: {})
                 flask.jsonify = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
@@ -127,12 +128,17 @@ class InstalledArtifactSmokeTests(unittest.TestCase):
                 from racelink.web import register_rl_blueprint
                 from racelink.web.blueprint import _resolve_asset_dirs
 
-                template_dir, static_dir = _resolve_asset_dirs()
-                assert pathlib.Path(template_dir).is_dir(), template_dir
+                static_dir = _resolve_asset_dirs()
                 assert pathlib.Path(static_dir).is_dir(), static_dir
-                assert pathlib.Path(template_dir, "racelink.html").is_file()
-                assert pathlib.Path(static_dir, "racelink.css").is_file()
-                assert pathlib.Path(static_dir, "racelink.js").is_file()
+                # Phase 1 PoC: the WebUI is a Vite-built SPA. The shell
+                # lives at static/dist/index.html and the hashed JS/CSS
+                # bundles under static/dist/assets/.
+                shell = pathlib.Path(static_dir, "dist", "index.html")
+                assert shell.is_file(), shell
+                assets_dir = shell.parent / "assets"
+                assert assets_dir.is_dir(), assets_dir
+                assert any(assets_dir.glob("*.js")), "no JS bundle in dist/assets"
+                assert any(assets_dir.glob("*.css")), "no CSS bundle in dist/assets"
                 assert callable(create_runtime)
                 assert callable(build_standalone_runtime)
                 assert callable(create_standalone_app)

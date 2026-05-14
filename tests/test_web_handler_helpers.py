@@ -291,11 +291,12 @@ class ApplyDeviceMetaUpdatesTests(unittest.TestCase):
 
 
 class ResolveSpecialConfigRequestTests(unittest.TestCase):
-    def _specials_service(self, *, resolve=None, validate_raises=None):
+    def _specials_service(self, *, resolve=None, validate_raises=None, packed=(0, 0, 0, 0)):
         svc = MagicMock()
         svc.resolve_option.return_value = resolve
         if validate_raises:
             svc.validate_option_value.side_effect = validate_raises
+        svc.pack_option_value.return_value = packed
         return svc
 
     def test_rejects_missing_fields(self):
@@ -317,11 +318,21 @@ class ResolveSpecialConfigRequestTests(unittest.TestCase):
         self.assertIn("broadcast", payload["error"])
 
     def test_rejects_non_int_value(self):
-        ctx = _fake_ctx()
+        # The route now accepts both ints and ``{start, stop}`` pair
+        # dicts, so the per-shape validation lives in
+        # ``validate_option_value`` rather than upfront ``int()``. To
+        # exercise that path the request must reach a registered device
+        # whose option-info opts into a scalar shape.
+        dev = types.SimpleNamespace(addr="AABBCCDDEEFF")
+        ctx = _fake_ctx(devices={"AABBCCDDEEFF": dev})
+        svc = self._specials_service(
+            resolve={"option": 0x42, "bytes": 1, "min": 0, "max": 255},
+            validate_raises=ValueError("value must be an integer"),
+        )
         ok, payload, status = _resolve_special_config_request(
             ctx,
             {"mac": "AABBCCDDEEFF", "key": "x", "value": "not-an-int"},
-            self._specials_service(),
+            svc,
         )
         self.assertFalse(ok)
         self.assertEqual(status, 400)
@@ -329,7 +340,9 @@ class ResolveSpecialConfigRequestTests(unittest.TestCase):
     def test_happy_path(self):
         dev = types.SimpleNamespace(addr="AABBCCDDEEFF")
         ctx = _fake_ctx(devices={"AABBCCDDEEFF": dev})
-        svc = self._specials_service(resolve={"option": 0x42})
+        # Realistic option_info — ``pack_option_value`` reads ``bytes``
+        # to decide the data-byte layout.
+        svc = self._specials_service(resolve={"option": 0x42, "bytes": 1}, packed=(3, 0, 0, 0))
         ok, payload, status = _resolve_special_config_request(
             ctx,
             {"mac": "AABBCCDDEEFF", "key": "startblock_slots", "value": "3"},
@@ -338,7 +351,13 @@ class ResolveSpecialConfigRequestTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(status, 200)
         self.assertEqual(payload["option"], 0x42)
-        self.assertEqual(payload["value_int"], 3)
+        # Value is forwarded verbatim; the data bytes are pre-packed for
+        # the route handler so it can call sendConfig directly.
+        self.assertEqual(payload["value"], "3")
+        self.assertEqual(payload["data0"], 3)
+        self.assertEqual(payload["data1"], 0)
+        self.assertEqual(payload["data2"], 0)
+        self.assertEqual(payload["data3"], 0)
         self.assertEqual(payload["mac_str"], "AABBCCDDEEFF")
 
 

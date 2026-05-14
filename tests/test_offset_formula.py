@@ -9,7 +9,9 @@ clamping to [0, 65535], signed step, modulo cycle=0 → 1, etc.
 
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 
 from racelink.domain.offset_formula import (
     OFFSET_MS_MAX,
@@ -97,6 +99,53 @@ class EvaluateForGroupsTests(unittest.TestCase):
             {"id": 1, "offset_ms": 100},
             {"id": 5, "offset_ms": 500},
         ])
+
+
+class FixtureParityTests(unittest.TestCase):
+    """Pin the Python evaluator against the shared parity fixture.
+
+    The TS port reads the same file (see
+    ``frontend/src/stores/scenes.test.ts``); a divergence on either side
+    fails CI. When this test starts failing, either:
+
+    - The Python evaluator drifted: revert, or update the TS port and
+      regenerate the fixture in the same commit.
+    - The fixture is stale: regenerate via
+      ``python tests/gen_offset_parity_fixture.py`` and commit.
+
+    Tracker entry: ``frontend/POST_MIGRATION_CLEANUP.md`` §12.
+    """
+
+    FIXTURE_PATH = (
+        Path(__file__).parent / "fixtures" / "offset_formula_parity.json"
+    )
+
+    def test_fixture_matches_python_evaluator(self):
+        self.assertTrue(
+            self.FIXTURE_PATH.exists(),
+            f"missing parity fixture at {self.FIXTURE_PATH} — regenerate "
+            "via `python tests/gen_offset_parity_fixture.py`",
+        )
+        payload = json.loads(self.FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = payload["cases"]
+        # Guard against an accidentally-truncated fixture; the generator
+        # currently emits 1024 cases.
+        self.assertGreaterEqual(
+            len(cases), 1000, "fixture is suspiciously small"
+        )
+        for i, case in enumerate(cases):
+            spec = case["spec"]
+            gid = case["group_id"]
+            expected = case["expected"]
+            actual = evaluate_offset_ms(spec, gid)
+            self.assertEqual(
+                actual,
+                expected,
+                msg=(
+                    f"case[{i}] {spec} gid={gid}: python evaluator "
+                    f"returns {actual}, fixture expects {expected}"
+                ),
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

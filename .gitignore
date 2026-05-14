@@ -32,6 +32,10 @@ CLAUDE.local.md
 .env
 .venv/
 venv/
-build/
-dist/
+# Root-anchor the Python packaging dirs so they don't accidentally
+# match nested directories with the same name (notably the Vite
+# bundle output at ``racelink/static/dist/``, which is a tracked
+# build artefact that operators install without a Node toolchain).
+/build/
+/dist/
 *.egg-info/

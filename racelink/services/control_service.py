@@ -1,11 +1,17 @@
 """Control message service for active device/group operations.
 
-Post-Phase-D naming:
-- ``send_wled_preset`` sends a WLED preset id (OPC_PRESET, 4 B fixed).
-- ``send_wled_control`` sends a direct effect-parameter packet (OPC_CONTROL,
-  variable length). Pre-rename: ``send_wled_control_advanced``.
-- ``send_rl_preset_by_id`` resolves a stable RL-preset id and dispatches
-  through ``send_wled_control`` with the persisted parameter snapshot.
+Method naming mirrors the protocol opcodes:
+
+- ``send_wled_preset`` sends a WLED preset id (``OPC_PRESET``, 4 B fixed
+  body). The preset must already exist in the device's active
+  ``presets.json``.
+- ``send_control`` sends a direct effect-parameter packet (``OPC_CONTROL``,
+  variable-length body). The opcode and this method are protocol-level —
+  not WLED-specific — so future lighting backends can re-use the same
+  packet shape.
+- ``send_rl_preset_by_id`` resolves a stable RL-preset id to its
+  persisted 14-field parameter snapshot, then dispatches through
+  ``send_control``.
 """
 
 from __future__ import annotations
@@ -68,6 +74,65 @@ class ControlService:
                     exc_info=True,
                 )
                 continue
+
+    def _apply_control_locally(self, dev, *, flags: int, params: dict, brightness_val: int, brightness_present: bool) -> None:
+        """Mirror what we just told the device onto the local DTO so the
+        device-table renders the new state immediately.
+
+        Iteration 9: ``OPC_CONTROL`` is RESP_NONE on the wire (per
+        ``racelink_proto_auto.py::RULES``); per the operator's principle
+        — RESP_NONE control ops update local state immediately
+        (optimistic) — we mirror the just-sent fields here. The
+        symmetric eager-update for ``OPC_PRESET`` lives in
+        ``send_device_preset`` / ``_update_group_preset_cache``.
+
+        ``presetId`` is intentionally NOT touched — it's the host's
+        "last preset id I asked the device to apply" tracker. The
+        ``send_rl_preset_by_id`` path stamps it separately with the
+        applied RL-preset id; raw ``send_control`` callers (e.g. scene
+        ``rl_effect`` actions) shouldn't overwrite that.
+        """
+        try:
+            dev.flags = int(flags) & 0xFF
+            mode = params.get("mode")
+            if mode is not None:
+                dev.effectId = int(mode) & 0xFF
+            # Brightness only mirrors when the wire frame actually
+            # carried a brightness byte (HAS_BRI). Otherwise the prior
+            # device brightness stays — matches the "absent fields keep
+            # their previous value" semantic of OPC_CONTROL's fieldMask.
+            if brightness_present:
+                dev.brightness = int(brightness_val) & 0xFF
+        except Exception:
+            # swallow-ok: best-effort cache mirror — wire send already
+            # succeeded, this just keeps the UI in sync. A failure here
+            # (malformed dev field) is worth a debug log so a recurring
+            # data-quality issue surfaces.
+            logger.debug(
+                "_apply_control_locally skipped on dev %r",
+                getattr(dev, "addr", "?"),
+                exc_info=True,
+            )
+
+    def _update_group_control_cache(self, group_id: int, *, flags: int, params: dict, brightness_val: int, brightness_present: bool) -> None:
+        for device in self.controller.device_repository.list():
+            try:
+                if (int(getattr(device, "groupId", 0)) & 0xFF) != group_id:
+                    continue
+            except Exception:
+                logger.debug(
+                    "group-control cache filter skipped device %r",
+                    getattr(device, "addr", "?"),
+                    exc_info=True,
+                )
+                continue
+            self._apply_control_locally(
+                device,
+                flags=flags,
+                params=params,
+                brightness_val=brightness_val,
+                brightness_present=brightness_present,
+            )
 
     def send_device_preset(self, target_device, flags=None, preset_id=None, brightness=None) -> bool:
         """Send OPC_PRESET to a single node (receiver = last3 of targetDevice.addr).
@@ -141,7 +206,7 @@ class ControlService:
         Accepts numeric ``presetId`` only. RaceLink-native RL-presets follow a
         separate path via :meth:`send_rl_preset_by_id`.
 
-        Flag handling is identical to :meth:`send_wled_control` (protocol
+        Flag handling is identical to :meth:`send_control` (protocol
         contract, ``racelink_proto.h`` byte 1 on both opcodes). Honours the
         four user-intent flags from ``params``: ``arm_on_sync``, ``force_tt0``,
         ``force_reapply``, ``offset_mode``. ``POWER_ON``/``HAS_BRI`` are
@@ -224,7 +289,7 @@ class ControlService:
         """Apply a RaceLink-native preset (OPC_CONTROL) by its stable int id.
 
         Loads the persisted parameter snapshot via ``rl_presets_service`` and
-        delegates to :meth:`send_wled_control` with the merged params.
+        delegates to :meth:`send_control` with the merged params.
         ``brightness_override`` (e.g. from a RotorHazard Quickset slider) takes
         precedence over the value saved in the preset. Flags stored with the
         preset (``arm_on_sync`` / ``force_tt0`` / ``force_reapply``) are
@@ -257,25 +322,57 @@ class ControlService:
             if flags_meta.get(key):
                 merged[key] = True
 
-        return self.send_wled_control(
+        ok = self.send_control(
             targetDevice=targetDevice,
             targetGroup=targetGroup,
             params=merged,
         )
 
-    def send_wled_control(self, *, targetDevice=None, targetGroup=None, params=None):
-        """Send OPC_CONTROL with the WLED effect parameters from ``params``
-        (pre-rename: ``send_wled_control_advanced``).
+        # Iteration 8: track the just-applied RL-preset id on the
+        # targeted device so the Device Options dialog's "RaceLink
+        # Preset" dropdown can pre-select it on next open. Without
+        # this, ``dev.presetId`` stayed at whatever ``send_device_preset``
+        # last wrote (a WLED preset id, possibly 0) and the dropdown
+        # rendered with no selection. Mirror the same write to every
+        # device in a target group so a fleet-apply also sticks.
+        if ok:
+            if targetDevice is not None:
+                try:
+                    targetDevice.presetId = pid & 0xFF
+                except Exception:
+                    # swallow-ok: best-effort cache update; the wire send
+                    # already succeeded, the dropdown just won't pre-fill.
+                    logger.debug(
+                        "send_rl_preset_by_id: could not stamp presetId on %r",
+                        getattr(targetDevice, "addr", "?"),
+                        exc_info=True,
+                    )
+            elif targetGroup is not None:
+                gid = int(targetGroup) & 0xFF
+                for dev in self.controller.device_repository.list():
+                    try:
+                        if (int(getattr(dev, "groupId", 0)) & 0xFF) == gid:
+                            dev.presetId = pid & 0xFF
+                    except Exception:
+                        logger.debug(
+                            "send_rl_preset_by_id: group cache update skipped %r",
+                            getattr(dev, "addr", "?"),
+                            exc_info=True,
+                        )
+        return ok
+
+    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
+        """Send OPC_CONTROL with the effect parameters from ``params``.
 
         Full-state semantics: every field present in ``params`` is included in
         the serialized body. Fields set to ``None`` (or missing entirely) are
         omitted via the ``fieldMask``/``extMask`` presence bits, so the
-        WLED node leaves them untouched.
+        receiver leaves them untouched.
 
         Flag handling matches :meth:`send_wled_preset`: ``POWER_ON`` derived
         from brightness, ``HAS_BRI`` always set when brightness is provided.
         """
-        transport = self._require_transport("sendWledControl")
+        transport = self._require_transport("sendControl")
         if transport is None:
             return False
 
@@ -310,6 +407,8 @@ class ControlService:
             if key in params and params[key] is not None:
                 ctrl_kwargs[key] = tuple(int(c) & 0xFF for c in params[key])
 
+        brightness_present = brightness is not None
+
         if targetGroup is not None:
             group_b = int(targetGroup) & 0xFF
             transport.send_control(
@@ -317,6 +416,18 @@ class ControlService:
                 group_id=group_b,
                 flags=flags,
                 **ctrl_kwargs,
+            )
+            # Iteration 9: OPC_CONTROL is RESP_NONE — mirror onto every
+            # group member's DTO so the device-table reflects the new
+            # state immediately (no need to wait for a manual Get
+            # Status). The route handler's SSE refresh propagates the
+            # change to the frontend.
+            self._update_group_control_cache(
+                group_b,
+                flags=flags,
+                params=params,
+                brightness_val=brightness_val,
+                brightness_present=brightness_present,
             )
             return True
         if targetDevice is not None:
@@ -327,6 +438,15 @@ class ControlService:
                 group_id=group_b,
                 flags=flags,
                 **ctrl_kwargs,
+            )
+            # Iteration 9: see _update_group_control_cache comment above —
+            # symmetric optimistic mirror for the unicast path.
+            self._apply_control_locally(
+                targetDevice,
+                flags=flags,
+                params=params,
+                brightness_val=brightness_val,
+                brightness_present=brightness_present,
             )
             logger.debug(
                 "RL: Sent CONTROL to %s: flags=0x%02X fields=%s",

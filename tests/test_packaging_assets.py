@@ -26,11 +26,17 @@ class PackagingAssetsTests(unittest.TestCase):
         )
 
     def test_iter_sources_includes_webui_assets(self):
+        # Phase 1 PoC moved the WebUI to a Vite-built SPA: the canonical
+        # shell lives at ``racelink/static/dist/index.html`` and the
+        # hashed JS/CSS bundles under ``racelink/static/dist/assets/``.
+        # Asset filenames change per build (content-hashed), so assert
+        # the shell + at least one JS and one CSS bundle.
         rel_paths = {rel_path for _src, rel_path in _build_backend._iter_sources()}
 
-        self.assertIn("racelink/pages/racelink.html", rel_paths)
-        self.assertIn("racelink/static/racelink.css", rel_paths)
-        self.assertIn("racelink/static/racelink.js", rel_paths)
+        self.assertIn("racelink/static/dist/index.html", rel_paths)
+        asset_paths = {p for p in rel_paths if p.startswith("racelink/static/dist/assets/")}
+        self.assertTrue(any(p.endswith(".js") for p in asset_paths), asset_paths)
+        self.assertTrue(any(p.endswith(".css") for p in asset_paths), asset_paths)
 
     def test_built_wheel_contains_webui_assets(self):
         build_dir = ROOT / ".wheel-test"
@@ -45,9 +51,10 @@ class PackagingAssetsTests(unittest.TestCase):
         finally:
             shutil.rmtree(build_dir)
 
-        self.assertIn("racelink/pages/racelink.html", names)
-        self.assertIn("racelink/static/racelink.css", names)
-        self.assertIn("racelink/static/racelink.js", names)
+        self.assertIn("racelink/static/dist/index.html", names)
+        asset_paths = {p for p in names if p.startswith("racelink/static/dist/assets/")}
+        self.assertTrue(any(p.endswith(".js") for p in asset_paths), asset_paths)
+        self.assertTrue(any(p.endswith(".css") for p in asset_paths), asset_paths)
 
     def test_built_sdist_contains_packaged_webui_assets(self):
         build_dir = ROOT / ".sdist-test"
@@ -63,9 +70,10 @@ class PackagingAssetsTests(unittest.TestCase):
             shutil.rmtree(build_dir)
 
         prefix = f"{_build_backend.NAME}-{_build_backend.VERSION}"
-        self.assertIn(f"{prefix}/racelink/pages/racelink.html", names)
-        self.assertIn(f"{prefix}/racelink/static/racelink.css", names)
-        self.assertIn(f"{prefix}/racelink/static/racelink.js", names)
+        self.assertIn(f"{prefix}/racelink/static/dist/index.html", names)
+        asset_paths = {p for p in names if p.startswith(f"{prefix}/racelink/static/dist/assets/")}
+        self.assertTrue(any(p.endswith(".js") for p in asset_paths), asset_paths)
+        self.assertTrue(any(p.endswith(".css") for p in asset_paths), asset_paths)
 
     def test_builds_are_reproducible_with_fixed_source_date_epoch(self):
         build_root = ROOT / ".repro-build-test"

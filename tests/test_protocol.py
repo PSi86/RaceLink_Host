@@ -299,7 +299,7 @@ class ControlAdvBuilderTests(unittest.TestCase):
         self.assertEqual(RLPA.BODY_MAX, 22)
 
 
-class WledControlAdvancedServiceTests(unittest.TestCase):
+class ControlServiceTests(unittest.TestCase):
     def test_service_calls_transport_with_kwargs(self):
         # Local import to avoid top-level dependency on controller module in this test file.
         from racelink.services.control_service import ControlService
@@ -321,7 +321,7 @@ class WledControlAdvancedServiceTests(unittest.TestCase):
 
         ctrl = _FakeController()
         svc = ControlService(ctrl, None)
-        ok = svc.send_wled_control(
+        ok = svc.send_control(
             targetDevice=_Dev(),
             params={
                 "mode": 5,

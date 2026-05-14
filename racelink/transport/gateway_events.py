@@ -23,6 +23,14 @@ class LP:
     OPC_STREAM = 0x07
     OPC_CONTROL = 0x08
     OPC_OFFSET = 0x09
+    # 0x0A — read-back of an OPC_CONFIG option. Request body is one
+    # byte (the option to read); reply reuses the 5-byte ``P_Config``
+    # shape (option + data0..3) with the N→M direction bit. Added
+    # 2026-05-08 alongside the WLED firmware ``OPC_GET_CONFIG``
+    # dispatcher; once ``racelink_proto.h`` regenerates this constant
+    # appears in ``racelink_proto_auto`` and the ``getattr`` below
+    # picks it up automatically.
+    OPC_GET_CONFIG = 0x0A
     OPC_ACK = 0x7E
 
     @staticmethod
@@ -43,6 +51,7 @@ if _HAVE_AUTO:
         LP.OPC_STREAM = getattr(RLPA, "OPC_STREAM", LP.OPC_STREAM)
         LP.OPC_CONTROL = getattr(RLPA, "OPC_CONTROL", LP.OPC_CONTROL)
         LP.OPC_OFFSET = getattr(RLPA, "OPC_OFFSET", LP.OPC_OFFSET)
+        LP.OPC_GET_CONFIG = getattr(RLPA, "OPC_GET_CONFIG", LP.OPC_GET_CONFIG)
         LP.OPC_ACK = getattr(RLPA, "OPC_ACK", LP.OPC_ACK)
 
         make_type = getattr(RLPA, "make_type", LP.make_type)

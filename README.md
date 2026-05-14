@@ -70,8 +70,11 @@ RaceLink_Host/
 │   ├── core/, domain/, protocol/, transport/, state/, services/
 │   ├── web/            Flask blueprint, SSE, API, request helpers
 │   ├── integrations/standalone/
-│   ├── pages/          shared WebUI HTML
-│   └── static/         shared WebUI JS / CSS
+│   └── static/dist/    Vite-built SPA artefacts (committed; rebuilt
+│                       via `npm run build` from frontend/)
+├── frontend/           Vue 3 + Vite SPA (the operator WebUI). See
+│                       frontend/README.md for layout, dev workflow,
+│                       and the post-migration cleanup tracker.
 ├── racelink_proto.h    canonical wire-format header (mirrored to Gateway + WLED)
 ├── tests/
 ├── pyproject.toml
@@ -79,6 +82,12 @@ RaceLink_Host/
 ├── LICENSE
 └── .github/workflows/
 ```
+
+The pre-2026-04-29 vanilla-JS WebUI (`racelink/pages/`,
+`racelink/static/racelink.js`, `scenes.js`, `racelink.css`) was
+removed at the Vue PoC merge. The shared WebUI now lives in
+`frontend/` and ships as the built bundle under
+`racelink/static/dist/`.
 
 For a full architectural tour see
 [Architecture](https://psi86.github.io/RaceLink_Docs/RaceLink_Host/architecture/).

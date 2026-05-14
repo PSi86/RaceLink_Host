@@ -22,19 +22,20 @@ from ..domain import (
     state_scope,
     wled_preset_select_options,
 )
-from ..domain.flags import USER_FLAG_KEYS
+from ..domain.flags import USER_FLAG_DEFS
+from ..domain.node_config import serialize_node_config_schema
 from ..services import OTAWorkflowService, SpecialsService
 from ..services.scene_cost_estimator import estimate_scene, lora_parameters
 from ..services.scenes_service import (
     GROUP_ID_MAX,
     KIND_OFFSET_GROUP,
+    KIND_RL_EFFECT,
     KIND_RL_PRESET,
     KIND_STARTBLOCK,
-    KIND_WLED_CONTROL,
     KIND_WLED_PRESET,
     MAX_GROUPS_OFFSET_ENTRIES,
     MAX_OFFSET_GROUP_CHILDREN,
-    OFFSET_FORMULA_MODES,
+    OFFSET_FORMULA_MODE_LABELS,
     OFFSET_GROUP_CHILD_KINDS,
     OFFSET_MS_MAX,
     OFFSET_MS_MIN,
@@ -270,6 +271,11 @@ def _resolve_special_config_request(ctx, body, specials_service):
     On success, ``payload`` is a dict with the validated request data; on
     failure, ``payload`` is an error dict and ``status`` is the HTTP code.
     Extracted from ``api_specials_config`` (plan P2-4).
+
+    Accepts ``value`` as either an int (scalar 1/2-byte options) or a
+    dict (``{start, stop}`` for ``shape == "uint16-pair"``). The packed
+    ``data0..3`` bytes are returned in the payload so the route handler
+    can forward them straight to ``sendConfig``.
     """
     mac = body.get("mac", None)
     key = body.get("key", None)
@@ -282,13 +288,6 @@ def _resolve_special_config_request(ctx, body, specials_service):
         return False, {"ok": False, "error": "invalid mac/address"}, 400
     if recv3 == b"\xFF\xFF\xFF":
         return False, {"ok": False, "error": "broadcast not allowed for config"}, 400
-
-    try:
-        value_int = int(value)
-    except (TypeError, ValueError):
-        # swallow-ok: bad user input -> 400. Narrow the catch: int()
-        # only raises these two; a wider catch would hide real bugs.
-        return False, {"ok": False, "error": "invalid value"}, 400
 
     mac_str = str(mac).upper()
     with ctx.rl_lock:
@@ -303,7 +302,12 @@ def _resolve_special_config_request(ctx, body, specials_service):
     if option is None:
         return False, {"ok": False, "error": "option not writable"}, 400
     try:
-        specials_service.validate_option_value(option_info, value_int)
+        specials_service.validate_option_value(option_info, value)
+    except ValueError as ex:
+        return False, {"ok": False, "error": str(ex)}, 400
+
+    try:
+        d0, d1, d2, d3 = specials_service.pack_option_value(option_info, value)
     except ValueError as ex:
         return False, {"ok": False, "error": str(ex)}, 400
 
@@ -312,7 +316,12 @@ def _resolve_special_config_request(ctx, body, specials_service):
         "key": key,
         "recv3": recv3,
         "option": option,
-        "value_int": value_int,
+        "option_info": option_info,
+        "value": value,
+        "data0": d0,
+        "data1": d1,
+        "data2": d2,
+        "data3": d3,
     }, 200
 
 
@@ -919,6 +928,15 @@ def register_api_routes(bp, ctx):
         _sse_refresh(ctx, {state_scope.FULL})
         return jsonify({"ok": True})
 
+    @bp.route("/api/node-config/schema", methods=["GET"])
+    def api_node_config_schema():
+        """Operator-facing CONFIG-packet catalogue + per-bit ``configByte``
+        labels. The WebUI reads this once at boot to populate the Node
+        Config dropdown and the device-table Config-column tooltips.
+        Source of truth is :mod:`racelink.domain.node_config`.
+        """
+        return jsonify({"ok": True, "schema": serialize_node_config_schema()})
+
     @bp.route("/api/config", methods=["POST"])
     def api_config():
         if ctx.tasks.is_running():
@@ -991,22 +1009,34 @@ def register_api_routes(bp, ctx):
         key = payload["key"]
         recv3 = payload["recv3"]
         option = payload["option"]
-        value_int = payload["value_int"]
+        option_info = payload["option_info"]
+        value = payload["value"]
+        d0 = payload["data0"]
+        d1 = payload["data1"]
+        d2 = payload["data2"]
+        d3 = payload["data3"]
 
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
 
         def do_special_config():
             ctx.tasks.update(meta={"mac": mac_str, "key": key, "message": f"Sending {key} (0x{int(option):02X})"})
-            ok = ctx.rl_instance.sendConfig(option=int(option) & 0xFF, data0=value_int, recv3=recv3, wait_for_ack=True, timeout_s=6.0)
+            ok = ctx.rl_instance.sendConfig(
+                option=int(option) & 0xFF,
+                data0=d0,
+                data1=d1,
+                data2=d2,
+                data3=d3,
+                recv3=recv3,
+                wait_for_ack=True,
+                timeout_s=6.0,
+            )
             if not ok:
                 raise RuntimeError(f"ACK timeout for option 0x{int(option):02X}")
             with ctx.rl_lock:
                 dev2 = ctx.rl_instance.getDeviceFromAddress(mac_str)
                 if not dev2:
                     raise RuntimeError("device not found")
-                if not hasattr(dev2, "specials") or dev2.specials is None:
-                    dev2.specials = {}
-                dev2.specials[key] = int(value_int) & 0xFF
+                specials_service.write_specials(dev2, option_info, value)
                 try:
                     ctx.rl_instance.save_to_db(
                         {"manual": True}, scopes={state_scope.DEVICE_SPECIALS}
@@ -1021,12 +1051,59 @@ def register_api_routes(bp, ctx):
                         exc_info=True,
                     )
             _sse_refresh(ctx, {state_scope.DEVICE_SPECIALS})
-            return {"mac": mac_str, "key": key, "value": value_int}
+            return {"mac": mac_str, "key": key, "value": value}
 
         task = ctx.tasks.start("special_config", do_special_config, meta={"mac": mac_str, "key": key, "message": "Preparing special config"})
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/specials/config/import", methods=["POST"])
+    def api_specials_config_import():
+        """Adopt the device-reported value into the host-side ``dev.specials``
+        without sending an ``OPC_CONFIG`` packet.
+
+        Used by the dialog's "Import device" button after a divergence
+        between the host-stored value and the live read-back. Body:
+        ``{mac, key, value}`` where ``value`` matches the option's
+        scalar / pair shape — the same shape ``/api/specials/get``
+        returns.
+        """
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+
+        body = request.get_json(silent=True) or {}
+        mac = body.get("mac", None)
+        key = body.get("key", None)
+        value = body.get("value", None)
+        if not mac or not key or value is None:
+            return jsonify({"ok": False, "error": "missing mac/key/value"}), 400
+
+        mac_str = str(mac).upper()
+        with ctx.rl_lock:
+            dev = ctx.rl_instance.getDeviceFromAddress(mac_str)
+            if not dev:
+                return jsonify({"ok": False, "error": "device not found"}), 404
+            option_info = specials_service.resolve_option(dev, key)
+            if not option_info:
+                return jsonify({"ok": False, "error": "option not supported for device"}), 400
+            try:
+                specials_service.validate_option_value(option_info, value)
+            except ValueError as ex:
+                return jsonify({"ok": False, "error": str(ex)}), 400
+            written = specials_service.write_specials(dev, option_info, value)
+            try:
+                ctx.rl_instance.save_to_db(
+                    {"manual": True}, scopes={state_scope.DEVICE_SPECIALS}
+                )
+            except Exception:
+                logger.warning(
+                    "save_to_db after specials import failed",
+                    exc_info=True,
+                )
+
+        _sse_refresh(ctx, {state_scope.DEVICE_SPECIALS})
+        return jsonify({"ok": True, "mac": mac_str, "key": key, "value": value, "written": written})
 
     @bp.route("/api/specials/action", methods=["POST"])
     def api_specials_action():
@@ -1083,11 +1160,67 @@ def register_api_routes(bp, ctx):
         # Diagnostic only — gateway-driven state mirror updates via
         # EV_STATE_CHANGED (Batch B; see MasterState.apply_gateway_state).
         ctx.sse.master.set(last_event="SPECIAL_SENT")
+        # Some actions mutate ``dev.specials`` host-side
+        # (sendStartblockConfig, sendWledResetOverrides). Fire the SSE
+        # refresh so the dialog rows re-bind to the new dev snapshot;
+        # actions that don't mutate state still benefit (the refresh
+        # is one /api/devices fetch — cheap).
+        _sse_refresh(ctx, {state_scope.DEVICE_SPECIALS})
         return jsonify({"ok": True, "result": result, "function": fn_key, "params": params_coerced})
 
     @bp.route("/api/specials/get", methods=["POST"])
     def api_specials_get():
-        return jsonify({"ok": False, "error": "not implemented"}), 501
+        """Read one option's current device-side value.
+
+        Body: ``{mac, key}``. Sends ``OPC_GET_CONFIG`` to the device,
+        waits for the ``GET_CONFIG_REPLY`` (single round-trip,
+        ~600 ms with retries), and returns the unpacked value
+        matching the option's declared shape (scalar / uint16-pair).
+
+        Bypasses ``ctx.tasks.is_running()`` — the dialog opens reads
+        for several options sequentially during normal operation, so
+        gating on the global task lock would block dialog renders.
+        Wire serialisation is provided by the gateway transport.
+        """
+        body = request.get_json(silent=True) or {}
+        mac = body.get("mac", None)
+        key = body.get("key", None)
+        if not mac or not key:
+            return jsonify({"ok": False, "error": "missing mac/key"}), 400
+
+        recv3 = parse_recv3_from_addr(mac)
+        if not recv3:
+            return jsonify({"ok": False, "error": "invalid mac/address"}), 400
+        if recv3 == b"\xFF\xFF\xFF":
+            return jsonify({"ok": False, "error": "broadcast not allowed for read"}), 400
+
+        mac_str = str(mac).upper()
+        with ctx.rl_lock:
+            dev = ctx.rl_instance.getDeviceFromAddress(mac_str)
+            if not dev:
+                return jsonify({"ok": False, "error": "device not found"}), 404
+            option_info = specials_service.resolve_option(dev, key)
+        if not option_info:
+            return jsonify({"ok": False, "error": "option not supported for device"}), 400
+        option = option_info.get("option")
+        if option is None:
+            return jsonify({"ok": False, "error": "option not readable"}), 400
+
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+        config_service = getattr(ctx.rl_instance, "config_service", None)
+        if config_service is None or not hasattr(config_service, "read_config"):
+            return jsonify({"ok": False, "error": "read_config unavailable"}), 500
+
+        result = config_service.read_config(dev, int(option) & 0xFF)
+        if result is None:
+            return jsonify({"ok": False, "mac": mac_str, "key": key, "error": "timeout"})
+
+        _opt, d0, d1, d2, d3 = result
+        try:
+            value = specials_service.unpack_option_value(option_info, d0, d1, d2, d3)
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 500
+        return jsonify({"ok": True, "mac": mac_str, "key": key, "value": value})
 
     @bp.route("/api/devices/control", methods=["POST"])
     def api_devices_control():
@@ -1181,6 +1314,7 @@ def register_api_routes(bp, ctx):
         file_obj = request.files.get("file", None)
         try:
             info = presets_service.store_uploaded_file(file_obj)
+            _sse_refresh(ctx, {state_scope.WLED_PRESETS})
             return jsonify({"ok": True, "file": {"name": info["name"], "size": info["size"], "saved_ts": info["saved_ts"]}, "files": presets_service.list_files()})
         except Exception as ex:
             # surface-as-400: same shape as the fw upload route.
@@ -1211,6 +1345,7 @@ def register_api_routes(bp, ctx):
         if not presets_service.apply_from_path(path):
             return jsonify({"ok": False, "error": "failed to parse presets.json"}), 400
         presets_service.set_current_name(name)
+        _sse_refresh(ctx, {state_scope.WLED_PRESETS})
         return jsonify({"ok": True, "current": name})
 
     # ------------------------------------------------------------------
@@ -1230,7 +1365,7 @@ def register_api_routes(bp, ctx):
     def api_rl_presets_schema():
         """Return the 14-field editor schema with generators resolved.
 
-        Phase D: the Specials ``wled_control`` action now only carries the
+        The Specials ``rl_preset`` action only carries the
         preset-picker form; the full editor lives in ``dlgRlPresets`` and
         needs its own schema source (``RL_PRESET_EDITOR_SCHEMA``).
         """
@@ -1256,6 +1391,7 @@ def register_api_routes(bp, ctx):
             )
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
+        _sse_refresh(ctx, {state_scope.RL_PRESETS})
         return jsonify({"ok": True, "preset": preset})
 
     @bp.route("/api/rl-presets/<key>", methods=["GET"])
@@ -1283,6 +1419,7 @@ def register_api_routes(bp, ctx):
             return jsonify({"ok": False, "error": str(ex)}), 400
         if preset is None:
             return jsonify({"ok": False, "error": "preset not found"}), 404
+        _sse_refresh(ctx, {state_scope.RL_PRESETS})
         return jsonify({"ok": True, "preset": preset})
 
     @bp.route("/api/rl-presets/<key>", methods=["DELETE"])
@@ -1291,6 +1428,7 @@ def register_api_routes(bp, ctx):
             return _rl_presets_unavailable()
         if not rl_presets_service.delete(key):
             return jsonify({"ok": False, "error": "preset not found"}), 404
+        _sse_refresh(ctx, {state_scope.RL_PRESETS})
         return jsonify({"ok": True})
 
     @bp.route("/api/rl-presets/<key>/duplicate", methods=["POST"])
@@ -1305,6 +1443,7 @@ def register_api_routes(bp, ctx):
             return jsonify({"ok": False, "error": str(ex)}), 400
         if preset is None:
             return jsonify({"ok": False, "error": "preset not found"}), 404
+        _sse_refresh(ctx, {state_scope.RL_PRESETS})
         return jsonify({"ok": True, "preset": preset})
 
     # ------------------------------------------------------------------
@@ -1348,13 +1487,14 @@ def register_api_routes(bp, ctx):
                 },
                 "brightness": {"widget": "slider", "min": 0, "max": 255},
             },
-            KIND_WLED_CONTROL: {
-                "presetId": {
-                    "widget": "select",
-                    "options": rl_preset_select_options(context=sl_ctx),
-                },
-                "brightness": {"widget": "slider", "min": 0, "max": 255},
-            },
+            # ``rl_effect`` carries inline RaceLink effect parameters (no
+            # preset id). The editor reuses the same 14-field schema as
+            # the standalone RL-preset editor (``dlgRlPresets``) so any
+            # parameter combination an operator could save as a preset
+            # can also be applied one-shot from a scene.
+            KIND_RL_EFFECT: serialize_rl_preset_editor_schema(
+                context=sl_ctx
+            )["ui"],
             KIND_STARTBLOCK: {
                 "fn_key": {"widget": "select", "options": [
                     {"value": "startblock_control", "label": "Startblock Control"},
@@ -1368,25 +1508,52 @@ def register_api_routes(bp, ctx):
             out = dict(entry)
             out["ui"] = ui_per_kind.get(entry["kind"], {})
             kinds_out.append(out)
+        # Operator-facing labels for target kinds and offset-formula
+        # modes (§8b). Carried alongside the wire values so the WebUI
+        # can render straight from the schema rather than hard-coding
+        # display strings. Container scope omits ``device`` because the
+        # offset formula is per-group.
+        target_kind_labels = {
+            "broadcast": "Broadcast",
+            "groups":    "Group",
+            "device":    "Device",
+        }
+        target_kinds = [
+            {"value": v, "label": target_kind_labels[v]}
+            for v in ("broadcast", "groups", "device")
+        ]
+        container_target_kinds = [
+            {"value": v, "label": target_kind_labels[v]}
+            for v in ("broadcast", "groups")
+        ]
+
+        offset_modes = [dict(m) for m in OFFSET_FORMULA_MODE_LABELS]
+
         return jsonify({
             "ok": True,
             "kinds": kinds_out,
-            "flag_keys": list(USER_FLAG_KEYS),
+            # Same ``[{key, label}]`` shape as
+            # ``/api/rl-presets/schema``'s ``flags`` field — both
+            # endpoints serve from ``USER_FLAG_DEFS`` so the per-action
+            # override block in the scene editor can render the same
+            # human-readable labels as the RL-preset editor without a
+            # client-side fallback humaniser. See
+            # frontend/POST_MIGRATION_CLEANUP.md §13.
+            "flags": [dict(f) for f in USER_FLAG_DEFS],
             # Unified target shape across every action — see
             # ``scenes_service._canonical_target`` and the broadcast-
             # ruleset doc. Legacy values (``scope``, singular ``group``,
             # standalone ``groups`` field on offset_group) are migrated
             # on read; they should never appear on a freshly-saved
-            # scene. Container scope omits ``device`` because the
-            # offset formula is per-group.
-            "target_kinds":             ["broadcast", "groups", "device"],
-            "container_target_kinds":   ["broadcast", "groups"],
+            # scene.
+            "target_kinds":             target_kinds,
+            "container_target_kinds":   container_target_kinds,
             "offset_group": {
                 "max_groups":   MAX_GROUPS_OFFSET_ENTRIES,
                 "max_children": MAX_OFFSET_GROUP_CHILDREN,
                 "group_id":     {"min": 0, "max": GROUP_ID_MAX},
                 "offset_ms":    {"min": OFFSET_MS_MIN, "max": OFFSET_MS_MAX},
-                "modes":        list(OFFSET_FORMULA_MODES),
+                "modes":        offset_modes,
                 "base_ms":      {"min": -32768, "max": 32767},
                 "step_ms":      {"min": -32768, "max": 32767},
                 "center":       {"min": 0,      "max": GROUP_ID_MAX},
@@ -1395,7 +1562,7 @@ def register_api_routes(bp, ctx):
                 # replaces the pre-2026-05 ``groups: "all"`` checkbox.
                 "supports_broadcast_target": True,
                 "child_kinds":  list(OFFSET_GROUP_CHILD_KINDS),
-                "child_target_kinds":      ["broadcast", "groups", "device"],
+                "child_target_kinds":      target_kinds,
             },
             # Active LoRa parameters for the cost-estimator tooltip.
             "lora": lora_parameters(),
@@ -1626,8 +1793,9 @@ def register_api_routes(bp, ctx):
         ``scene_progress``) before each action starts and after it returns.
         The bus is a separate connection from this request so broadcasting
         during the synchronous run does not block the response. The
-        consumer (scenes.js) updates per-row borders live; the post-run
-        result strip still comes from the JSON payload returned here.
+        Vue editor (``frontend/src/components/scenes/SceneRunPipStrip.vue``)
+        updates per-row pips live; the post-run result strip still comes
+        from the JSON payload returned here.
 
         Ephemeral-draft path: when the request body contains an ``actions``
         list, the runner executes that list instead of the persisted scene.
@@ -1708,7 +1876,7 @@ def register_api_routes(bp, ctx):
             return jsonify({"ok": False, "error": "invalid mac"}), 400
 
         def do_presets_download():
-            return ota_workflows.download_presets(
+            result = ota_workflows.download_presets(
                 rl_instance=ctx.rl_instance,
                 task_manager=ctx.tasks,
                 mac=mac,
@@ -1717,6 +1885,14 @@ def register_api_routes(bp, ctx):
                 host_wifi_enable=wifi["host_wifi_enable"],
                 host_wifi_restore=wifi["host_wifi_restore"],
             )
+            # The workflow runs in the task thread; ``ctx.sse.broadcast``
+            # is thread-safe (snapshot-then-fan-out under
+            # ``_clients_lock``). Broadcast WLED_PRESETS only when the
+            # file actually landed on disk — failures already surface
+            # via the task's error state.
+            if isinstance(result, dict) and result.get("ok"):
+                _sse_refresh(ctx, {state_scope.WLED_PRESETS})
+            return result
 
         task = ctx.tasks.start("presets_download", do_presets_download, meta={"stage": "INIT", "addr": mac, "message": "Preset download started", "baseUrl": wifi["base_url"]})
         if not task:
@@ -1794,7 +1970,27 @@ def register_api_routes(bp, ctx):
                 skip_validation=skip_validation,
             )
 
-        task = ctx.tasks.start("fwupdate", do_fwupdate, meta={"stage": "INIT", "index": 0, "total": len(macs), "retries": retries, "addr": None, "message": "Firmware update started", "baseUrl": wifi["base_url"]})
+        # ``macs`` + ``deviceState`` are the authoritative per-device
+        # row identity / state surface for the WebUI's progress panel —
+        # see frontend/POST_MIGRATION_CLEANUP.md §9. The workflow
+        # mutates these in place across the per-device loop and emits
+        # them on every meta update.
+        addrs = [str(m) for m in macs]
+        task = ctx.tasks.start(
+            "fwupdate",
+            do_fwupdate,
+            meta={
+                "stage": "INIT",
+                "index": 0,
+                "total": len(macs),
+                "retries": retries,
+                "addr": None,
+                "message": "Firmware update started",
+                "baseUrl": wifi["base_url"],
+                "macs": addrs,
+                "deviceState": {a: "queued" for a in addrs},
+            },
+        )
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})

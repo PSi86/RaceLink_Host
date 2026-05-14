@@ -38,13 +38,34 @@ def _join_url(base: str, suffix: str) -> str:
     return f"{base_norm}{suffix_norm}" if base_norm else suffix_norm
 
 
-def _resolve_asset_dirs() -> tuple[str, str]:
+def _resolve_asset_dirs() -> str:
+    """Locate the static-asset root for the RaceLink Blueprint.
+
+    The legacy ``racelink/pages/`` Jinja templates were retired when the
+    WebUI moved to a Vite-built SPA; the SPA shell is now served via
+    ``render_template_string`` from ``racelink/static/dist/index.html``.
+    Only the static-asset directory remains a real path — Flask accepts
+    ``template_folder=None`` (its default), so the Blueprint no longer
+    needs a separate template root.
+    """
     package_root = Path(__file__).resolve().parents[1]
-    package_pages = package_root / "pages"
     package_static = package_root / "static"
-    if not package_pages.is_dir() or not package_static.is_dir():
+    if not package_static.is_dir():
         raise FileNotFoundError("RaceLink web assets are missing from the installed package")
-    return str(package_pages), str(package_static)
+    return str(package_static)
+
+
+def _resolve_spa_shell_path() -> Path:
+    """Locate the Vue PoC's built ``index.html``.
+
+    Phase 1 PoC: the Vite bundle lands in ``racelink/static/dist/`` and the
+    blueprint serves it from both ``/racelink/`` and ``/racelink/scenes``
+    via ``render_template_string`` so the ``{{ rl_base_path }}`` /
+    ``{{ rl_static_path }}`` Jinja placeholders inside the file are
+    substituted server-side.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    return package_root / "static" / "dist" / "index.html"
 
 
 def _resolve_blueprint_registrar(app_or_host):
@@ -201,12 +222,11 @@ def create_racelink_web_blueprint(
             presets_service=ctx.services["presets"],
         )
 
-    template_dir, static_dir = _resolve_asset_dirs()
+    static_dir = _resolve_asset_dirs()
     bp = Blueprint(
         blueprint_name,
         __name__,
         url_prefix=normalized_prefix or None,
-        template_folder=template_dir,
         static_folder=static_dir,
         static_url_path="/static",
     )
@@ -233,11 +253,26 @@ def create_racelink_web_blueprint(
     ctx.sse = sse
     ctx.tasks = tasks
 
-    @bp.route("/")
-    def rl_render():
+    spa_shell_path = _resolve_spa_shell_path()
+
+    def _render_spa_shell() -> str:
+        # Phase 1 PoC: serve the Vue SPA shell. Both /racelink/ and
+        # /racelink/scenes return the same shell; Vue Router resolves
+        # the page component once the bundle has booted. The file is
+        # rendered through Jinja so the ``{{ rl_base_path }}`` and
+        # ``{{ rl_static_path }}`` placeholders embedded by the Vite
+        # build are substituted server-side — keeping the same
+        # template hand-off the legacy frontend used.
         sse.ensure_transport_hooked(runtime.rl_instance)
-        return templating.render_template(
-            "racelink.html",
+        try:
+            shell_source = spa_shell_path.read_text(encoding="utf-8")
+        except FileNotFoundError as ex:
+            raise FileNotFoundError(
+                f"RaceLink Vue bundle missing at {spa_shell_path!s}; "
+                "run `npm run build` in frontend/ before starting the host."
+            ) from ex
+        return templating.render_template_string(
+            shell_source,
             serverInfo=None,
             getOption=runtime.option,
             __=runtime.translate,
@@ -245,20 +280,17 @@ def create_racelink_web_blueprint(
             rl_static_path=_join_url(normalized_prefix, "/static"),
         )
 
+    @bp.route("/")
+    def rl_render():
+        return _render_spa_shell()
+
     @bp.route("/scenes")
     def rl_render_scenes():
         # R5a: Scene Manager moved out of dlgScenes into its own page.
-        # Same render-template helpers as the Devices page so SSE wiring and
-        # base-path math match exactly.
-        sse.ensure_transport_hooked(runtime.rl_instance)
-        return templating.render_template(
-            "scenes.html",
-            serverInfo=None,
-            getOption=runtime.option,
-            __=runtime.translate,
-            rl_base_path=normalized_prefix or "",
-            rl_static_path=_join_url(normalized_prefix, "/static"),
-        )
+        # Same SPA shell as the Devices page; Vue Router takes over once
+        # the bundle has mounted. SSE wiring and base-path math match
+        # exactly because both routes render identical HTML.
+        return _render_spa_shell()
 
     sse.register_routes(bp, tasks, runtime.rl_instance)
     api_state = register_api_routes(bp, ctx)

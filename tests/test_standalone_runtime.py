@@ -1,78 +1,12 @@
 import pathlib
 import sys
 import tempfile
-import types
 import unittest
+
+from tests._flask_stub import install_flask, install_serial
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-
-
-def _ensure_serial_stub():
-    if "serial" in sys.modules:
-        return
-    serial_stub = types.ModuleType("serial")
-    serial_stub.Serial = object
-    serial_stub.SerialException = Exception
-    sys.modules["serial"] = serial_stub
-
-    serial_tools = types.ModuleType("serial.tools")
-    serial_list_ports = types.ModuleType("serial.tools.list_ports")
-    serial_list_ports.comports = lambda: []
-    serial_tools.list_ports = serial_list_ports
-    serial_stub.tools = serial_tools
-    sys.modules["serial.tools"] = serial_tools
-    sys.modules["serial.tools.list_ports"] = serial_list_ports
-
-
-def _ensure_flask_stub():
-    flask = sys.modules.get("flask")
-    if flask is None:
-        flask = types.ModuleType("flask")
-        sys.modules["flask"] = flask
-
-    class Flask:
-        def __init__(self, name, *args, **kwargs):
-            self.name = name
-            self.args = args
-            self.kwargs = kwargs
-            self.blueprints = {}
-            self.routes = {}
-
-        def register_blueprint(self, blueprint):
-            self.blueprints[blueprint.name] = blueprint
-
-        def route(self, rule, methods=None):
-            def _decorator(fn):
-                self.routes[(rule, tuple(methods or ("GET",)))] = fn
-                return fn
-
-            return _decorator
-
-        def run(self, *args, **kwargs):
-            return None
-
-    class Blueprint:
-        def __init__(self, name, import_name, **kwargs):
-            self.name = name
-            self.import_name = import_name
-            self.kwargs = kwargs
-            self.routes = {}
-
-        def route(self, rule, methods=None):
-            def _decorator(fn):
-                self.routes[(rule, tuple(methods or ("GET",)))] = fn
-                return fn
-
-            return _decorator
-
-    flask.Flask = Flask
-    flask.Blueprint = Blueprint
-    flask.templating = types.SimpleNamespace(render_template=lambda *args, **kwargs: {"args": args, "kwargs": kwargs})
-    flask.request = types.SimpleNamespace(args={}, json=None, form={}, files={}, get_json=lambda silent=True: {})
-    flask.jsonify = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
-    flask.Response = type("Response", (), {})
-    flask.stream_with_context = lambda fn: fn
 
 
 class StandaloneRuntimeTests(unittest.TestCase):
@@ -86,8 +20,8 @@ class StandaloneRuntimeTests(unittest.TestCase):
             "racelink.integrations.standalone.webapp",
         ):
             sys.modules.pop(name, None)
-        _ensure_serial_stub()
-        _ensure_flask_stub()
+        install_serial()
+        install_flask()
         from racelink.integrations.standalone import StandaloneConfig
         from racelink.integrations.standalone.bootstrap import build_standalone_runtime
         from racelink.integrations.standalone.webapp import create_standalone_app

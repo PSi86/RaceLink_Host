@@ -2,7 +2,7 @@
 
 A *scene* is a named, ordered sequence of up to 20 actions. Each action is a
 typed item drawn from a closed set: dispatchable items (``rl_preset``,
-``wled_preset``, ``wled_control``, ``startblock``) plus two control-flow items
+``wled_preset``, ``rl_effect``, ``startblock``) plus two control-flow items
 (``sync``, ``delay``). The runner (``SceneRunnerService``) plays the list back
 in order; simultaneity is achieved by giving multiple dispatchable actions
 ``arm_on_sync`` flag overrides and inserting an explicit ``sync`` action after
@@ -35,10 +35,19 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 # ---- action kinds (closed enum) -----------------------------------------
+#
+# Effect-applying kinds correspond to two protocol opcodes:
+#   * ``rl_preset``  — apply a saved RaceLink-native preset by id.   OPC_CONTROL
+#                      (host resolves the id to the persisted 14-field
+#                       parameter snapshot before dispatch).
+#   * ``rl_effect``  — apply RaceLink-native effect parameters       OPC_CONTROL
+#                      inline (no preset id, params carried directly
+#                      on the action).
+#   * ``wled_preset``— apply a classical WLED preset by id.          OPC_PRESET
 
 KIND_RL_PRESET = "rl_preset"
+KIND_RL_EFFECT = "rl_effect"
 KIND_WLED_PRESET = "wled_preset"
-KIND_WLED_CONTROL = "wled_control"
 KIND_STARTBLOCK = "startblock"
 KIND_SYNC = "sync"
 KIND_DELAY = "delay"
@@ -49,8 +58,8 @@ KIND_OFFSET_GROUP = "offset_group"
 
 ALL_KINDS = (
     KIND_RL_PRESET,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
-    KIND_WLED_CONTROL,
     KIND_STARTBLOCK,
     KIND_SYNC,
     KIND_DELAY,
@@ -60,8 +69,8 @@ ALL_KINDS = (
 # Kinds that target a single group or device.
 KINDS_WITH_TARGET = (
     KIND_RL_PRESET,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
-    KIND_WLED_CONTROL,
     KIND_STARTBLOCK,
 )
 
@@ -69,21 +78,19 @@ KINDS_WITH_TARGET = (
 # Startblock has no flag concept; sync/delay don't dispatch a packet.
 KINDS_WITH_FLAGS = (
     KIND_RL_PRESET,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
-    KIND_WLED_CONTROL,
 )
 
 # Kinds allowed as children inside an ``offset_group`` container. The plan
 # explicitly excludes startblock (no offset semantics), sync/delay (top-level
-# control flow), and another offset_group (no nesting). ``rl_preset`` is
-# included alongside the two literal "CONTROL"/"WLED PRESET" action types so
-# legacy ``groups_offset`` actions backed by RL presets migrate cleanly —
-# all three emit OPC_PRESET / OPC_CONTROL on the wire and respect the
-# OFFSET_MODE acceptance gate.
+# control flow), and another offset_group (no nesting). All three emit
+# OPC_PRESET / OPC_CONTROL on the wire and respect the OFFSET_MODE
+# acceptance gate.
 OFFSET_GROUP_CHILD_KINDS = (
     KIND_RL_PRESET,
+    KIND_RL_EFFECT,
     KIND_WLED_PRESET,
-    KIND_WLED_CONTROL,
 )
 
 MAX_ACTIONS_PER_SCENE = 20
@@ -128,11 +135,22 @@ def get_action_kinds_metadata() -> List[Dict[str, Any]]:
             "vars": ["presetId", "brightness"],
         },
         {
-            "kind": KIND_WLED_CONTROL,
-            "label": "Apply WLED Control (RL preset via OPC_CONTROL)",
+            "kind": KIND_RL_EFFECT,
+            "label": "Apply RL Effect (inline params, OPC_CONTROL)",
             "supports_target": True,
             "supports_flags_override": True,
-            "vars": ["presetId", "brightness"],
+            # Mirror RL_PRESET_EDITOR_SCHEMA's 14-field var set so a
+            # one-shot effect application can carry any combination an
+            # operator could otherwise save as an RL preset. Live UI
+            # widget metadata is supplied by ``api_scenes_editor_schema``.
+            "vars": [
+                "mode", "speed", "intensity",
+                "custom1", "custom2", "custom3",
+                "check1", "check2", "check3",
+                "palette",
+                "color1", "color2", "color3",
+                "brightness",
+            ],
         },
         {
             "kind": KIND_STARTBLOCK,
@@ -224,6 +242,11 @@ def _migrate_legacy_target(raw: Any) -> Any:
         return raw
     kind = raw.get("kind")
     if kind == "scope":
+        logger.warning(
+            "scenes: deprecated legacy %s shape encountered; "
+            "auto-migrated for load (slated for removal 2026-Q3, tracker §14)",
+            "target.kind=scope",
+        )
         return {"kind": "broadcast"}
     if kind == "group":
         value = raw.get("value")
@@ -232,6 +255,11 @@ def _migrate_legacy_target(raw: Any) -> Any:
         except (TypeError, ValueError):
             # Pass through — validator will reject with a clear message.
             return raw
+        logger.warning(
+            "scenes: deprecated legacy %s shape encountered; "
+            "auto-migrated for load (slated for removal 2026-Q3, tracker §14)",
+            "target.kind=group",
+        )
         return {"kind": "groups", "value": [v]}
     return raw
 
@@ -374,6 +402,38 @@ def _canonical_offset_group_child(raw: Any, *, parent_groups: Any) -> Dict[str, 
     return out
 
 
+def _migrate_legacy_offset_group_groups_field(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive a unified ``target`` from the legacy standalone ``groups`` field.
+
+    Pre-2026-05 ``offset_group`` actions carried ``groups: "all" | [<int>, ...]``
+    instead of the unified ``target`` shape. This shim converts that legacy
+    field into the canonical ``target`` and emits a deprecation warning so
+    operator-saved scenes still on the old shape surface in production logs.
+
+    Raises ``ValueError`` if neither ``target`` nor a usable legacy ``groups``
+    field is present — that case is a malformed action, not a legacy one.
+
+    Slated for removal in 2026-Q3 (tracker §14, Schritt 2) once a release
+    cycle has passed without the warning firing.
+    """
+    legacy_groups = raw.get("groups")
+    if legacy_groups == "all" or legacy_groups == 255:
+        target_raw: Dict[str, Any] = {"kind": "broadcast"}
+    elif isinstance(legacy_groups, list) and legacy_groups:
+        target_raw = {"kind": "groups", "value": list(legacy_groups)}
+    else:
+        raise ValueError(
+            'offset_group requires a "target" field; legacy "groups" '
+            f'is missing or invalid: {legacy_groups!r}'
+        )
+    logger.warning(
+        "scenes: deprecated legacy %s shape encountered; "
+        "auto-migrated for load (slated for removal 2026-Q3, tracker §14)",
+        "offset_group.groups field",
+    )
+    return target_raw
+
+
 def _canonical_offset_group_action(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Validate a top-level ``offset_group`` container action.
 
@@ -399,17 +459,7 @@ def _canonical_offset_group_action(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     target_raw = raw.get("target")
     if target_raw is None:
-        # Legacy: derive `target` from the standalone `groups` field.
-        legacy_groups = raw.get("groups")
-        if legacy_groups == "all" or legacy_groups == 255:
-            target_raw = {"kind": "broadcast"}
-        elif isinstance(legacy_groups, list) and legacy_groups:
-            target_raw = {"kind": "groups", "value": list(legacy_groups)}
-        else:
-            raise ValueError(
-                'offset_group requires a "target" field; legacy "groups" '
-                f'is missing or invalid: {legacy_groups!r}'
-            )
+        target_raw = _migrate_legacy_offset_group_groups_field(raw)
 
     target = _canonical_offset_group_container_target(target_raw)
     target_is_broadcast = (target["kind"] == "broadcast")
@@ -452,6 +502,18 @@ def _canonical_offset_group_action(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 OFFSET_FORMULA_MODES = ("none", "explicit", "linear", "vshape", "modulo")
+
+# Operator-facing labels for the offset-formula modes. Mirrors the
+# ``OFFSET_FORMULA_MODES`` tuple — the wire validator uses just the
+# value strings, the WebUI editor renders ``label`` + ``description``.
+OFFSET_FORMULA_MODE_LABELS = (
+    {"value": "none",     "label": "none",     "description": "no per-group offset"},
+    {"value": "linear",   "label": "linear",   "description": "base + gid · step"},
+    {"value": "vshape",   "label": "vshape",   "description": "base + |gid − center| · step"},
+    {"value": "modulo",   "label": "modulo",   "description": "base + (gid mod cycle) · step"},
+    {"value": "explicit", "label": "explicit", "description": "per-group table"},
+)
+
 OFFSET_BASE_MIN   = -32768
 OFFSET_BASE_MAX   = 32767
 OFFSET_STEP_MIN   = -32768
@@ -672,6 +734,11 @@ def _canonical_action(raw: Any) -> Dict[str, Any]:
     # are auto-rewritten to ``offset_group`` containers with a single child
     # before validation. This keeps pre-hierarchy scenes loadable.
     if _is_legacy_groups_offset_target(raw):
+        logger.warning(
+            "scenes: deprecated legacy %s shape encountered; "
+            "auto-migrated for load (slated for removal 2026-Q3, tracker §14)",
+            "target.kind=groups_offset",
+        )
         raw = _migrate_legacy_groups_offset_action(raw)
 
     kind = raw.get("kind")
@@ -709,7 +776,7 @@ def _canonical_action(raw: Any) -> Dict[str, Any]:
                 raise ValueError(f"sync action must not carry '{stray}'")
         return {"kind": KIND_SYNC}
 
-    # KINDS_WITH_TARGET (rl_preset / wled_preset / wled_control / startblock)
+    # KINDS_WITH_TARGET (rl_preset / wled_preset / rl_effect / startblock)
     if "target" not in raw:
         raise ValueError(f"action kind {kind!r} requires a 'target'")
     target = _canonical_target(raw.get("target"))
