@@ -24,6 +24,7 @@ from ..domain import (
     wled_preset_select_options,
 )
 from ..domain.flags import USER_FLAG_DEFS
+from ..domain.indicators import DEFAULT_INDICATE_DURATION_SEC, IndicatorType
 from ..domain.node_config import serialize_node_config_schema
 from ..services import OTAWorkflowService, SpecialsService
 from ..services.scene_cost_estimator import estimate_scene, lora_parameters
@@ -492,6 +493,21 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/task", methods=["GET"])
     def api_task():
+        return jsonify({"ok": True, "task": ctx.tasks.snapshot()})
+
+    @bp.route("/api/task/cancel", methods=["POST"])
+    def api_task_cancel():
+        """Cooperative cancel for the currently running long task.
+
+        Sets the task's cancel flag and returns immediately. The worker
+        polls :meth:`TaskManager.is_cancel_requested` at its own cancel
+        points and winds down — for OTA that means "skip remaining
+        devices after the current one completes". The dialog stays open
+        through the WebUI lockdown until the resulting summary lands.
+        """
+        signalled = ctx.tasks.request_cancel()
+        if not signalled:
+            return jsonify({"ok": False, "error": "no task running"}), 200
         return jsonify({"ok": True, "task": ctx.tasks.snapshot()})
 
     @bp.route("/api/options", methods=["GET"])
@@ -1472,6 +1488,52 @@ def register_api_routes(bp, ctx):
         # EV_STATE_CHANGED (Batch B; see MasterState.apply_gateway_state).
         ctx.sse.master.set(last_event="CONTROL_SENT")
         return jsonify({"ok": True, "changed": changed})
+
+    @bp.route("/api/devices/indicate", methods=["POST"])
+    def api_devices_indicate():
+        """Trigger the OPC_INDICATE overlay on one or more devices so the
+        operator can visually locate them (default catalog row IDENTIFY = 4,
+        magenta strobe).
+
+        Naming: the route uses *indicate* (matching the wire opcode
+        ``OPC_INDICATE``) — *identify* is reserved for the RF-discovery
+        opcode ``OPC_DEVICES``. The operator-facing verb in the UI is
+        "Locate".
+
+        Body: ``{ "macs": ["AABBCC112233", ...],
+                  "indicator_type": <int, default IDENTIFY=4>,
+                  "duration_sec":   <int, default 5, clamped 0..255> }``.
+        ``duration_sec == 0`` cancels a running indicator on the target
+        device(s). Returns ``{"ok": true, "count": N}`` where ``N`` is the
+        number of devices for which a frame was queued — unknown MACs are
+        skipped, missing-transport returns ``count: 0`` without erroring.
+        """
+        body = request.get_json(silent=True) or {}
+        macs = body.get("macs")
+        if not isinstance(macs, list) or len(macs) == 0:
+            return jsonify({"ok": False, "error": "macs must be a non-empty list"}), 400
+
+        try:
+            indicator_type = int(body.get("indicator_type", IndicatorType.IDENTIFY)) & 0xFF
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "indicator_type must be an integer"}), 400
+        try:
+            duration_sec = int(body.get("duration_sec", DEFAULT_INDICATE_DURATION_SEC))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "duration_sec must be an integer"}), 400
+        duration_sec = max(0, min(255, duration_sec))
+
+        count = 0
+        control_service = getattr(ctx.rl_instance, "control_service", None)
+        if control_service is None:
+            return jsonify({"ok": False, "error": "control_service unavailable"}), 503
+        for mac in macs:
+            dev = ctx.rl_instance.getDeviceFromAddress(str(mac))
+            if dev is None:
+                continue
+            if control_service.send_device_indicate(dev, indicator_type, duration_sec):
+                count += 1
+        return jsonify({"ok": True, "count": count})
 
     @bp.route("/api/fw/upload", methods=["POST"])
     def api_fw_upload():

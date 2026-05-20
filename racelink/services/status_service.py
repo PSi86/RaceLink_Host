@@ -23,6 +23,7 @@ import logging
 
 from ..transport import LP, mac_last3_from_hex
 from . import rf_timing
+from .pending_requests import PendingMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +54,11 @@ class StatusService:
         if target_device is None:
             recv3 = b"\xFF\xFF\xFF"
             group_id = int(group_filter) & 0xFF
-            sender_filter = None
+            unicast_target: bytes | None = None
         else:
             recv3 = mac_last3_from_hex(target_device.addr)
             group_id = int(target_device.groupId) & 0xFF
-            sender_filter = recv3.hex().upper()
-
-        updated = 0
-        responders = set()
+            unicast_target = bytes(recv3)
 
         # Snapshot of devices believed online BEFORE the broadcast.
         # Only these are candidates for the post-broadcast per-device
@@ -86,32 +84,6 @@ class StatusService:
                     if mac:
                         was_online_before.add(mac)
 
-        def _collect(ev: dict) -> bool:
-            nonlocal updated
-            try:
-                if ev.get("opc") == LP.OPC_STATUS and ev.get("reply") == "STATUS_REPLY":
-                    if sender_filter:
-                        sender3 = ev.get("sender3")
-                        if isinstance(sender3, (bytes, bytearray)) and bytes(sender3).hex().upper() != sender_filter:
-                            return False
-                    updated += 1
-                    try:
-                        mac6 = ev.get("mac6")
-                        if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
-                            responders.add(bytes(mac6).hex().upper())
-                        else:
-                            sender3 = ev.get("sender3")
-                            if isinstance(sender3, (bytes, bytearray)) and len(sender3) == 3:
-                                responders.add(bytes(sender3).hex().upper())
-                    except Exception:
-                        # swallow-ok: best-effort fallback; caller proceeds with safe default
-                        pass
-                    return True
-            except Exception:
-                # swallow-ok: best-effort fallback; caller proceeds with safe default
-                pass
-            return False
-
         try:
             transport.drain_events(0.0)
         except Exception:
@@ -119,7 +91,9 @@ class StatusService:
 
         # Plan Phase C (revised): expected-count is known from the device
         # repository. Early-exit on count; otherwise 600 ms idle-timeout; max
-        # ceiling scales with the target population.
+        # ceiling scales with the target population. For broadcast polls the
+        # matcher's ``sender_filter`` is None (wildcard) — any device that
+        # responds is welcome, even ones not in the local repo yet.
         if target_device is not None:
             expected_count = 1
         elif group_filter == 255:
@@ -135,13 +109,32 @@ class StatusService:
             expected_count, ceiling_s=rf_timing.COLLECT_MAX_CEILING_S
         )
 
-        self.gateway_service.send_and_collect(
-            lambda: transport.send_get_status(recv3=recv3, group_id=group_id, flags=0),
-            _collect,
-            expected=expected_count if expected_count > 0 else None,
+        matcher = PendingMatcher(
+            sender_filter=frozenset({unicast_target}) if unicast_target is not None else None,
+            expected_opcode=int(LP.OPC_STATUS) & 0x7F,
+            discriminator_field="reply",
+            discriminator_value="STATUS_REPLY",
+            # Fall back to a large sentinel when the operator polls into an
+            # empty group; idle/max-timeout will close the window naturally.
+            expected_count=expected_count if expected_count > 0 else 2**31,
             idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
             max_timeout_s=max_timeout_s,
         )
+        replies, _reason = self.gateway_service.send_and_match(
+            lambda: transport.send_get_status(recv3=recv3, group_id=group_id, flags=0),
+            matcher,
+        )
+
+        responders: set[str] = set()
+        for ev in replies:
+            mac6 = ev.get("mac6")
+            if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
+                responders.add(bytes(mac6).hex().upper())
+                continue
+            sender3 = ev.get("sender3")
+            if isinstance(sender3, (bytes, bytearray)) and len(sender3) == 3:
+                responders.add(bytes(sender3).hex().upper())
+        updated = len(replies)
 
         # Per-device retry pass for broadcast/group polls. Targets that
         # were online before the broadcast but didn't reply get one

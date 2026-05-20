@@ -317,7 +317,7 @@ void _wrapperRef
         <Button type="button" variant="secondary" :disabled="submitting" @click="close">
           Cancel
         </Button>
-        <Button type="button" :disabled="submitting || !isDirty" @click="onApply">
+        <Button variant="brand" type="button" :disabled="submitting || !isDirty" @click="onApply">
           {{ submitting ? 'Applying…' : 'Apply' }}
         </Button>
       </DialogFooter>

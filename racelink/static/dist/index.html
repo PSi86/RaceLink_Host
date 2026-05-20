@@ -3,9 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Favicon is shipped via Vite's public/ folder. Path is rendered
+       through Flask's Jinja substitution so the icon resolves under
+       any blueprint prefix (``rl_static_path`` = ``/<prefix>/static``,
+       Vite drops public assets at ``<prefix>/static/dist/``). Without
+       this link the browser auto-requests ``/favicon.ico`` at the site
+       root, which Flask doesn't serve. -->
+  <link rel="icon" type="image/svg+xml" href="{{ rl_static_path }}/dist/favicon.svg" />
   <title>RaceLink</title>
-  <script type="module" crossorigin src="/racelink/static/dist/assets/index-BlvmS-6u.js"></script>
-  <link rel="stylesheet" crossorigin href="/racelink/static/dist/assets/index-CdQGxyn6.css">
+  <script type="module" crossorigin src="/racelink/static/dist/assets/index-HhKYBmXr.js"></script>
+  <link rel="stylesheet" crossorigin href="/racelink/static/dist/assets/index-3x9HosBb.css">
 </head>
 <!-- ``data-rl-base-path`` is rewritten by Flask's Jinja render of this file at
      request time. In dev, Vite serves it as a literal ``{{ rl_base_path }}``

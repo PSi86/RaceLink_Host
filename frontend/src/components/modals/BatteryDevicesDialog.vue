@@ -18,6 +18,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { apiPost } from '@/api/client'
+import { useToast } from '@/composables/useToast'
 import { useDevicesStore } from '@/stores/devices'
 import { useGroupsStore } from '@/stores/groups'
 import type { Device } from '@/api/types'
@@ -27,6 +29,28 @@ const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
 
 const devices = useDevicesStore()
 const groups = useGroupsStore()
+const toast = useToast()
+
+// In-flight indicate requests; mirrors the DeviceTable pattern so a
+// second click within the roundtrip doesn't pile up duplicate frames.
+// (Endpoint + opcode are called "indicate"; the operator-facing verb
+// is "Locate" — "identify" is reserved for OPC_DEVICES RF discovery.)
+const indicating = ref<Set<string>>(new Set())
+
+async function onIndicate(addr: string, name: string) {
+  if (indicating.value.has(addr)) return
+  indicating.value.add(addr)
+  try {
+    const r = await apiPost('/api/devices/indicate', { macs: [addr] })
+    if (!r?.ok) {
+      toast.error(`Locate failed: ${r?.error || 'unknown'}`)
+      return
+    }
+    toast.show(`Locating ${name || addr}…`)
+  } finally {
+    indicating.value.delete(addr)
+  }
+}
 
 type SortKey = 'group' | 'name' | 'mac' | 'voltage'
 
@@ -160,6 +184,7 @@ watch(
               >
                 VBat<span class="tabular-nums">{{ sortIndicator('voltage') }}</span>
               </th>
+              <th class="py-1 text-right font-medium"></th>
             </tr>
           </thead>
           <tbody>
@@ -175,6 +200,17 @@ watch(
                 >
                   {{ row.battery_class }}
                 </span>
+              </td>
+              <td class="py-1.5 pl-2 text-right">
+                <button
+                  type="button"
+                  class="cursor-pointer rounded border border-border bg-transparent px-2 py-0.5 text-xs hover:border-accent hover:text-accent disabled:cursor-wait disabled:opacity-50"
+                  :title="`Flash ${row.name || row.addr}'s LEDs to locate it physically`"
+                  :disabled="indicating.has(row.addr)"
+                  @click="onIndicate(row.addr, row.name)"
+                >
+                  Locate
+                </button>
               </td>
             </tr>
           </tbody>

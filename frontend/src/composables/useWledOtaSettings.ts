@@ -40,7 +40,7 @@ const DEFAULTS: WledOtaSettings = {
   iface: 'wlan0',
   password: 'wled1234',
   otaPassword: 'wledota',
-  timeoutS: 20,
+  timeoutS: 30,
   hostWifiEnable: true,
   hostWifiRestore: true,
 }

@@ -33,6 +33,7 @@ from typing import Optional
 
 from ..transport import LP, mac_last3_from_hex
 from . import rf_timing
+from .pending_requests import PendingMatcher
 
 
 class ConfigService:
@@ -122,17 +123,19 @@ class ConfigService:
         def _send():
             self.gateway_service.transport.send_get_config(recv3, opt_byte)
 
-        # Pass the option byte as the registry's secondary discriminator.
-        # The codec parses ``option`` into the GET_CONFIG_REPLY event; the
-        # registry's ``expected_key2`` filter then ensures a reply for
-        # option X cannot accidentally wake a waiter that's pending for
-        # option Y on the same device (iteration-3 fix). Concurrent reads
-        # for different options now route their replies correctly.
-        replies, _had = self.gateway_service.send_and_wait_for_reply(
-            recv3, LP.OPC_GET_CONFIG, _send,
-            timeout_s=float(timeout_s),
-            discriminator=opt_byte,
+        # The ``option`` byte is the discriminator: GET_CONFIG_REPLY echoes
+        # back the option it answers. Two concurrent reads on the same
+        # device for different options route to their own matcher via this
+        # filter (iteration-3 fix, preserved under Option D).
+        matcher = PendingMatcher(
+            sender_filter=frozenset({recv3}),
+            expected_opcode=int(LP.OPC_GET_CONFIG) & 0x7F,
+            discriminator_field="option",
+            discriminator_value=opt_byte,
+            expected_count=1,
+            max_timeout_s=float(timeout_s),
         )
+        replies, _reason = self.gateway_service.send_and_match(_send, matcher)
         for ev in replies:
             if ev.get("reply") != "GET_CONFIG_REPLY":
                 continue

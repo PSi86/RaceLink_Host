@@ -63,6 +63,8 @@ enum Opcode7 : uint8_t {
   OPC_CONTROL       = 0x08, // CONTROL (M2N) -- variable-length direct effect params (see layout below)
   OPC_OFFSET        = 0x09, // OFFSET (M2N) -- per-group offset_ms snapshot used by ARM_ON_SYNC + OFFSET_MODE controls
   OPC_GET_CONFIG    = 0x0A, // GET_CONFIG (M2N, 1B body=option) -> reply: same opcode N2M, body=P_Config (5B). Read-back of OPC_CONFIG-style options so the host can detect device-vs-host divergence on dialog open.
+  OPC_HEADLESS      = 0x0B, // HEADLESS (M2N broadcast) -- symbolic Headless-catalog id + brightness; receiver expands locally via the shared Headless catalog (see racelink_headless.h). Added 2026-05-16 for Headless Mode; additive (slaves not built with the catalog reject it cleanly via parseBody length check). The opcode name was changed from OPC_SCENE on 2026-05-17 to free "SCENE" terminology for a future host-level RaceLink-Scene opcode (which today travels as OPC_CONTROL); wire-format byte value 0x0B is unchanged.
+  OPC_INDICATE      = 0x0C, // INDICATE (M2N broadcast or unicast) -- short-lived status indicator overlay: P_Indicate (type + durationSec). Receiver looks up the type in the shared catalog (racelink_indicators.h), overlays the segment for durationSec seconds, then restores the pre-indicator state. durationSec==0 cancels any currently-running indicator without showing a new one. Animated only (BREATH/STROBE) per project rule.
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
   // Phase-D rename (2026-04-25): opcode values are invariant, only the
   // identifiers shifted: OPC_CONTROL -> OPC_PRESET (0x04), OPC_CONTROL_ADV
@@ -97,6 +99,21 @@ struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; u
 // reserved for a future HAS_GROUP_MASK extension carrying selective fire.
 static const uint8_t SYNC_FLAG_TRIGGER_ARMED = 0x01;
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
+// OPC_HEADLESS body — symbolic Headless-catalog id + broadcast brightness.
+// The receiver looks ``sceneId`` up in its compile-time Headless catalog
+// (racelink_headless.h) and runs the local expansion. Used by the
+// Headless-Mode master and by external software (e.g. FPVGate) so the
+// same catalog drives both sides. Header receiver should be the
+// 0xFF:FF:FF broadcast. (Body struct + field name keep "scene" naming
+// because each catalog row is internally called a "Headless scene"; the
+// rename was scoped to the wire opcode to avoid confusion with a future
+// host-level OPC_SCENE that may replace OPC_CONTROL.)
+struct __attribute__((packed)) P_Headless    { uint8_t sceneId; uint8_t brightness;  }; // 2B
+// OPC_INDICATE body — symbolic indicator-id + duration in seconds. The
+// receiver looks ``type`` up in the shared catalog (racelink_indicators.h)
+// and overlays the segment for ``durationSec`` seconds, then restores the
+// pre-indicator state. ``durationSec == 0`` is a cancel signal.
+struct __attribute__((packed)) P_Indicate    { uint8_t type; uint8_t durationSec;    }; // 2B
 // OPC_OFFSET (Master -> Node, RESP_NONE) — variable-length 2..7 B body.
 // First two bytes are always present:
 //   Byte 0: groupId (0..254 = filter; 255 = broadcast to all groups)
@@ -280,6 +297,8 @@ static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
 static_assert(sizeof(P_GetConfig) <= BODY_MAX, "P_GetConfig too large");
 static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
 static_assert(sizeof(P_Stream) <= BODY_MAX, "P_Stream too large");
+static_assert(sizeof(P_Headless) <= BODY_MAX, "P_Headless too large");
+static_assert(sizeof(P_Indicate) <= BODY_MAX, "P_Indicate too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
 static_assert(sizeof(P_StatusReply) <= BODY_MAX, "P_StatusReply too large");
 static_assert(sizeof(P_Ack) <= BODY_MAX, "P_Ack too large");
@@ -332,6 +351,10 @@ static constexpr PacketRule RULES[] = {
   // the host's "Device Options" dialog to detect host-vs-device divergence on
   // open; absent reply means "device does not expose this option for read".
   { OPC_GET_CONFIG, DIR_M2N, RESP_SPECIFIC, OPC_GET_CONFIG, SZ<P_GetConfig>(), SZ<P_Config>(),       "GET_CONFIG" },
+  // OPC_HEADLESS: Headless-Mode trigger (M2N broadcast, 2B body) -> no response.
+  { OPC_HEADLESS,   DIR_M2N, RESP_NONE,     0,           SZ<P_Headless>(),    0,                     "HEADLESS" },
+  // OPC_INDICATE: short-lived status indicator overlay (M2N, 2B body) -> no response.
+  { OPC_INDICATE,   DIR_M2N, RESP_NONE,     0,           SZ<P_Indicate>(),    0,                     "INDICATE" },
 };
 
 // Lookup by 7-bit opcode

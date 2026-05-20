@@ -104,7 +104,11 @@ async function onStatusAll() {
 
 <template>
   <header class="sticky top-0 z-[2] flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-4 py-3">
-    <h1 class="m-0 text-lg">RaceLink</h1>
+    <h1 class="m-0">
+      <span class="rl-brand" aria-label="RaceLink">
+        <span class="rl-brand__dot" aria-hidden="true"></span>RACE<span class="rl-brand__g">LINK</span>
+      </span>
+    </h1>
     <div class="flex flex-wrap justify-end gap-2">
       <!-- Page navigation runs through ``<router-link>`` so the SPA never
            unmounts on Devices ↔ Scenes transitions. A full-page reload
@@ -140,7 +144,7 @@ async function onStatusAll() {
         >
           Re-sync group config
         </button>
-        <button :disabled="gateway.busy" @click="onSave">Save</button>
+        <button class="btn-brand" :disabled="gateway.busy" @click="onSave">Save</button>
         <button :disabled="gateway.busy" @click="onReload">Reload</button>
         <button
           title="Host settings (battery thresholds, …)"

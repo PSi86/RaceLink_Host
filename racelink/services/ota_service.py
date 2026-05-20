@@ -123,6 +123,30 @@ class OTAService:
             raise ValueError("invalid addr")
         return bytes.fromhex(last3)
 
+    def expected_softap_bssid(self, addr: str) -> str:
+        """Predict the SoftAP BSSID a WLED node will broadcast on.
+
+        ESP32's IDF default is ``AP_MAC = STA_MAC + 1`` (the 48-bit MAC
+        incremented by one). neu 94.txt logs three RaceLink Node V3 boards
+        with this exact relationship (e.g. STA ``DCB4D9A8A95A`` → BSSID
+        ``DC:B4:D9:A8:A9:5B``). Returning the prediction lets the OTA
+        workflow pass ``bssid`` to ``nmcli dev wifi connect`` so NM
+        locks onto the *target* device even when the previous device's
+        AP is still in the scan cache with stronger signal.
+
+        Returns the BSSID as colon-separated upper-case hex; ``""`` if
+        ``addr`` doesn't parse — callers fall through to ``bssid=<auto>``.
+        """
+        mac_hex = self.expected_mac_hex(addr)
+        if len(mac_hex) != 12:
+            return ""
+        try:
+            ap_int = (int(mac_hex, 16) + 1) & ((1 << 48) - 1)
+        except ValueError:
+            return ""
+        ap_hex = f"{ap_int:012X}"
+        return ":".join(ap_hex[i:i + 2] for i in range(0, 12, 2))
+
     def lookup_group_id_for_addr(self, addr: str, devices) -> int:
         want = self.expected_mac_hex(addr)
         if not want:

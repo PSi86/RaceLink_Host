@@ -184,6 +184,7 @@ async function onResetToDefault() {
           <div class="flex gap-2">
             <Button type="button" variant="secondary" @click="close">Cancel</Button>
             <Button
+              variant="brand"
               type="submit"
               :disabled="submitting || targetDevices.length === 0 || !pattern.trim()"
             >

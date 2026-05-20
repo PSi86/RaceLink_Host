@@ -14,6 +14,7 @@
 import { computed, watch, ref } from 'vue'
 
 import { useGatewayStore } from '@/stores/gateway'
+import { useFwLiveTimer } from '@/composables/useFwTimer'
 import type { FwDeviceError, FwDeviceState, TaskSnapshot } from '@/api/types'
 
 const props = defineProps<{
@@ -93,6 +94,30 @@ const progressPct = computed(() => {
   return Math.max(0, Math.min(100, Math.round((idx / total) * 100)))
 })
 
+// Live elapsed / remaining timer. Anchors on the backend's
+// server-computed ``elapsed_s`` (recomputed every snapshot) and adds
+// local seconds for the gap between SSE pushes via the composable's
+// 1 Hz ticker. The estimate is initially based on ~30 s per device
+// (see ``useFwTimer``) and self-refines once at least one device is
+// done. Using ``elapsed_s`` instead of ``started_ts`` removes the
+// host-vs-browser clock-skew offset that previously made the timer
+// start at e.g. "0:07" on a host without NTP sync (2026-05-19).
+const serverElapsedS = computed(() => task.value?.elapsed_s ?? null)
+const deviceIndex = computed(() => Number(meta.value.index ?? 0))
+const deviceTotal = computed(() => Number(meta.value.total ?? props.macs.length) || 0)
+const { elapsedLabel, remainingLabel, remainingS } = useFwLiveTimer({
+  serverElapsedS,
+  deviceIndex,
+  deviceTotal,
+  finished: isFinished,
+})
+const timerLabel = computed(() => {
+  if (isFinished.value) return `done in ${elapsedLabel.value}`
+  if (deviceTotal.value <= 0) return elapsedLabel.value
+  if (remainingS.value <= 0) return `${elapsedLabel.value} · finishing…`
+  return `${elapsedLabel.value} · ~${remainingLabel.value} left`
+})
+
 // Drive per-row state off ``meta.deviceState`` (authoritative map
 // emitted by the workflow). Re-runs on every task snapshot change.
 // The current-addr's stage string is folded into the row's message so
@@ -104,13 +129,26 @@ watch(
 
     const next = new Map(rows.value)
     const ds = (meta.value.deviceState ?? {}) as Record<string, FwDeviceState>
+    const dm = (meta.value.deviceMessages ?? {}) as Record<string, string>
     const currentAddr = String(meta.value.addr || '').toUpperCase()
     const stage = typeof meta.value.stage === 'string' ? meta.value.stage : undefined
 
     for (const [addr, state] of Object.entries(ds)) {
       const macKey = String(addr).toUpperCase()
       if (!next.has(macKey)) continue
-      const message = state === 'running' && macKey === currentAddr ? stage : undefined
+      // For ``error`` rows, prefer the live per-device message the
+      // workflow now pushes into ``meta.deviceMessages`` so the row
+      // can show the concrete failure (e.g. "Timeout waiting for
+      // CONFIG ACK …") instead of the generic "error" label, even
+      // before the task finishes. The dict is keyed by the raw
+      // workflow MAC string; we look up both the uppercase canonical
+      // form and the raw key for safety.
+      let message: string | undefined
+      if (state === 'running' && macKey === currentAddr) {
+        message = stage
+      } else if (state === 'error') {
+        message = dm[macKey] || dm[String(addr)]
+      }
       next.set(macKey, { state, message })
     }
 
@@ -159,9 +197,15 @@ function statusLabel(entry: RowEntry): string {
 
 <template>
   <div class="flex flex-col gap-3">
-    <!-- Stage label -->
-    <div class="rounded-md border border-border bg-card/40 px-3 py-2 text-sm tabular-nums">
-      {{ stageLabel }}
+    <!-- Stage label + live timer -->
+    <div class="flex items-center justify-between gap-3 rounded-md border border-border bg-card/40 px-3 py-2 text-sm tabular-nums">
+      <span>{{ stageLabel }}</span>
+      <span
+        class="text-xs text-muted-foreground"
+        title="Elapsed since the workflow started. Remaining is refined once one device has finished."
+      >
+        {{ timerLabel }}
+      </span>
     </div>
 
     <!-- Progress bar -->

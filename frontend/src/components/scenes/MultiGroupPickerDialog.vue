@@ -167,7 +167,7 @@ function confirm() {
 
       <DialogFooter>
         <Button type="button" variant="secondary" @click="close">Cancel</Button>
-        <Button type="button" @click="confirm">Confirm</Button>
+        <Button variant="brand" type="button" @click="confirm">Confirm</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

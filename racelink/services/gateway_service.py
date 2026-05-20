@@ -2,9 +2,9 @@
 
 The single largest service in the host. Owns:
 
-* The **pending-request registry** (:class:`PendingRequestRegistry` from
-  ``pending_requests``) used for unicast ``send_and_wait_for_reply``
-  request/response matching.
+* The **pending-matcher registry** (:class:`PendingMatcherRegistry` from
+  ``pending_requests``) used for unicast and multi-sender request/reply
+  matching via ``send_and_match``.
 * The **TX listener path** (``on_transport_tx``) that stamps a pending
   expectation when a unicast request goes out, and the matching
   **RX listener path** (``on_transport_event`` →
@@ -54,9 +54,8 @@ from ..transport.gateway_events import (
     LP,
 )
 from .pending_requests import (
-    RESP_ACK as PR_RESP_ACK,
-    RESP_SPECIFIC as PR_RESP_SPECIFIC,
-    PendingRequestRegistry,
+    PendingMatcher,
+    PendingMatcherRegistry,
 )
 from . import rf_timing
 
@@ -96,12 +95,24 @@ class GatewayService:
             thread_name_prefix="rl-auto-restore",
         )
         self._auto_restore_futures: list[Future] = []
+        # Per-MAC tracking so OTA can wait specifically on the auto-restore
+        # worker for the device it just flashed, rather than the global
+        # list (which may include unrelated workers). Keyed by 12-char
+        # uppercase MAC hex. See ``wait_for_auto_restore``.
+        self._auto_restore_futures_by_mac: dict[str, Future] = {}
+        # Per-MAC threading.Event signalling "device sent IDENTIFY_REPLY".
+        # Used by OTA to gate "next device starts" on "previous device
+        # rebooted and re-registered on RaceLink radio". The event is
+        # cleared by the OTA workflow before each AP-Open and set in
+        # ``on_transport_event`` when an IDENTIFY_REPLY arrives.
+        self._identify_events: dict[str, threading.Event] = {}
+        self._identify_events_lock = threading.Lock()
         # Transport redesign (plan Phase B): the Host owns request/reply
         # matching now that the Gateway stays in Continuous RX. The registry
         # unblocks unicast waiters as soon as the expected frame arrives; any
         # unmatched frame continues through the existing unsolicited pipeline
         # in ``on_transport_event``.
-        self._pending_registry = PendingRequestRegistry()
+        self._pending_registry = PendingMatcherRegistry()
         # Reserved for future use; disabled by default because the observed
         # "bulk set group times out on the second device" problem turned out
         # to be a host-side deadlock (web thread held ``ctx.rl_lock`` across
@@ -127,42 +138,68 @@ class GatewayService:
             return _NullLock()
         return lock
 
-    def send_and_wait_for_reply(
+    def send_and_match(
+        self,
+        send_fn,
+        matcher: PendingMatcher,
+    ) -> tuple[list[dict], str]:
+        """Unified send + wait-for-matching-events primitive.
+
+        Registers ``matcher`` with the host's pending-matcher registry,
+        invokes ``send_fn``, and blocks on the matcher's condition until
+        one of: ``expected_count`` events collected, idle window expires,
+        or hard ceiling reached.
+
+        Returns ``(collected_events, reason)`` where ``reason ∈
+        {"count", "idle", "max_timeout", "no_reply"}``. The matcher is
+        always removed from the registry in the ``finally`` block — safe
+        to call multiple times if needed.
+
+        The single primitive for all "outbound TX → inbound reply"
+        coordination — covers unicast 1-reply, multi-sender N-reply,
+        and wildcard discovery flows.
+        """
+        if not self.transport:
+            return [], "no_reply"
+
+        self.install_transport_hooks()
+        self._pending_registry.register(matcher)
+        t_start = time.monotonic()
+        try:
+            send_fn()
+            # Hard ceiling counts from when send_fn returned — we anchor
+            # on registered_ts which is set in ``PendingMatcher.__init__``
+            # just before ``register``. Slight
+            # drift (≤ ms) is irrelevant.
+            reason = matcher.wait(on_send_complete=t_start)
+        finally:
+            self._pending_registry.cancel(matcher)
+        logger.debug(
+            "send_and_match EXIT reason=%s collected=%d elapsed=%.3fs",
+            reason,
+            len(matcher.collected),
+            time.monotonic() - t_start,
+        )
+        return list(matcher.collected), reason
+
+    def _build_unicast_matcher(
         self,
         recv3: bytes,
         opcode7: int,
-        send_fn,
-        timeout_s: float = rf_timing.UNICAST_ATTEMPT_TIMEOUT_S,
+        timeout_s: float,
         discriminator: Optional[int] = None,
-    ) -> tuple[list[dict], bool]:
-        """Unicast request/response helper (plan Transport Redesign Phase B).
+    ) -> Optional[PendingMatcher]:
+        """Build a single-reply matcher for unicast request/response.
 
-        The Host registers the expected ``(sender, opcode/ack_of)`` with the
-        :class:`PendingRequestRegistry`, calls ``send_fn``, and blocks on the
-        per-request completion event. Every inbound frame flows through
-        ``on_transport_event`` -> ``_pending_registry.try_match``; a match
-        sets ``done`` and the waiter returns in ≤ 1 ms from the USB dispatch.
-
-        Broadcast requests (``recv3 == FFFFFF``) do not register -- callers
-        should use :meth:`send_and_collect` instead, which is the right
-        primitive for "N unknown responders within a time window".
-
-        ``discriminator`` is an optional secondary match key forwarded to
-        :class:`PendingRequest.expected_key2`. For ``OPC_GET_CONFIG`` the
-        caller passes the option byte so two simultaneous reads on the
-        same device but for different options cannot wake each other's
-        waiter (iteration-3 fix).
+        Returns ``None`` when the opcode has no expected reply
+        (``RESP_NONE`` policy) — the caller should fire-and-forget in
+        that case. Broadcast targets (``recv3 == FFFFFF``) get a
+        wildcard ``sender_filter`` with idle-timeout enabled so the
+        first reply wins and stragglers tail off cleanly.
         """
-        if not self.transport:
-            return [], False
-
-        self.install_transport_hooks()
-
         opcode7 = int(opcode7) & 0x7F
         recv3_b = bytes(recv3 or b"")
-        sender_filter = recv3_b if recv3_b and recv3_b != b"\xFF\xFF\xFF" else None
-        sender_filter_hex = sender_filter.hex().upper() if sender_filter else ""
-        sender_dev = self.controller.getDeviceFromAddress(sender_filter_hex) if sender_filter_hex else None
+        sender_filter_bytes = recv3_b if recv3_b and recv3_b != b"\xFF\xFF\xFF" else None
 
         try:
             rule = protocol_rules.find_rule(opcode7)
@@ -172,105 +209,32 @@ class GatewayService:
 
         policy = int(response_policy(opcode7)) if rule else int(protocol_rules.RESP_NONE)
         if policy == int(protocol_rules.RESP_NONE):
-            send_fn()
-            return [], False
+            return None
 
-        # Broadcast fallback: no single-sender identity, so the registry
-        # cannot match. Route to ``send_and_collect`` with ``expected=1`` so
-        # the first matching reply wins and the idle timeout cleans up after
-        # any stragglers. This is an unusual path -- broadcast callers
-        # typically use ``send_and_collect`` directly.
-        if sender_filter is None:
-            rsp_opc = int(response_opcode(opcode7)) if rule else -1
-
-            def _bcast_pred(ev: dict) -> bool:
-                try:
-                    opc = int(ev.get("opc", -1))
-                    if policy == int(protocol_rules.RESP_ACK):
-                        return (
-                            opc == int(LP.OPC_ACK)
-                            and int(ev.get("ack_of", -1)) == opcode7
-                        )
-                    if policy == int(protocol_rules.RESP_SPECIFIC):
-                        return opc == rsp_opc
-                except Exception:
-                    # swallow-ok: predicate contract - malformed event
-                    return False
-                return False
-
-            replies = self.send_and_collect(
-                send_fn,
-                _bcast_pred,
-                expected=1,
-                idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
-                max_timeout_s=float(timeout_s),
-            )
-            return replies, bool(replies)
+        sender_filter = (
+            frozenset({sender_filter_bytes}) if sender_filter_bytes is not None else None
+        )
+        idle_s = rf_timing.COLLECT_IDLE_TIMEOUT_S if sender_filter is None else 0.0
 
         if policy == int(protocol_rules.RESP_ACK):
-            registry_policy = PR_RESP_ACK
-            expected_key = opcode7
-        else:  # RESP_SPECIFIC
-            registry_policy = PR_RESP_SPECIFIC
-            expected_key = int(response_opcode(opcode7)) & 0x7F if rule else opcode7
-
-        req = self._pending_registry.register(
-            sender_last3=sender_filter,
-            expected_key=expected_key,
-            policy=registry_policy,
-            timeout_s=timeout_s,
-            expected_key2=discriminator,
-        )
-        opcode_name = self.opcode_name(opcode7)
-        t0 = time.monotonic()
-        logger.debug(
-            "send_and_wait ENTER sender=%s opcode=0x%02X(%s) policy=%d timeout=%.2fs",
-            sender_filter.hex().upper(),
-            opcode7,
-            opcode_name,
-            policy,
-            timeout_s,
-        )
-        try:
-            send_fn()
-            completed = req.done.wait(timeout=float(timeout_s))
-        finally:
-            self._pending_registry.cancel(req)
-
-        elapsed = time.monotonic() - t0
-        if not completed or req.reply is None:
-            logger.debug(
-                "send_and_wait EXIT  TIMEOUT sender=%s opcode=0x%02X(%s) elapsed=%.3fs",
-                sender_filter.hex().upper(),
-                opcode7,
-                opcode_name,
-                elapsed,
+            return PendingMatcher(
+                sender_filter=sender_filter,
+                expected_ack_of=opcode7,
+                expected_count=1,
+                idle_timeout_s=idle_s,
+                max_timeout_s=float(timeout_s),
             )
-            return [], False
-
-        logger.debug(
-            "send_and_wait EXIT  MATCHED sender=%s opcode=0x%02X(%s) elapsed=%.3fs",
-            sender_filter.hex().upper(),
-            opcode7,
-            opcode_name,
-            elapsed,
+        # RESP_SPECIFIC
+        rsp_opc = int(response_opcode(opcode7)) & 0x7F if rule else opcode7
+        return PendingMatcher(
+            sender_filter=sender_filter,
+            expected_opcode=rsp_opc,
+            discriminator_field="option" if discriminator is not None else None,
+            discriminator_value=discriminator,
+            expected_count=1,
+            idle_timeout_s=idle_s,
+            max_timeout_s=float(timeout_s),
         )
-
-        if sender_dev is not None:
-            try:
-                with self._state_lock():
-                    sender_dev.mark_online()
-            except Exception:
-                logger.exception("RaceLink: mark_online after match raised")
-
-        # Post-match settle: sleep briefly so the Gateway radio has time to
-        # settle between the RX (reply we just consumed) and the next TX the
-        # caller is likely to queue. Set ``post_match_settle_s = 0.0`` to
-        # disable. See class docstring for the underlying Gateway CAD issue.
-        settle = float(getattr(self, "post_match_settle_s", 0.0) or 0.0)
-        if settle > 0.0:
-            time.sleep(settle)
-        return [req.reply], True
 
     def send_and_wait_with_retries(
         self,
@@ -284,12 +248,12 @@ class GatewayService:
     ) -> tuple[list[dict], bool]:
         """Wait-for-reply with bounded retries on transient timeout.
 
-        Composes ``send_and_wait_for_reply`` in a retry loop. The
-        per-attempt timeout is short (``rf_timing.UNICAST_ATTEMPT_TIMEOUT_S``,
-        default 1.5 s); a single dropped frame on either direction
-        triggers an automatic retry rather than a false-negative
-        timeout for the caller. Success on any attempt
-        short-circuits.
+        Builds a unicast :class:`PendingMatcher` per attempt and
+        delegates to :meth:`send_and_match`. The per-attempt timeout is
+        short (``rf_timing.UNICAST_ATTEMPT_TIMEOUT_S``, default 1.5 s); a
+        single dropped frame on either direction triggers an automatic
+        retry rather than a false-negative timeout for the caller.
+        Success on any attempt short-circuits.
 
         Defaults pulled from :mod:`rf_timing`. Worst case
         ≈ ``per_attempt × attempts + retry_delay × (attempts - 1)``,
@@ -297,6 +261,7 @@ class GatewayService:
         old 8 s single-attempt timeout this helper replaces, even
         for genuinely-offline devices.
         """
+        opcode7 = int(opcode7) & 0x7F
         n = int(attempts if attempts is not None else rf_timing.UNICAST_MAX_ATTEMPTS)
         if n < 1:
             n = 1
@@ -309,127 +274,86 @@ class GatewayService:
             retry_delay_s if retry_delay_s is not None else rf_timing.UNICAST_RETRY_DELAY_S
         )
 
+        if not self.transport:
+            return [], False
+
+        # Resolve the optional sender device once for the mark_online hook.
+        recv3_b = bytes(recv3 or b"")
+        sender_filter_bytes = recv3_b if recv3_b and recv3_b != b"\xFF\xFF\xFF" else None
+        sender_filter_hex = sender_filter_bytes.hex().upper() if sender_filter_bytes else ""
+        sender_dev = (
+            self.controller.getDeviceFromAddress(sender_filter_hex)
+            if sender_filter_hex
+            else None
+        )
+
+        opcode_name = self.opcode_name(opcode7)
         last_events: list[dict] = []
         for attempt in range(n):
-            events, ok = self.send_and_wait_for_reply(recv3, opcode7, send_fn, timeout_s=per)
-            if ok:
-                if attempt > 0:
-                    logger.debug(
-                        "send_and_wait_with_retries: matched on attempt %d/%d (opcode=0x%02X)",
-                        attempt + 1,
-                        n,
-                        int(opcode7) & 0x7F,
-                    )
+            matcher = self._build_unicast_matcher(recv3, opcode7, per, discriminator=None)
+            if matcher is None:
+                # Opcode with no expected reply — fire-and-forget; no point
+                # retrying. Mirrors the legacy ``RESP_NONE`` short-circuit.
+                self.install_transport_hooks()
+                send_fn()
+                return [], False
+            t0 = time.monotonic()
+            logger.debug(
+                "send_and_wait ENTER sender=%s opcode=0x%02X(%s) attempt=%d/%d timeout=%.2fs",
+                sender_filter_hex or "broadcast",
+                opcode7,
+                opcode_name,
+                attempt + 1,
+                n,
+                per,
+            )
+            events, reason = self.send_and_match(send_fn, matcher)
+            elapsed = time.monotonic() - t0
+            if events:
+                logger.debug(
+                    "send_and_wait EXIT  MATCHED sender=%s opcode=0x%02X(%s) reason=%s "
+                    "attempt=%d/%d elapsed=%.3fs",
+                    sender_filter_hex or "broadcast",
+                    opcode7,
+                    opcode_name,
+                    reason,
+                    attempt + 1,
+                    n,
+                    elapsed,
+                )
+                if sender_dev is not None:
+                    try:
+                        with self._state_lock():
+                            sender_dev.mark_online()
+                    except Exception:
+                        logger.exception("RaceLink: mark_online after match raised")
+                # Post-match settle (default 0.0 — diagnostic knob only).
+                settle = float(getattr(self, "post_match_settle_s", 0.0) or 0.0)
+                if settle > 0.0:
+                    time.sleep(settle)
                 return events, True
+            logger.debug(
+                "send_and_wait EXIT  TIMEOUT sender=%s opcode=0x%02X(%s) reason=%s "
+                "attempt=%d/%d elapsed=%.3fs",
+                sender_filter_hex or "broadcast",
+                opcode7,
+                opcode_name,
+                reason,
+                attempt + 1,
+                n,
+                elapsed,
+            )
             last_events = events
             if attempt < n - 1 and delay > 0.0:
                 time.sleep(delay)
         logger.debug(
             "send_and_wait_with_retries: exhausted %d attempts (opcode=0x%02X, per=%.2fs)",
             n,
-            int(opcode7) & 0x7F,
+            opcode7,
             per,
         )
         return last_events, False
 
-    def send_and_collect(
-        self,
-        send_fn,
-        collect_pred,
-        *,
-        expected: Optional[int] = None,
-        idle_timeout_s: float = rf_timing.COLLECT_IDLE_TIMEOUT_S,
-        max_timeout_s: float = rf_timing.COLLECT_MAX_CEILING_S,
-    ) -> list[dict]:
-        """Broadcast-style collector with idle-based termination.
-
-        The Gateway sits in Continuous RX (Phase A), so the Host owns the
-        clock for *how long* to listen. Semantics:
-
-        1. **Early exit on count.** If ``expected`` is given, return as soon
-           as that many matching replies arrive.
-        2. **Idle timeout.** Once the first match arrives, return when no new
-           match has arrived for ``idle_timeout_s`` seconds.
-        3. **Hard ceiling.** Regardless of 1 + 2, never wait longer than
-           ``max_timeout_s`` from the moment ``send_fn`` is invoked. This is a
-           safety net against a faulty device that streams continuously.
-
-        Before the first match, only the hard ceiling applies -- that covers
-        the "no device responded at all" case (``GET_DEVICES`` on an empty RF
-        scene waits the full 5 s and then returns with ``[]``).
-        """
-        transport = self.transport
-        if transport is None:
-            return []
-
-        self.install_transport_hooks()
-
-        collected: list[dict] = []
-        cond = threading.Condition()
-        full_flag = [False]
-        last_match_ts: list[Optional[float]] = [None]
-
-        def _cb(ev: dict):
-            try:
-                if not isinstance(ev, dict):
-                    return
-                if not collect_pred(ev):
-                    return
-                with cond:
-                    collected.append(ev)
-                    last_match_ts[0] = time.monotonic()
-                    if expected is not None and len(collected) >= int(expected):
-                        full_flag[0] = True
-                    cond.notify_all()
-            except Exception:
-                logger.exception("RaceLink: send_and_collect predicate raised")
-
-        transport.add_listener(_cb)
-        reason = "unknown"
-        try:
-            t_start = time.monotonic()
-            hard_deadline = t_start + float(max_timeout_s)
-            logger.debug(
-                "send_and_collect ENTER expected=%s idle=%.2fs max=%.2fs",
-                expected,
-                idle_timeout_s,
-                max_timeout_s,
-            )
-            send_fn()
-            with cond:
-                while True:
-                    now = time.monotonic()
-                    if full_flag[0]:
-                        reason = "count"
-                        break
-                    if now >= hard_deadline:
-                        reason = "max_timeout" if last_match_ts[0] is not None else "no_reply"
-                        break
-                    if last_match_ts[0] is None:
-                        # No match yet -- block up to the hard deadline.
-                        wait_s = max(0.0, hard_deadline - now)
-                    else:
-                        idle_deadline = last_match_ts[0] + float(idle_timeout_s)
-                        effective_deadline = min(idle_deadline, hard_deadline)
-                        wait_s = effective_deadline - now
-                        if wait_s <= 0.0:
-                            # Idle window already expired since the last
-                            # match -- no need to wait further.
-                            reason = "idle"
-                            break
-                    cond.wait(timeout=wait_s)
-        finally:
-            try:
-                transport.remove_listener(_cb)
-            except Exception:
-                logger.debug("RaceLink: remove_listener failed after send_and_collect", exc_info=True)
-        logger.debug(
-            "send_and_collect EXIT  reason=%s collected=%d elapsed=%.3fs",
-            reason,
-            len(collected),
-            time.monotonic() - t_start,
-        )
-        return collected
 
     @staticmethod
     def compute_collect_max_timeout(
@@ -573,25 +497,7 @@ class GatewayService:
         except Exception:
             logger.debug("RaceLink: drain_events before send_stream raised", exc_info=True)
 
-        acked = set()
-
-        def _collect(ev: dict) -> bool:
-            try:
-                if ev.get("opc") != LP.OPC_ACK:
-                    return False
-                if int(ev.get("ack_of", -1)) != int(LP.OPC_STREAM):
-                    return False
-                sender3 = ev.get("sender3")
-                if not isinstance(sender3, (bytes, bytearray)):
-                    return False
-                sender3_b = bytes(sender3)
-                if sender3_b not in target_last3:
-                    return False
-                acked.add(sender3_b)
-                return True
-            except Exception:
-                # swallow-ok: predicate contract - malformed event -> "not an ack"
-                return False
+        acked: set[bytes] = set()
 
         # Plan Phase C (revised): each retry iteration returns as soon as all
         # targets have ACKed, or after ``idle_timeout_s`` of silence on an
@@ -602,13 +508,24 @@ class GatewayService:
             self.compute_collect_max_timeout(expected, ceiling_s=max_ceiling),
         )
         for attempt in range(max(0, int(retries)) + 1):
-            self.send_and_collect(
-                lambda: transport.send_stream(recv3=recv3, payload=data),
-                _collect,
-                expected=expected,
+            remaining = target_last3 - acked
+            if not remaining:
+                break
+            matcher = PendingMatcher(
+                sender_filter=frozenset(remaining),
+                expected_ack_of=int(LP.OPC_STREAM) & 0x7F,
+                expected_count=len(remaining),
                 idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
                 max_timeout_s=max_timeout,
             )
+            replies, _reason = self.send_and_match(
+                lambda: transport.send_stream(recv3=recv3, payload=data),
+                matcher,
+            )
+            for ev in replies:
+                s3 = ev.get("sender3")
+                if isinstance(s3, (bytes, bytearray)):
+                    acked.add(bytes(s3))
             if len(acked) >= expected:
                 break
             if attempt < int(retries):
@@ -627,11 +544,9 @@ class GatewayService:
         """Legacy reply-window helper (deprecated -- plan Transport Redesign D).
 
         The Gateway no longer drives a Timed RX window after unicast TX; it
-        stays in Continuous RX. New callers should use:
-
-        * :meth:`send_and_wait_for_reply` for unicast request/response (uses
-          :class:`PendingRequestRegistry`),
-        * :meth:`send_and_collect` for broadcast collectors (wall-clock based).
+        stays in Continuous RX. New callers should build a
+        :class:`PendingMatcher` and call :meth:`send_and_match`
+        — covers both unicast 1-reply and multi-sender N-reply paths.
 
         Batch B (2026-04-28) collapsed EV_RX_WINDOW_OPEN/CLOSED into
         EV_STATE_CHANGED; the "window closed" signal is now an
@@ -1050,10 +965,11 @@ class GatewayService:
 
             self.log_transport_reply(ev)
 
-            # Plan Phase B: complete any matching unicast waiter first. This
-            # unblocks ``send_and_wait_for_reply`` immediately; the remainder
-            # of this handler then updates device state for the same event so
-            # the unsolicited pipeline keeps working.
+            # Unified matcher routing: any registered PendingMatcher whose
+            # filters accept this event is signalled here. Unblocks the
+            # blocking caller in ``send_and_match``; the remainder of this
+            # handler then updates device state for the same event so the
+            # unsolicited pipeline keeps working.
             try:
                 self._pending_registry.try_match(ev)
             except Exception:
@@ -1106,6 +1022,16 @@ class GatewayService:
                             ev.get("host_rssi"),
                             ev.get("host_snr"),
                         )
+                    # Signal any ``wait_for_identify`` waiter for this MAC.
+                    # Set before ``_restore_known_device_group`` so OTA can
+                    # immediately move on to waiting for the auto-restore
+                    # worker that the next line is about to spawn.
+                    with self._identify_events_lock:
+                        identify_event = self._identify_events.get(mac12)
+                        if identify_event is None:
+                            identify_event = threading.Event()
+                            self._identify_events[mac12] = identify_event
+                    identify_event.set()
                     self._restore_known_device_group(dev, reported_group=ev.get("groupId"), is_known_device=is_known_device)
 
             self.pending_try_match(ev)
@@ -1194,6 +1120,7 @@ class GatewayService:
                         getattr(dev, "addr", "?"),
                     )
 
+        mac_key = self._normalize_mac_key(getattr(dev, "addr", "") or "")
         with self._auto_reassign_lock:
             # Prune completed futures so the in-flight list stays
             # bounded between submits. The executor itself manages
@@ -1202,6 +1129,12 @@ class GatewayService:
             self._auto_restore_futures = [
                 f for f in self._auto_restore_futures if not f.done()
             ]
+            # Drop completed per-MAC entries by the same rule. A future
+            # tied to a MAC stays under that key until a new worker for
+            # the same MAC replaces it.
+            stale = [m for m, f in self._auto_restore_futures_by_mac.items() if f.done()]
+            for m in stale:
+                self._auto_restore_futures_by_mac.pop(m, None)
             try:
                 fut = self._auto_restore_executor.submit(_worker)
             except RuntimeError:
@@ -1214,6 +1147,8 @@ class GatewayService:
                 )
                 return
             self._auto_restore_futures.append(fut)
+            if mac_key:
+                self._auto_restore_futures_by_mac[mac_key] = fut
 
     def _join_auto_restore_workers(self, timeout: float = 5.0) -> None:
         """Wait for in-flight auto-restore workers to complete.
@@ -1235,6 +1170,73 @@ class GatewayService:
                     "auto-restore worker future raised in test join",
                     exc_info=True,
                 )
+
+    @staticmethod
+    def _normalize_mac_key(mac: str) -> str:
+        return "".join(c for c in str(mac or "") if c.isalnum()).upper()
+
+    def clear_identify(self, mac: str) -> None:
+        """Forget any past IDENTIFY_REPLY for ``mac`` so a subsequent
+        :meth:`wait_for_identify` only resolves on a *new* reply.
+
+        Used by the OTA workflow before each AP-Open: we want the post-
+        reboot identify to gate the next iteration, not a stale event
+        from earlier in the session.
+        """
+        key = self._normalize_mac_key(mac)
+        if not key:
+            return
+        with self._identify_events_lock:
+            ev = self._identify_events.get(key)
+        if ev is not None:
+            ev.clear()
+
+    def wait_for_identify(self, mac: str, timeout_s: float) -> bool:
+        """Block until an IDENTIFY_REPLY for ``mac`` arrives or
+        ``timeout_s`` elapses. Returns ``True`` on identify, ``False``
+        on timeout. Safe to call after ``clear_identify`` or before any
+        IDENTIFY has ever arrived — a fresh ``threading.Event`` is
+        created on first use.
+        """
+        key = self._normalize_mac_key(mac)
+        if not key:
+            return False
+        with self._identify_events_lock:
+            ev = self._identify_events.get(key)
+            if ev is None:
+                ev = threading.Event()
+                self._identify_events[key] = ev
+        return ev.wait(timeout=timeout_s)
+
+    def wait_for_auto_restore(self, mac: str, timeout_s: float) -> bool:
+        """Block until the in-flight auto-restore worker for ``mac``
+        completes, or ``timeout_s`` elapses. Returns ``True`` when the
+        worker finished (regardless of ACK result — the worker itself
+        logs failures), ``False`` on timeout, and ``True`` immediately
+        if no worker is currently in-flight for that MAC.
+
+        OTA uses this after :meth:`wait_for_identify` so the next
+        device's AP-Open is not started while ``setNodeGroupId`` is
+        still on the radio for the previous device.
+        """
+        key = self._normalize_mac_key(mac)
+        if not key:
+            return True
+        with self._auto_reassign_lock:
+            fut = self._auto_restore_futures_by_mac.get(key)
+        if fut is None or fut.done():
+            return True
+        try:
+            fut.result(timeout=timeout_s)
+            return True
+        except Exception:
+            # swallow-ok: ``concurrent.futures.TimeoutError`` is the
+            # timeout case; any other exception is a worker-side
+            # failure that the worker itself already logged in
+            # ``_spawn_auto_reassign_worker``. Either way the
+            # caller's "is the radio still busy for this MAC?"
+            # question is answered: ``False`` means still busy.
+            return fut.done()
 
     def shutdown(self) -> None:
         """Release the auto-restore executor. Safe to call multiple

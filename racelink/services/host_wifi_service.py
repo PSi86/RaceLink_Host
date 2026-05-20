@@ -153,6 +153,136 @@ class HostWifiService:
         return [line.strip() for line in (proc.stdout or "").splitlines() if (line or "").strip()]
 
     @staticmethod
+    def _split_nmcli_terse_fields(line: str) -> List[str]:
+        """Split one ``nmcli -t``-formatted line.
+
+        nmcli -t uses ``:`` as field separator and escapes literal
+        colons inside field values as ``\\:`` — relevant for BSSID
+        fields like ``DC\\:B4\\:D9\\:A8\\:A9\\:5B``. We walk the
+        string instead of using ``str.split(":")`` so the BSSID
+        round-trips correctly.
+        """
+        fields: List[str] = []
+        cur: list[str] = []
+        i = 0
+        line = line or ""
+        while i < len(line):
+            c = line[i]
+            if c == "\\" and i + 1 < len(line) and line[i + 1] == ":":
+                cur.append(":")
+                i += 2
+            elif c == ":":
+                fields.append("".join(cur))
+                cur = []
+                i += 1
+            else:
+                cur.append(c)
+                i += 1
+        fields.append("".join(cur))
+        return fields
+
+    def list_aps_detailed(self, iface: str) -> List[dict]:
+        """Structured scan view used by ``connect_ap``'s BSSID-cascade.
+
+        Returns a list of ``{"in_use", "bssid", "ssid"}`` dicts for
+        every AP currently in nmcli's scan cache for ``iface``. BSSIDs
+        are normalised to upper-case so case-insensitive comparison
+        against operator-supplied / predicted values is trivial.
+
+        Used to detect "exactly one candidate-SSID AP visible whose
+        BSSID is not the previous device" (the fallback path for nodes
+        that don't follow the ESP32 ``AP_MAC = STA_MAC + 1`` convention).
+        """
+        iface = (iface or "wlan0").strip()
+        try:
+            proc = self.nmcli_run(
+                ["-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list",
+                 "ifname", iface, "--rescan", "no"],
+                timeout_s=8.0,
+            )
+        except Exception:
+            # swallow-ok: caller treats empty list as "nothing visible"
+            return []
+        if proc.returncode != 0:
+            return []
+        aps: List[dict] = []
+        for raw in (proc.stdout or "").splitlines():
+            if not raw.strip():
+                continue
+            fields = self._split_nmcli_terse_fields(raw)
+            if len(fields) < 3:
+                continue
+            in_use, bssid, ssid = fields[0], fields[1], fields[2]
+            if not bssid:
+                # Hidden / cloaked APs report empty BSSID — useless
+                # for BSSID-based targeting.
+                continue
+            aps.append({
+                "in_use": in_use.strip() == "*",
+                "bssid": bssid.upper(),
+                "ssid": ssid,
+            })
+        return aps
+
+    def active_bssid(self, iface: str) -> str:
+        """BSSID currently associated on ``iface`` (or ``""``).
+
+        Used by the OTA workflow after a successful ``connect_ap`` to
+        record which BSSID to *avoid* on the next iteration's connect.
+        """
+        for ap in self.list_aps_detailed(iface):
+            if ap.get("in_use"):
+                return str(ap.get("bssid") or "")
+        return ""
+
+    def wifi_state_snapshot(self, iface: str, candidates: Optional[Sequence[str]] = None) -> str:
+        """Compact diagnostic snapshot of ``iface``'s NM state and
+        visible APs matching the ``candidates`` SSID list.
+
+        Best-effort: any nmcli failure falls through to a placeholder
+        string so the caller's error-path log line is never dropped.
+        Used by :meth:`connect_ap` around the connect attempt so a
+        failed run leaves enough info to tell apart NM-state drift,
+        AP-bringup race, and a misbehaving hostapd on the device.
+
+        Format is intentionally one short line per nmcli call so the
+        log entry stays grep-friendly:
+        ``dev=<wlan0:state:connection> aps=[<rows matching candidate SSIDs>]``.
+        """
+        iface = (iface or "wlan0").strip()
+        parts: list[str] = []
+        try:
+            proc = self.nmcli_run(
+                ["-t", "-f", "DEVICE,STATE,CONNECTION", "dev"],
+                timeout_s=4.0,
+            )
+            line = next(
+                (l for l in (proc.stdout or "").splitlines() if l.startswith(f"{iface}:")),
+                f"{iface}:<unknown>",
+            )
+            parts.append(f"dev={line}")
+        except Exception as ex:
+            # swallow-ok: diagnostic snapshot, never the source of truth
+            parts.append(f"dev=<error:{type(ex).__name__}>")
+        try:
+            # Non-terse format keeps BSSIDs / signal columns human-
+            # readable. ``--rescan no`` reuses the most recent scan so
+            # this reflects what the connect call would have seen.
+            proc = self.nmcli_run(
+                ["-f", "IN-USE,BSSID,SSID,SIGNAL,CHAN", "dev", "wifi", "list",
+                 "ifname", iface, "--rescan", "no"],
+                timeout_s=4.0,
+            )
+            cand = {str(c) for c in (candidates or []) if c}
+            lines = [l for l in (proc.stdout or "").splitlines() if l.strip()]
+            relevant = [l for l in lines if any(c in l for c in cand)] if cand else lines[:6]
+            parts.append(f"aps={relevant}")
+        except Exception as ex:
+            # swallow-ok: diagnostic snapshot, never the source of truth
+            parts.append(f"aps=<error:{type(ex).__name__}>")
+        return " ".join(parts)
+
+    @staticmethod
     def _coerce_ssid_list(ssids: SsidArg) -> List[str]:
         if isinstance(ssids, str):
             items: Iterable[str] = [ssids]
@@ -168,6 +298,7 @@ class HostWifiService:
         *,
         iface: str = "",
         bssid: str = "",
+        avoid_bssid: str = "",
         timeout_s: float = 35.0,
     ) -> str:
         """Connect to the first visible SSID from ``ssids`` using ``password``.
@@ -180,8 +311,24 @@ class HostWifiService:
         the profile after the OTA: it would just churn the NM
         configuration and force a re-authorisation on the next run.
 
-        Returns the SSID we actually connected to (so the caller can show
-        it in the operator UI / progress strip). Raises ``RuntimeError``
+        BSSID selection cascade (per scan iteration):
+
+        1. ``bssid`` hint provided AND that BSSID is in the scan → use it.
+           This is the primary path when the OTA workflow predicts the
+           target's SoftAP MAC from the device's STA MAC.
+        2. ``avoid_bssid`` provided AND exactly one candidate-SSID AP is
+           visible whose BSSID is *not* ``avoid_bssid`` → use that BSSID.
+           Multi-device fallback for nodes that don't follow the ESP32
+           ``AP_MAC = STA_MAC + 1`` default — picks the new device's AP
+           when there's no ambiguity. Disabled when ``avoid_bssid`` is
+           empty (i.e. first device of a run) because there's no
+           discriminator there.
+        3. Neither hint nor avoid set → connect with ``bssid=<auto>`` and
+           let NM pick the strongest matching SSID (legacy behavior).
+        4. Otherwise (e.g. hint set but not visible and we have an avoid):
+           skip this iteration and rescan.
+
+        Returns the SSID we actually connected to. Raises ``RuntimeError``
         on timeout or auth failure.
         """
         candidates = self._coerce_ssid_list(ssids)
@@ -190,30 +337,149 @@ class HostWifiService:
         if not password:
             raise RuntimeError("AP password missing")
         iface = str(iface or "wlan0").strip()
-        bssid = str(bssid or "").strip()
+        bssid = str(bssid or "").strip().upper()
+        avoid_bssid = str(avoid_bssid or "").strip().upper()
+        candidate_set = set(candidates)
 
         self.wait_iface_ready(iface, timeout_s=12.0)
+        # Pre-emptive disconnect: if ``iface`` is still actively bound
+        # to one of our candidate SSIDs from a previous iteration (or
+        # an aborted run), drop that connection BEFORE the scan-loop
+        # starts. Two effects:
+        #   1. Unblocks NM's scan-throttle so subsequent ``rescan``
+        #      calls actually surface new BSSIDs quickly.
+        #   2. Makes the eventual ``_dev_wifi_connect`` start from a
+        #      clean state — no stale BSSID-affinity that NM could
+        #      cling to (the neu 94.txt "Secrets were required"
+        #      failure mode).
+        # Idempotent per SSID — no-op if iface is not connected to it.
+        for cand in candidates:
+            self._disconnect_iface_from_ssid(iface, cand)
+        # Stale-BSSID filter for the multi-device fallback (cascade 2):
+        # NM keeps a previously seen AP in its scan cache for ~30 s
+        # after it stops responding (neu 97.txt: device 1's BSSID still
+        # at signal 75 long after that device rebooted out of AP mode).
+        # If we used "any single non-avoid BSSID" as the fallback rule,
+        # we'd pick that stale entry over the still-not-yet-visible
+        # BSSID of the current device. Capture the snapshot at start
+        # so the fallback can require "BSSID *appeared after* we
+        # started looking" — which is the reliable signal for "the
+        # current device's AP came up just now".
+        initial_bssids = {
+            ap.get("bssid", "")
+            for ap in self.list_aps_detailed(iface)
+            if ap.get("bssid")
+        }
+        # Pre-connect state snapshot so a failed run captures whether
+        # NM was already mid-transition (carrying state from a previous
+        # OTA iteration) or whether the device's AP simply wasn't
+        # visible yet. Cheap; only runs once per call.
+        logger.info(
+            "AP connect_ap: start candidates=%s iface=%s bssid=%s avoid_bssid=%s timeout_s=%.1fs initial_bssids=%s | %s",
+            candidates, iface, bssid or "<auto>", avoid_bssid or "<none>", float(timeout_s),
+            sorted(initial_bssids) if initial_bssids else "[]",
+            self.wifi_state_snapshot(iface, candidates),
+        )
         deadline = time.time() + max(5.0, float(timeout_s))
         last_err = None
+        attempt = 0
         while time.time() < deadline:
+            attempt += 1
             try:
                 self.rescan(iface)
             except Exception:
                 # swallow-ok: scan failures retry on the next loop iteration
                 pass
 
-            visible = self.list_ssids(iface)
-            matched = next((s for s in candidates if s in visible), None)
-            if matched is None:
-                time.sleep(0.7)
+            aps = self.list_aps_detailed(iface)
+            cand_aps = [ap for ap in aps if ap.get("ssid") in candidate_set]
+
+            chosen_bssid = ""
+            matched = ""
+
+            # (1) primary: predicted-BSSID match
+            if bssid:
+                for ap in cand_aps:
+                    if ap.get("bssid") == bssid:
+                        chosen_bssid = bssid
+                        matched = ap.get("ssid") or ""
+                        break
+
+            # (2) multi-device fallback: exactly one candidate AP that
+            #     is BOTH not the previous device's BSSID AND wasn't
+            #     in the scan cache when we started looking. The
+            #     "freshly appeared" filter excludes stale entries
+            #     (previously-flashed devices whose APs are long down
+            #     but still in NM's cache). Skipped on the first device
+            #     (avoid_bssid empty) — no discriminator there.
+            if not matched and avoid_bssid:
+                fresh_non_avoid = [
+                    ap for ap in cand_aps
+                    if ap.get("bssid") != avoid_bssid
+                    and ap.get("bssid") not in initial_bssids
+                ]
+                if len(fresh_non_avoid) == 1:
+                    chosen_bssid = fresh_non_avoid[0].get("bssid") or ""
+                    matched = fresh_non_avoid[0].get("ssid") or ""
+                    logger.info(
+                        "AP connect_ap: attempt %d predicted bssid not visible; "
+                        "fallback to freshly appeared non-avoid candidate bssid=%s",
+                        attempt, chosen_bssid,
+                    )
+
+            # (3) legacy: no hint, no avoid → first candidate, no bssid lock
+            if not matched and not bssid and not avoid_bssid:
+                matched_ssid = next((s for s in candidates if any(
+                    ap.get("ssid") == s for ap in cand_aps)), "")
+                if matched_ssid:
+                    matched = matched_ssid
+                    chosen_bssid = ""  # let nmcli auto-pick
+
+            if not matched:
+                # DEBUG (not INFO) — busy-loop until something matches;
+                # log full scan so a final timeout has enough context.
+                logger.debug(
+                    "AP connect_ap: attempt %d no usable candidate (cand_aps=%s, avoid=%s, hint=%s)",
+                    attempt,
+                    [(ap.get("bssid"), ap.get("ssid")) for ap in cand_aps],
+                    avoid_bssid or "<none>", bssid or "<auto>",
+                )
+                # 1.5 s rhythm: NM internally throttles ``rescan`` to
+                # roughly every 5–15 s anyway, so polling faster just
+                # burns CPU and log lines without surfacing new APs
+                # any sooner. 1.5 s matches a typical active-scan
+                # round-trip on a single band; faster (0.7 s, observed
+                # in neu 96.txt as 13 attempts in 11 s) only produces
+                # noise.
+                time.sleep(1.5)
                 continue
 
+            t_attempt = time.monotonic()
+            logger.info(
+                "AP connect_ap: attempt %d invoking nmcli connect ssid=%r bssid=%s",
+                attempt, matched, chosen_bssid or "<auto>",
+            )
             try:
-                self._dev_wifi_connect(matched, password, iface=iface, bssid=bssid,
+                self._dev_wifi_connect(matched, password, iface=iface, bssid=chosen_bssid,
                                        timeout_s=min(60.0, max(15.0, float(timeout_s))))
+                logger.info(
+                    "AP connect_ap: attempt %d ssid=%r SUCCESS elapsed=%.2fs",
+                    attempt, matched, time.monotonic() - t_attempt,
+                )
                 return matched
             except Exception as ex:
+                attempt_elapsed = time.monotonic() - t_attempt
                 last_err = str(ex)
+                # WARNING: every failed attempt gets one line so a
+                # repro-after-the-fact can correlate timestamps with
+                # the rest of the OTA log. The snapshot is the actual
+                # diagnostic payload — it shows what NM saw AT THE
+                # MOMENT the attempt failed (rescan=no, no extra delay).
+                logger.warning(
+                    "AP connect_ap: attempt %d ssid=%r FAILED elapsed=%.2fs: %s | %s",
+                    attempt, matched, attempt_elapsed, last_err,
+                    self.wifi_state_snapshot(iface, candidates),
+                )
                 if "Wi-Fi is disabled" in last_err or "wireless is disabled" in last_err.lower():
                     raise RuntimeError(last_err)
                 if "Secrets were required" in last_err or "no secrets provided" in last_err.lower():
@@ -248,6 +514,90 @@ class HostWifiService:
         raise RuntimeError(
             f"timeout waiting for one of {candidates} to appear on {iface}"
         )
+
+    def disconnect_iface_fast(self, iface: str) -> None:
+        """Tell NM to disconnect ``iface`` and return without waiting
+        for the 802.11 deactivation handshake to finish.
+
+        Used post-OTA-upload: the WLED device is about to reboot, so
+        there is no peer for a graceful 4-way disconnect anyway. The
+        ``-w 0`` top-level flag tells nmcli to return as soon as NM has
+        accepted the request, instead of blocking the operator-facing
+        workflow on the full deactivation timeout.
+
+        Why this matters at the OTA layer: leaving the host in
+        ``connected:WLED_RaceLink_AP`` while the device reboots makes
+        NM throttle subsequent rescans (it thinks it's already in a
+        good state). The next iteration's ``connect_ap`` then spends
+        ~10 s burning attempts before the new device's BSSID appears
+        in the scan cache (observed in neu 96.txt as 13 vs 6 attempts
+        between first and follow-up devices). Forcing a disconnect
+        right after the upload moves NM into the "actively looking"
+        state so its background scan refreshes faster.
+
+        Best-effort: failures are swallowed because the workflow's
+        success path doesn't depend on it.
+        """
+        if not iface:
+            return
+        try:
+            # ``-w 0`` is a top-level nmcli option (it precedes the
+            # subcommand) that disables waiting for the operation to
+            # finish — important for "device is about to reboot, won't
+            # complete the disconnect handshake".
+            self.nmcli_run(["-w", "0", "dev", "disconnect", iface], timeout_s=4.0)
+            logger.info("Host WiFi: disconnect (-w 0) issued on %s", iface)
+        except Exception as ex:
+            # swallow-ok: best-effort post-upload cleanup. Logged at
+            # DEBUG so a chronic NM hiccup is still diagnosable.
+            logger.debug("disconnect_iface_fast(%s) failed: %s", iface, ex)
+
+    def _disconnect_iface_from_ssid(self, iface: str, ssid: str) -> None:
+        """Drop a stale active connection to ``ssid`` on ``iface`` so a
+        fresh ``dev wifi connect`` doesn't re-bind to the previous BSSID.
+
+        Background: in a multi-device OTA every WLED node broadcasts the
+        same SSID. After device N finishes, NM is left actively bound to
+        device N's BSSID (state ``connected:WLED_RaceLink_AP``). The next
+        ``dev wifi connect`` for the same SSID tries to *re-use* that
+        active connection rather than authenticating fresh against device
+        N+1's BSSID — and if device N is in its AP-shutdown window the
+        auth fails with ``"Secrets were required, but not provided"``
+        (observed in neu 94.txt). Forcing a clean disconnect first
+        removes the affinity.
+
+        SSID-scoped on purpose: we don't want to drop the operator's
+        regular WiFi when that WiFi happens to live on the same iface.
+        """
+        if not ssid:
+            return
+        try:
+            proc = self.nmcli_run(
+                ["-t", "-f", "DEVICE,STATE,CONNECTION", "dev"],
+                timeout_s=4.0,
+            )
+        except Exception as ex:
+            # swallow-ok: best-effort precondition; on failure we
+            # proceed without pre-disconnect.
+            logger.debug("pre-connect state check failed: %s", ex)
+            return
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split(":", 2)
+            if (len(parts) == 3
+                    and parts[0] == iface
+                    and parts[1] == "connected"
+                    and parts[2] == ssid):
+                logger.info(
+                    "AP %r: dropping stale active connection on %s before fresh connect",
+                    ssid, iface,
+                )
+                try:
+                    self.nmcli_run(["dev", "disconnect", iface], timeout_s=10.0)
+                except Exception as ex:
+                    # swallow-ok: best-effort cleanup; the subsequent
+                    # connect may still succeed.
+                    logger.debug("pre-connect disconnect failed: %s", ex)
+                return
 
     def _delete_profile_if_exists(self, ssid: str) -> None:
         """Best-effort: delete the NM connection profile named ``ssid``.
@@ -332,6 +682,10 @@ class HostWifiService:
         AP password (the failure mode that broke a fleet OTA where some
         nodes used the default ``wled1234`` and others had cleared it).
         """
+        # NOTE: the stale-active-connection cleanup (``_disconnect_iface_from_ssid``)
+        # is now performed once at the top of ``connect_ap`` before the
+        # scan-loop, so NM's scan-throttle is released earlier. No need
+        # to repeat it here per attempt.
         # Pre-delete any stale profile for this SSID so NM creates a
         # fresh one with correct key-mgmt. See
         # ``_delete_profile_if_exists`` for the full failure-mode

@@ -38,6 +38,16 @@ const { confirm } = useConfirm()
 const submitting = computed(() => false) // local; toggled inside onSend
 const submittingState = reactive({ value: false })
 
+// ``Reset to RaceLink defaults`` (key: wled_reset_overrides) carries the
+// generic "Send" label but is operator-perceived as a commit-state
+// action — it clears every override on the device. Render it with the
+// quiet cyan-outline brand variant (matches Save) instead of the loud
+// pink/cyan ``run`` gradient so it doesn't shout in a row of regular
+// Send buttons. Label text stays "Send" per operator vocabulary.
+const sendVariant = computed<'brand' | 'run'>(() =>
+  props.fn.key === 'wled_reset_overrides' ? 'brand' : 'run',
+)
+
 type VarValue = number | string | boolean | null | undefined
 
 // One bucket per declared var. Pre-seed from the device's current
@@ -178,7 +188,7 @@ void submitting // keep the unused-shape happy if a future variant uses it
   <div class="flex flex-col gap-2 rounded-md border border-border bg-card/40 p-3">
     <div class="flex items-center justify-between gap-2">
       <span class="text-sm font-medium">{{ fn.label || fn.key }}</span>
-      <Button type="button" size="sm" :disabled="submittingState.value" @click="onSend">
+      <Button :variant="sendVariant" type="button" size="sm" :disabled="submittingState.value" @click="onSend">
         {{ submittingState.value ? 'Sending…' : 'Send' }}
       </Button>
     </div>

@@ -224,7 +224,7 @@ def parse_wifi_options(body, ota_service):
         "ota_password": ota_password,
         "iface": str(wifi.get("iface") or body.get("wifiIface") or "wlan0"),
         "bssid": str(wifi.get("bssid") or body.get("wifiBssid") or ""),
-        "timeout_s": float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 20.0),
+        "timeout_s": float(wifi.get("timeoutS") or body.get("wifiTimeoutS") or 30.0),
         "host_wifi_enable": bool(wifi.get("hostWifiEnable") if "hostWifiEnable" in wifi else body.get("hostWifiEnable", True)),
         "host_wifi_restore": bool(wifi.get("hostWifiRestore") if "hostWifiRestore" in wifi else body.get("hostWifiRestore", True)),
     }

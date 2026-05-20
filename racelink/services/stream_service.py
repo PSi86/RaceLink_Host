@@ -16,8 +16,10 @@ Public API:
   (unicast, expected count = 1) must be set.
 
 Threading: blocking. Callers run it in task-manager threads;
-the underlying ``send_and_collect`` installs an RX listener for
-the duration of the window.
+the underlying :meth:`GatewayService.send_and_match` registers
+a :class:`PendingMatcher` for the expected per-device ACK set
+and unblocks the caller when ``expected_count`` is reached or
+the idle/max-timeout fires.
 """
 
 from __future__ import annotations

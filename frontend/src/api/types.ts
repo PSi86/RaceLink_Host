@@ -50,6 +50,12 @@ export interface TaskMeta {
   // device selection since.
   macs?: string[]
   deviceState?: Record<string, FwDeviceState>
+  /** Per-device live message companion to ``deviceState``. Populated by
+   *  the OTA workflow on the ``error`` transition so the live row can
+   *  show the concrete failure ("Timeout waiting for CONFIG ACK …")
+   *  instead of the generic "error" label, without having to wait for
+   *  the final ``result.errors[]`` overlay. Keyed by uppercase MAC. */
+  deviceMessages?: Record<string, string>
   baseUrl?: string
 }
 
@@ -61,9 +67,24 @@ export interface TaskSnapshot {
   last_error?: string | null
   started_ts?: number | null
   ended_ts?: number | null
+  /** Server-computed elapsed seconds since ``started_ts``, recomputed
+   *  on every snapshot. Authoritative timer base for the WebUI — using
+   *  this instead of ``Date.now()/1000 - started_ts`` avoids the host /
+   *  browser clock-skew drift (the host may run without NTP, the
+   *  browser is NTP-synced — the difference shows up as a constant
+   *  offset on the firmware-update timer). Null until the task is
+   *  started. Frozen at the final value when state is ``done``/``error``. */
+  elapsed_s?: number | null
   rx_replies?: number
   rx_window_events?: number
   rx_count_delta_total?: number
+  /** Set ``true`` after the operator clicks Cancel; the worker thread
+   *  polls a server-side flag at its cooperative cancel points and
+   *  winds down. The corresponding result entry carries ``cancelled``
+   *  and (for fwupdate) ``cancelled_after``. Surfaced over SSE so the
+   *  dialog can immediately switch its primary action to a disabled
+   *  "Cancelling…" state without waiting for the next state flip. */
+  cancel_requested?: boolean
 }
 
 export interface GatewayErrorPayload {

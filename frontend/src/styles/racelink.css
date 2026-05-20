@@ -22,7 +22,52 @@
 
 @layer base {
 *{ box-sizing:border-box; }
-body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--color-bg); color:var(--color-text); }
+
+/* Body: brand body-font (Sora) on top of the layered racelink.dev
+ * background. The two radial glows (pink top-left, cyan top-right)
+ * and the faint 64 px speed-grid mirror the public site so the WebUI
+ * reads as the same product. background-attachment: fixed keeps the
+ * glow anchored to the viewport on long pages. The grid lives on
+ * body::before so it tracks the viewport, ignores pointer events, and
+ * fades out toward the bottom via a radial mask. */
+body{
+  margin:0;
+  font-family: var(--font-body);
+  background:
+    radial-gradient(900px 520px at 12% -3%, rgba(255, 46, 110, 0.13), transparent 60%),
+    radial-gradient(820px 600px at 92% 4%, rgba(31, 230, 214, 0.11), transparent 58%),
+    var(--color-bg);
+  background-attachment: fixed;
+  color:var(--color-text);
+}
+body::before{
+  content:"";
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  z-index:0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.022) 1px, transparent 1px);
+  background-size: 64px 64px;
+  -webkit-mask-image: radial-gradient(ellipse at 50% 0%, #000, transparent 80%);
+          mask-image: radial-gradient(ellipse at 50% 0%, #000, transparent 80%);
+}
+/* App content must sit above the speed-grid layer. */
+#app{ position:relative; z-index:1; }
+
+/* Display font (Chakra Petch) on every heading. -0.005em letter-spacing
+ * matches the public site's tighter display setting. */
+h1, h2, h3, h4, h5, h6 { font-family: var(--font-display); letter-spacing: -0.005em; }
+
+/* Section-heading rhythm. Preflight is disabled, so h4 keeps the
+ * browser default ~1.33em margin on both sides — far too much air
+ * around the small uppercase TARGETS / OPERATIONS labels used in
+ * dialogs and editor sections. Tighten both margins (top hard,
+ * bottom slightly) so the heading still visually groups with its
+ * body. Per-site utility classes (mb-2, m-0, etc.) in the utilities
+ * layer override these. */
+h4 { margin-block-start: 0.2em; margin-block-end: 0.5em; }
 
 /* ===== Device table ===================================================
  *
@@ -45,7 +90,7 @@ body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif
 .rl-name-input{
   width:100%; min-width:0; padding:2px 6px;
   background:#101015; color:inherit; font:inherit;
-  border:1px solid #4c8bf5; border-radius:4px; outline:none;
+  border:1px solid var(--color-accent); border-radius:4px; outline:none;
 }
 
 /* Live row-update flash animation. Triggered when a device's
@@ -59,8 +104,8 @@ body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif
    rows the animation must hit the cells, since the row's own background
    is hidden behind opaque cell backgrounds. */
 @keyframes rl-row-flash {
-  0%   { background-color: rgba(76, 139, 245, 0.32); }
-  60%  { background-color: rgba(76, 139, 245, 0.16); }
+  0%   { background-color: rgba(31, 230, 214, 0.32); }
+  60%  { background-color: rgba(31, 230, 214, 0.16); }
   100% { background-color: transparent; }
 }
 li.rl-row-flash,
@@ -88,6 +133,29 @@ tr.rl-row-flash > td {
  * cleanly. shadcn-vue primitives bring their own styles and override
  * via class specificity (10) regardless of layer.
  */
+/* Form controls do NOT inherit font-family from <body> by default — the
+ * UA stylesheet pins them to a fallback (Arial/Helvetica). With
+ * Tailwind v4 Preflight disabled (see tailwind.css header), nothing
+ * else resets it, so bare buttons/selects/inputs and shadcn-vue
+ * primitives that omit ``font-sans`` paint in the wrong typeface.
+ * Only family is inherited — UA-default sizing/weight is preserved so
+ * dense compact controls stay compact. */
+button, input, select, textarea, optgroup { font-family: inherit; }
+
+/* UA-default accent (Win11 Edge: bright cyan-ish, GNOME: blue, ...)
+ * is what controls checkbox check marks, radio dots, range thumbs/
+ * tracks, and progress fills without our intervention. Pin it to the
+ * (toned) brand accent so these controls read as part of the design
+ * system rather than fighting it. */
+input[type="checkbox"],
+input[type="radio"],
+input[type="range"],
+progress,
+meter,
+select {
+  accent-color: var(--color-accent);
+}
+
 button{ background:#232330; border:1px solid #2a2a32; color:var(--color-text); padding:6px 10px; border-radius:8px; cursor:pointer; }
 button:hover{ border-color:#3b3b44; }
 button:disabled{ opacity:.5; cursor:not-allowed; }
@@ -108,5 +176,60 @@ select, input{ background:#1a1a23; color:var(--color-text); border:1px solid #2a
 .rl-toast.rl-toast-error{
   background:#4a1a1a; color:#ffeaea;
   border-color:#7a2a2a;
+}
+
+/* ===== Brand: RACE LINK wordmark + CTA button ========================
+ * 1:1 port of the racelink.dev header brand. .rl-brand wraps the
+ * layout; .rl-brand__dot is the pink-glow accent; .rl-brand__g clips
+ * the pink→cyan gradient onto the "LINK" text via background-clip.
+ * Used in AppHeader only — secondary surfaces keep plain text.
+ *
+ * .btn-brand is an opt-in utility for high-priority CTAs (Save,
+ * Apply). It overrides the bare-button skin defined above with the
+ * brand gradient, pink glow, and a small lift on hover. Disabled
+ * state strips the lift and shadow so it does not look interactive.
+ */
+.rl-brand{
+  display:inline-flex; align-items:center; gap:9px;
+  font-family: var(--font-display);
+  font-weight:700; font-size:21px; letter-spacing:0.06em;
+  color: var(--color-text); text-decoration:none; line-height:1;
+}
+.rl-brand__dot{
+  width:9px; height:9px; border-radius:50%;
+  background: var(--color-brand-gradient);
+  box-shadow: var(--shadow-brand-glow);
+  flex-shrink:0;
+}
+.rl-brand__g{
+  background: var(--color-brand-gradient);
+  -webkit-background-clip: text;
+          background-clip: text;
+  color: transparent;
+}
+
+/* .btn-brand — toned-down cyan accent for primary CTAs (Save, Apply).
+ * Earlier iteration used the pink→cyan gradient + glow which read as
+ * too loud for an action that appears alongside half a dozen other
+ * buttons. Now it mirrors the public-site ``.btn--ghost:hover`` look:
+ * faint cyan fill, cyan text, slim cyan border — still the visually
+ * dominant button in its row, but no shouting. */
+.btn-brand{
+  background: rgba(31, 230, 214, 0.08);
+  color: var(--color-brand-cyan);
+  border: 1px solid rgba(31, 230, 214, 0.45);
+  font-family: var(--font-display);
+  font-weight:600;
+  letter-spacing:0.03em;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+.btn-brand:hover:not(:disabled){
+  background: rgba(31, 230, 214, 0.14);
+  border-color: rgba(31, 230, 214, 0.7);
+  color: #5ff2e6;
+}
+.btn-brand:disabled{
+  opacity:0.5;
+  cursor:not-allowed;
 }
 }  /* end @layer base */

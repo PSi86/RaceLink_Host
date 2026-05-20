@@ -32,6 +32,7 @@ from ..protocol.packets import (
     build_control_body,
     build_get_config_body,
     build_get_devices_body,
+    build_indicate_body,
     build_offset_body,
     build_preset_body,
     build_set_group_body,
@@ -581,6 +582,19 @@ class GatewaySerialTransport:
         """Send an OPC_PRESET packet (4 B fixed, pre-rename: OPC_CONTROL)."""
         body = build_preset_body(group_id=group_id, flags=flags, preset_id=preset_id, brightness=brightness)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_PRESET), recv3, body)
+
+    def send_indicate(self, recv3: bytes, indicator_type: int, duration_sec: int) -> SendOutcome:
+        """Send an OPC_INDICATE packet (2 B fixed body).
+
+        Receivers expand ``indicator_type`` via the shared
+        ``racelink_indicators.h`` catalog and overlay the segment for
+        ``duration_sec`` seconds, then restore the pre-indicator state via
+        their snapshot logic. ``duration_sec == 0`` cancels any active
+        indicator without showing a new one. ``recv3`` may be unicast or
+        the broadcast sentinel ``b"\\xFF\\xFF\\xFF"`` for fleet-wide notify.
+        """
+        body = build_indicate_body(indicator_type=indicator_type, duration_sec=duration_sec)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_INDICATE), recv3, body)
 
     def send_control(self, recv3: bytes, group_id: int, flags: int, **params) -> SendOutcome:
         """Send an OPC_CONTROL packet (variable-length body, 3..21 B).

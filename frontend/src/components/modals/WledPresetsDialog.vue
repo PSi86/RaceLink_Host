@@ -27,6 +27,7 @@ import { useGatewayStore } from '@/stores/gateway'
 import { useSpecialsStore } from '@/stores/specials'
 import { useToast } from '@/composables/useToast'
 import { useWledOtaSettings } from '@/composables/useWledOtaSettings'
+import { useTaskNavigationGuard } from '@/composables/useTaskNavigationGuard'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
@@ -66,6 +67,10 @@ const currentLabel = computed(() =>
 const dirtySelection = computed(() => Boolean(chosenName.value) && chosenName.value !== presets.current)
 const applyDisabled = computed(() => applying.value || !dirtySelection.value)
 
+const presetsDownloadCancelRequested = computed(
+  () => gateway.presetsBusy && Boolean(gateway.task?.cancel_requested),
+)
+
 const downloadResultLine = computed(() => {
   const t = gateway.task
   if (!startedDownloadHere.value && (!t || t.name !== 'presets_download')) return ''
@@ -79,14 +84,31 @@ const downloadResultLine = computed(() => {
       parts.push(String(meta.stage))
     }
     if (meta.message) parts.push(String(meta.message))
+    if (t.cancel_requested) parts.unshift('Cancelling')
     return parts.length ? `Running: ${parts.join(' · ')}` : 'Running…'
   }
   if (t.state === 'done') {
-    const r = (t.result ?? {}) as { file?: { name?: string } }
+    const r = (t.result ?? {}) as {
+      file?: { name?: string }
+      cancelled?: boolean
+      hostWifi?: { restored?: boolean; wasEnabled?: boolean; enabled?: boolean }
+    }
+    if (r.cancelled) {
+      const wifiNote = r.hostWifi?.restored ? ' Host WiFi restored.' : ''
+      return `Cancelled by operator — no presets file saved.${wifiNote}`
+    }
     return r.file?.name ? `Done — saved as "${r.file.name}".` : 'Done.'
   }
   if (t.state === 'error') return `Error: ${t.last_error || 'unknown'}`
   return ''
+})
+
+// Browser-navigation guard: while a presets download runs, asking for
+// confirmation before letting the operator leave (router or
+// beforeunload). Same WiFi-stranding risk as the FW update.
+useTaskNavigationGuard(() => gateway.presetsBusy, {
+  reason:
+    'A presets download is currently running. Leaving now will lose status visibility (the download continues server-side and may strand the host on the device AP if the WiFi cleanup is missed). Continue anyway?',
 })
 
 // Refresh the WLED-presets list once the download task ends with
@@ -204,11 +226,22 @@ async function onDownload() {
     downloading.value = false
   }
 }
+
+async function onCancelDownload() {
+  if (!gateway.presetsBusy || presetsDownloadCancelRequested.value) return
+  const ok = await gateway.cancelTask()
+  if (!ok) {
+    toast.error('Cancel failed: no task running.')
+  }
+}
 </script>
 
 <template>
   <Dialog :open="open" @update:open="(v) => emit('update:open', v)">
-    <DialogContent class="w-[min(720px,96vw)]">
+    <DialogContent
+      class="w-[min(720px,96vw)]"
+      :lock-close="gateway.presetsBusy"
+    >
       <DialogHeader>
         <DialogTitle>WLED Presets</DialogTitle>
         <DialogDescription>
@@ -262,7 +295,7 @@ async function onDownload() {
               {{ f.name }}
             </option>
           </select>
-          <Button type="button" size="sm" :disabled="applyDisabled" @click="onApply">
+          <Button variant="brand" type="button" size="sm" :disabled="applyDisabled" @click="onApply">
             {{ applying ? 'Applying…' : 'Apply' }}
           </Button>
         </div>
@@ -286,6 +319,19 @@ async function onDownload() {
             {{ downloadHint }}
           </span>
           <Button
+            v-if="gateway.presetsBusy"
+            type="button"
+            size="sm"
+            variant="destructive"
+            :disabled="presetsDownloadCancelRequested"
+            :title="presetsDownloadCancelRequested
+              ? 'Cancel already requested — waiting for current step to finish'
+              : 'Stop the download after the current step; host WiFi will still be restored'"
+            @click="onCancelDownload"
+          >
+            {{ presetsDownloadCancelRequested ? 'Cancelling…' : 'Cancel download' }}
+          </Button>
+          <Button
             type="button"
             size="sm"
             :disabled="downloadDisabled"
@@ -302,7 +348,15 @@ async function onDownload() {
       </section>
 
       <div class="flex justify-end">
-        <Button type="button" variant="secondary" @click="close">Close</Button>
+        <Button
+          type="button"
+          variant="secondary"
+          :disabled="gateway.presetsBusy"
+          :title="gateway.presetsBusy ? 'Cancel the download first' : 'Close the dialog'"
+          @click="close"
+        >
+          Close
+        </Button>
       </div>
     </DialogContent>
   </Dialog>

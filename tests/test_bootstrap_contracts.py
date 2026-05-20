@@ -3,7 +3,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONTROLLER_PATH = ROOT / "controller.py"
+CONTROLLER_PATH = ROOT / "racelink" / "controller.py"
 API_PATH = ROOT / "racelink" / "web" / "api.py"
 STANDALONE_WEBAPP_PATH = ROOT / "racelink" / "integrations" / "standalone" / "webapp.py"
 

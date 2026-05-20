@@ -11,8 +11,8 @@ from flask import Flask
 from ...app import RaceLinkApp, create_runtime
 from ...core import HostApi, HostEventBus, HostOptionStore, HostUiNotifier, NullSink, NullSource
 from ...domain import RL_DeviceGroup
+from ...controller import RaceLink_Host
 from ...web import RaceLinkWebRuntime, register_racelink_web
-from controller import RaceLink_Host
 from .config import StandaloneConfig, StandaloneOptionStore
 
 logger = logging.getLogger(__name__)

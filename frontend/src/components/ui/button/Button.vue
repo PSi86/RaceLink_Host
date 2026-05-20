@@ -18,9 +18,35 @@ const buttonVariants = cva(
       variant: {
         default: 'bg-primary text-primary-foreground hover:bg-primary/90',
         secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
-        destructive: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
+        // ``destructive`` is the pink-outline mirror of ``brand`` —
+        // same outline + tinted-fill structure but in brand pink.
+        // Used on Delete buttons and the confirm CTA of destructive
+        // confirm dialogs. Previously this slot held a solid red
+        // ``bg-destructive`` fill; the outline form fits the new
+        // outline-language of brand/run without giving up the
+        // danger-signal of pink.
+        destructive:
+          'border border-brand-pink/55 bg-brand-pink/10 text-brand-pink font-display tracking-wide ' +
+          'hover:bg-brand-pink/20 hover:border-brand-pink/85',
         ghost: 'hover:bg-secondary hover:text-secondary-foreground',
         outline: 'border border-border bg-background hover:bg-secondary hover:text-secondary-foreground',
+        // ``brand`` mirrors the .btn-brand utility class used on the
+        // AppHeader's Save button: a quiet cyan-outline CTA that reads
+        // as the primary action of a dialog without shouting. The
+        // brand cyan stays neon here because it sits as text/border on
+        // a near-transparent fill, not as a saturated background.
+        brand:
+          'border border-brand-cyan/45 bg-brand-cyan/10 text-brand-cyan font-display tracking-wide ' +
+          'hover:bg-brand-cyan/20 hover:border-brand-cyan/70',
+        // ``run`` is the louder sibling of ``brand`` — for buttons
+        // that *execute* an action (Start, Re-sync, Send, Start
+        // update) rather than commit state. Cyan border keeps it
+        // visually separate from destructive (pink) while the bumped
+        // pink→cyan gradient fill (--gradient-run) gives the punchy
+        // action-button feel.
+        run:
+          'btn-run-bg border border-brand-cyan/55 text-foreground font-display tracking-wide ' +
+          'hover:border-brand-cyan/85',
       },
       size: {
         default: 'h-9 px-4 py-2',

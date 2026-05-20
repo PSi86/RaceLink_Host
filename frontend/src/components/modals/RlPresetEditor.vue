@@ -223,14 +223,14 @@ async function onDelete() {
         Unsaved changes.
       </span>
       <template v-if="isExisting">
-        <Button type="button" variant="ghost" :disabled="submitting" @click="onDelete">
+        <Button type="button" variant="destructive" :disabled="submitting" @click="onDelete">
           Delete
         </Button>
         <Button type="button" variant="secondary" :disabled="submitting" @click="onDuplicate">
           Duplicate
         </Button>
       </template>
-      <Button type="submit" :disabled="submitting">{{ submitLabel }}</Button>
+      <Button variant="brand" type="submit" :disabled="submitting">{{ submitLabel }}</Button>
     </div>
   </form>
 </template>

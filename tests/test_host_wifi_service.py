@@ -30,6 +30,26 @@ def _err(stderr: str, returncode: int = 1) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["nmcli"], returncode=returncode, stdout="", stderr=stderr)
 
 
+def _aps_scan(ssids, *, in_use_index: int = -1, bssids=None) -> subprocess.CompletedProcess:
+    """Build a ``nmcli -t -f IN-USE,BSSID,SSID dev wifi list`` response.
+
+    One synthesised AP per SSID (BSSID auto-generated unless supplied
+    via ``bssids``). The terse format escapes literal colons inside
+    BSSIDs as ``\\:`` — mirrored here so the parser is exercised on
+    realistic input.
+    """
+    lines = []
+    for i, ssid in enumerate(ssids):
+        if bssids is not None and i < len(bssids):
+            raw = bssids[i]
+        else:
+            raw = f"AA:BB:CC:DD:EE:{i:02X}"
+        escaped = raw.replace(":", "\\:")
+        marker = "*" if i == in_use_index else " "
+        lines.append(f"{marker}:{escaped}:{ssid}")
+    return _ok("\n".join(lines) + ("\n" if lines else ""))
+
+
 class _Recorder:
     """Stub for ``HostWifiService.nmcli_run`` that scripts deterministic
     responses by argv prefix and records every invocation.
@@ -69,8 +89,8 @@ class ConnectApTests(unittest.TestCase):
         # actually visible — the new name isn't broadcast in this case.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("Other-AP\nWLED-AP\nlab-wifi\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["Other-AP", "WLED-AP", "lab-wifi"]),
         )
         matched = self.svc.connect_ap(
             ["WLED_RaceLink_AP", "WLED-AP"],
@@ -96,8 +116,8 @@ class ConnectApTests(unittest.TestCase):
         # operators with mixed fleets see the new name preferred.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED-AP\nWLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED-AP", "WLED_RaceLink_AP"]),
         )
         matched = self.svc.connect_ap(
             ["WLED_RaceLink_AP", "WLED-AP"],
@@ -108,17 +128,23 @@ class ConnectApTests(unittest.TestCase):
 
     def test_passes_bssid_when_supplied(self):
         self._ready_iface()
+        # When ``bssid`` is supplied, the cascade requires that BSSID
+        # to actually appear in the scan — otherwise the workflow
+        # keeps spinning. Synthesise an AP whose BSSID matches the
+        # hint so we exercise the (1) primary path.
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"], bssids=["AA:BB:CC:DD:EE:FF"]),
         )
         self.svc.connect_ap(
             ["WLED_RaceLink_AP"], "wled1234",
             iface="wlan0", bssid="aa:bb:cc:dd:ee:ff",
         )
-        connect_argv = [c for c in self.recorder.calls if "connect" in c][0]
+        connect_argv = [c for c in self.recorder.calls if "--wait" in c][0]
         self.assertIn("bssid", connect_argv)
-        self.assertIn("aa:bb:cc:dd:ee:ff", connect_argv)
+        # The cascade normalises to upper-case so the nmcli argv
+        # carries the upper-case form regardless of operator input.
+        self.assertIn("AA:BB:CC:DD:EE:FF", connect_argv)
 
     def test_empty_ssid_list_raises(self):
         with self.assertRaises(RuntimeError) as cm:
@@ -141,8 +167,8 @@ class ConnectApTests(unittest.TestCase):
         # either signal fires here first.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"]),
         )
         self.recorder.script(
             ("--wait",),  # the actual connect command
@@ -172,8 +198,8 @@ class ConnectApTests(unittest.TestCase):
 
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"]),
         )
         self.recorder.script(
             ("--wait",),  # the actual connect command
@@ -279,8 +305,8 @@ class PreDeleteProfileTests(unittest.TestCase):
         # with the key-mgmt error, even though the password is correct.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"]),
         )
         self.svc.connect_ap(
             ["WLED_RaceLink_AP"], "wled1234",
@@ -305,8 +331,8 @@ class PreDeleteProfileTests(unittest.TestCase):
         # OTA would always fail.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"]),
         )
         self.recorder.script(
             ("con", "delete"),
@@ -326,8 +352,8 @@ class PreDeleteProfileTests(unittest.TestCase):
         # return the matched SSID without raising.
         self._ready_iface()
         self.recorder.script(
-            ("-t", "-f", "SSID", "dev", "wifi", "list"),
-            _ok("WLED_RaceLink_AP\n"),
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"]),
         )
         # First OTA: con delete returns "unknown connection" (no
         # profile yet); connect succeeds.
@@ -377,8 +403,12 @@ class OpenApFallbackTests(unittest.TestCase):
         # responses for the PSK and open-AP connect attempts.
         if a[:5] == ["-t", "-f", "DEVICE,TYPE,STATE", "dev", "status"]:
             return _ok("wlan0:wifi:connected\n")
-        if a[:4] == ["-t", "-f", "SSID", "dev"]:
-            return _ok("WLED_RaceLink_AP\n")
+        if a[:5] == ["-t", "-f", "DEVICE,STATE,CONNECTION", "dev"]:
+            # New pre-disconnect probe — pretend wlan0 is idle so the
+            # cleanup branch is a no-op for these fallback tests.
+            return _ok("wlan0:disconnected:\n")
+        if a[:4] == ["-t", "-f", "IN-USE,BSSID,SSID", "dev"]:
+            return _aps_scan(["WLED_RaceLink_AP"])
         if "connect" in a and "wifi" in a:
             if "password" in a:
                 return self._connect_with_psk_response
@@ -494,6 +524,402 @@ class DisconnectApTests(unittest.TestCase):
     def test_empty_ssid_is_noop(self):
         self.svc.disconnect_ap("")
         self.assertEqual(self.recorder.calls, [])
+
+
+class DisconnectIfaceFastTests(unittest.TestCase):
+    """Post-upload disconnect. Two contracts:
+
+    1. nmcli is invoked with the top-level ``-w 0`` flag so the call
+       returns immediately rather than blocking on the 802.11
+       deactivation handshake (the WLED device is rebooting and won't
+       complete it).
+    2. Failures are swallowed — this is a performance optimisation,
+       not load-bearing for OTA correctness.
+    """
+
+    def setUp(self):
+        self.svc = HostWifiService()
+        self.recorder = _Recorder()
+        self.svc.nmcli_run = self.recorder  # type: ignore[method-assign]
+
+    def test_invokes_nmcli_with_wait_zero(self):
+        self.svc.disconnect_iface_fast("wlan0")
+        self.assertEqual(len(self.recorder.calls), 1)
+        argv = self.recorder.calls[0]
+        # ``-w 0`` must precede the subcommand — nmcli requires top-
+        # level options before the OBJECT.
+        self.assertEqual(argv[:2], ["-w", "0"])
+        self.assertEqual(argv[2:5], ["dev", "disconnect", "wlan0"])
+
+    def test_empty_iface_is_noop(self):
+        self.svc.disconnect_iface_fast("")
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_swallows_nmcli_errors(self):
+        def raising_run(args, timeout_s=20.0):
+            raise RuntimeError("nmcli not available")
+
+        self.svc.nmcli_run = raising_run  # type: ignore[method-assign]
+        # Must NOT raise — best-effort post-upload cleanup.
+        self.svc.disconnect_iface_fast("wlan0")
+
+
+class ConnectApBssidCascadeTests(unittest.TestCase):
+    """Cascade in ``connect_ap``:
+
+    1. Predicted ``bssid`` (e.g. ESP32 default ``STA_MAC + 1``) wins if
+       it's in the scan.
+    2. Multi-device fallback: when ``avoid_bssid`` is set and exactly
+       one candidate-SSID AP visible has a different BSSID, use it.
+    3. Legacy: no hint, no avoid → first candidate, no BSSID lock.
+
+    Covers the neu 94.txt failure where the predicted BSSID didn't
+    match the device's actual SoftAP but only one alternative AP with
+    the candidate SSID was visible.
+    """
+
+    def setUp(self):
+        self.svc = HostWifiService()
+        self.recorder = _Recorder()
+        self.svc.nmcli_run = self.recorder  # type: ignore[method-assign]
+        # Iface always 'connected' so wait_iface_ready passes quickly.
+        self.recorder.script(
+            ("-t", "-f", "DEVICE,TYPE,STATE", "dev", "status"),
+            _ok("wlan0:wifi:connected\n"),
+        )
+        # The pre-disconnect probe (new dev=... snapshot) — reply
+        # "disconnected" so the SSID-scoped cleanup is a no-op.
+        self.recorder.script(
+            ("-t", "-f", "DEVICE,STATE,CONNECTION", "dev"),
+            _ok("wlan0:disconnected:\n"),
+        )
+
+    def _connect_argv(self):
+        for argv in self.recorder.calls:
+            if "--wait" in argv and "connect" in argv:
+                return argv
+        return None
+
+    def test_predicted_bssid_wins_when_present_in_scan(self):
+        # Both BSSIDs visible — the predicted one must be picked even
+        # though it isn't first in the scan order or strongest.
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(
+                ["WLED_RaceLink_AP", "WLED_RaceLink_AP"],
+                bssids=["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"],
+            ),
+        )
+        matched = self.svc.connect_ap(
+            ["WLED_RaceLink_AP"], "wled1234",
+            iface="wlan0",
+            bssid="AA:BB:CC:DD:EE:02",
+            avoid_bssid="AA:BB:CC:DD:EE:01",
+            timeout_s=2.0,
+        )
+        self.assertEqual(matched, "WLED_RaceLink_AP")
+        argv = self._connect_argv()
+        self.assertIn("bssid", argv)
+        self.assertIn("AA:BB:CC:DD:EE:02", argv)
+
+    def test_fallback_to_freshly_appeared_non_avoid_when_predicted_missing(self):
+        # neu 97.txt failure mode this addresses: NM keeps a previous
+        # device's AP in its scan cache for ~30 s after the device
+        # rebooted. If we used "any single non-avoid" as the fallback
+        # we'd pick that stale entry over the still-not-yet-visible
+        # target. Contract: the fallback fires only when the target's
+        # BSSID is *freshly appeared* (= not in the initial scan).
+        #
+        # State machine: first call (= initial snapshot at connect_ap
+        # start) sees only the avoid'd BSSID. Subsequent calls see
+        # avoid + target — the target is therefore "fresh" and gets
+        # picked by cascade (2).
+        call_count = [0]
+
+        def staged_aps(iface):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Initial snapshot: only the previous device's BSSID
+                # is in the scan cache.
+                return [
+                    {"in_use": False, "bssid": "AA:BB:CC:DD:EE:01",
+                     "ssid": "WLED_RaceLink_AP"},
+                ]
+            # Loop iterations: the target device has come up.
+            return [
+                {"in_use": False, "bssid": "AA:BB:CC:DD:EE:01",
+                 "ssid": "WLED_RaceLink_AP"},
+                {"in_use": False, "bssid": "AA:BB:CC:DD:EE:42",
+                 "ssid": "WLED_RaceLink_AP"},
+            ]
+
+        self.svc.list_aps_detailed = staged_aps  # type: ignore[method-assign]
+        matched = self.svc.connect_ap(
+            ["WLED_RaceLink_AP"], "wled1234",
+            iface="wlan0",
+            bssid="AA:BB:CC:DD:EE:99",          # predicted, never visible
+            avoid_bssid="AA:BB:CC:DD:EE:01",    # previous device
+            timeout_s=3.0,
+        )
+        self.assertEqual(matched, "WLED_RaceLink_AP")
+        argv = self._connect_argv()
+        self.assertIn("AA:BB:CC:DD:EE:42", argv)
+
+    def test_fallback_skips_stale_non_avoid_already_in_initial_scan(self):
+        # The exact failure path from neu 97.txt: predicted BSSID not
+        # visible, avoid is set, and the single non-avoid candidate
+        # was ALREADY in the scan cache when connect_ap started — so
+        # it's almost certainly a stale entry from an earlier device.
+        # Cascade (2) must NOT fire on that entry; the loop must time
+        # out instead of binding to a dead BSSID.
+        def static_aps(iface):
+            return [
+                {"in_use": False, "bssid": "AA:BB:CC:DD:EE:01",
+                 "ssid": "WLED_RaceLink_AP"},    # avoid (previous device)
+                {"in_use": False, "bssid": "AA:BB:CC:DD:EE:5B",
+                 "ssid": "WLED_RaceLink_AP"},    # stale entry from earlier device
+            ]
+
+        self.svc.list_aps_detailed = static_aps  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self.svc.connect_ap(
+                ["WLED_RaceLink_AP"], "wled1234",
+                iface="wlan0",
+                bssid="AA:BB:CC:DD:EE:99",
+                avoid_bssid="AA:BB:CC:DD:EE:01",
+                timeout_s=1.0,
+            )
+        self.assertIsNone(
+            self._connect_argv(),
+            "connect must not be invoked on stale BSSID that was already in initial scan",
+        )
+
+    def test_no_fallback_when_only_avoid_bssid_visible(self):
+        # Predicted missing, avoid is the only candidate AP visible —
+        # cascade (2) cannot disambiguate, must keep waiting and
+        # eventually time out. Pin: connect never invoked.
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(
+                ["WLED_RaceLink_AP"],
+                bssids=["AA:BB:CC:DD:EE:01"],
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            self.svc.connect_ap(
+                ["WLED_RaceLink_AP"], "wled1234",
+                iface="wlan0",
+                bssid="AA:BB:CC:DD:EE:99",
+                avoid_bssid="AA:BB:CC:DD:EE:01",
+                timeout_s=1.0,
+            )
+        self.assertIsNone(self._connect_argv(),
+                          "connect must not be invoked while only avoid BSSID visible")
+
+    def test_no_fallback_when_multiple_non_avoid_matches(self):
+        # Two non-avoid candidates — ambiguous. Cascade (2) requires
+        # exactly one for the fallback. Must keep waiting.
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(
+                ["WLED_RaceLink_AP"] * 3,
+                bssids=["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:42",
+                        "AA:BB:CC:DD:EE:43"],
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            self.svc.connect_ap(
+                ["WLED_RaceLink_AP"], "wled1234",
+                iface="wlan0",
+                bssid="AA:BB:CC:DD:EE:99",
+                avoid_bssid="AA:BB:CC:DD:EE:01",
+                timeout_s=1.0,
+            )
+        self.assertIsNone(self._connect_argv())
+
+    def test_no_avoid_means_no_fallback_on_first_device(self):
+        # First device of an OTA run: no avoid_bssid yet. If the
+        # predicted BSSID isn't visible, the workflow times out rather
+        # than guessing — the operator can override with wifi.bssid
+        # in the dialog. Pin that single-device runs never silently
+        # bind to the wrong AP.
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(
+                ["WLED_RaceLink_AP"],
+                bssids=["AA:BB:CC:DD:EE:42"],
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            self.svc.connect_ap(
+                ["WLED_RaceLink_AP"], "wled1234",
+                iface="wlan0",
+                bssid="AA:BB:CC:DD:EE:99",
+                avoid_bssid="",
+                timeout_s=1.0,
+            )
+        self.assertIsNone(self._connect_argv())
+
+
+class DisconnectIfaceFromSsidTests(unittest.TestCase):
+    """Pre-connect cleanup for the multi-device-OTA SSID-affinity bug.
+
+    See ``_disconnect_iface_from_ssid`` for the full failure-mode
+    context. The contract: only disconnect when ``iface`` is currently
+    active on ``ssid``; everything else is a no-op so the operator's
+    other WiFi is never collateral damage.
+    """
+
+    def setUp(self):
+        self.svc = HostWifiService()
+        self.recorder = _Recorder()
+        self.svc.nmcli_run = self.recorder  # type: ignore[method-assign]
+
+    def _set_dev_state(self, line: str) -> None:
+        self.recorder.script(
+            ("-t", "-f", "DEVICE,STATE,CONNECTION", "dev"),
+            _ok(line + "\n"),
+        )
+
+    def _disconnect_invocations(self) -> list:
+        return [argv for argv in self.recorder.calls
+                if argv[:2] == ["dev", "disconnect"]]
+
+    def test_disconnects_when_iface_is_active_on_same_ssid(self):
+        self._set_dev_state("wlan0:connected:WLED_RaceLink_AP")
+        self.svc._disconnect_iface_from_ssid("wlan0", "WLED_RaceLink_AP")
+        self.assertEqual(
+            self._disconnect_invocations(),
+            [["dev", "disconnect", "wlan0"]],
+        )
+
+    def test_noop_when_iface_is_on_different_ssid(self):
+        # Operator's regular WiFi must not be disconnected just because
+        # we're about to OTA — only same-SSID match triggers a drop.
+        self._set_dev_state("wlan0:connected:Home-WiFi")
+        self.svc._disconnect_iface_from_ssid("wlan0", "WLED_RaceLink_AP")
+        self.assertEqual(self._disconnect_invocations(), [])
+
+    def test_noop_when_iface_already_disconnected(self):
+        self._set_dev_state("wlan0:disconnected:")
+        self.svc._disconnect_iface_from_ssid("wlan0", "WLED_RaceLink_AP")
+        self.assertEqual(self._disconnect_invocations(), [])
+
+    def test_noop_when_state_query_fails(self):
+        def raising_run(args, timeout_s=20.0):
+            raise RuntimeError("nmcli not available")
+
+        self.svc.nmcli_run = raising_run  # type: ignore[method-assign]
+        # Must NOT raise — best-effort precondition.
+        self.svc._disconnect_iface_from_ssid("wlan0", "WLED_RaceLink_AP")
+
+    def test_empty_ssid_is_skipped(self):
+        self._set_dev_state("wlan0:connected:WLED_RaceLink_AP")
+        self.svc._disconnect_iface_from_ssid("wlan0", "")
+        self.assertEqual(self._disconnect_invocations(), [])
+
+
+class ListApsDetailedTests(unittest.TestCase):
+    """Structured scan parsing — the foundation under ``connect_ap``'s
+    cascade and ``active_bssid``. Critical detail: nmcli's ``-t`` terse
+    format escapes literal colons inside BSSIDs (``DC\\:B4\\:...``); the
+    parser must round-trip those correctly."""
+
+    def setUp(self):
+        self.svc = HostWifiService()
+        self.recorder = _Recorder()
+        self.svc.nmcli_run = self.recorder  # type: ignore[method-assign]
+
+    def test_parses_bssid_with_escaped_colons(self):
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["WLED_RaceLink_AP"], in_use_index=0,
+                      bssids=["DC:B4:D9:A8:A9:5B"]),
+        )
+        aps = self.svc.list_aps_detailed("wlan0")
+        self.assertEqual(len(aps), 1)
+        self.assertEqual(aps[0]["bssid"], "DC:B4:D9:A8:A9:5B")
+        self.assertEqual(aps[0]["ssid"], "WLED_RaceLink_AP")
+        self.assertTrue(aps[0]["in_use"])
+
+    def test_skips_hidden_aps_with_empty_bssid(self):
+        # Cloaked / hidden APs report empty BSSID — useless for
+        # BSSID-based targeting, must be filtered out.
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _ok(" ::Hidden-AP\n :AA\\:BB\\:CC\\:DD\\:EE\\:01:WLED_RaceLink_AP\n"),
+        )
+        aps = self.svc.list_aps_detailed("wlan0")
+        self.assertEqual([ap["ssid"] for ap in aps], ["WLED_RaceLink_AP"])
+
+    def test_returns_empty_on_nmcli_error(self):
+        def raising_run(args, timeout_s=20.0):
+            raise RuntimeError("nmcli not available")
+
+        self.svc.nmcli_run = raising_run  # type: ignore[method-assign]
+        self.assertEqual(self.svc.list_aps_detailed("wlan0"), [])
+
+    def test_active_bssid_returns_in_use_entry(self):
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["A", "B", "C"], in_use_index=1,
+                      bssids=["11:22:33:44:55:01",
+                              "11:22:33:44:55:02",
+                              "11:22:33:44:55:03"]),
+        )
+        self.assertEqual(self.svc.active_bssid("wlan0"), "11:22:33:44:55:02")
+
+    def test_active_bssid_returns_empty_when_no_in_use(self):
+        self.recorder.script(
+            ("-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"),
+            _aps_scan(["A"], in_use_index=-1),
+        )
+        self.assertEqual(self.svc.active_bssid("wlan0"), "")
+
+
+class WifiStateSnapshotTests(unittest.TestCase):
+    """Diagnostic helper used by ``connect_ap`` for error-path logs.
+
+    The snapshot is best-effort: if nmcli itself misbehaves, the
+    caller's error line should still get logged with placeholder
+    state rather than masking the original connect failure.
+    """
+
+    def setUp(self):
+        self.svc = HostWifiService()
+        self.recorder = _Recorder()
+        self.svc.nmcli_run = self.recorder  # type: ignore[method-assign]
+
+    def test_snapshot_filters_aps_by_candidate_ssid(self):
+        self.recorder.script(
+            ("-t", "-f", "DEVICE,STATE,CONNECTION", "dev"),
+            _ok("wlan0:disconnected:\nlo:unmanaged:\n"),
+        )
+        self.recorder.script(
+            ("-f", "IN-USE,BSSID,SSID,SIGNAL,CHAN", "dev", "wifi", "list"),
+            _ok(
+                "IN-USE  BSSID              SSID              SIGNAL  CHAN\n"
+                "        AA:BB:CC:DD:EE:01  WLED_RaceLink_AP  80      6\n"
+                "        AA:BB:CC:DD:EE:02  Other-Net         55      11\n"
+            ),
+        )
+        snap = self.svc.wifi_state_snapshot("wlan0", ["WLED_RaceLink_AP", "WLED-AP"])
+        self.assertIn("wlan0:disconnected:", snap)
+        self.assertIn("WLED_RaceLink_AP", snap)
+        # Non-candidate AP is filtered out — keeps the log line short.
+        self.assertNotIn("Other-Net", snap)
+
+    def test_snapshot_survives_nmcli_failures(self):
+        # Both nmcli calls raise — the snapshot must still return a
+        # non-empty placeholder string so the caller's WARNING line
+        # doesn't carry an unexplained trailing pipe.
+        def raising_run(args, timeout_s=20.0):
+            raise RuntimeError("nmcli not available")
+
+        self.svc.nmcli_run = raising_run  # type: ignore[method-assign]
+        snap = self.svc.wifi_state_snapshot("wlan0", ["WLED_RaceLink_AP"])
+        self.assertIn("dev=<error", snap)
+        self.assertIn("aps=<error", snap)
 
 
 if __name__ == "__main__":

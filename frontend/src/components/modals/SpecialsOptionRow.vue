@@ -274,7 +274,7 @@ const inputsDisabled = computed(() => submitting.value !== 'idle')
         :disabled="inputsDisabled"
       />
 
-      <Button type="button" size="sm" :disabled="inputsDisabled" @click="onSave">
+      <Button variant="brand" type="button" size="sm" :disabled="inputsDisabled" @click="onSave">
         {{ submitting === 'save' ? 'Saving…' : 'Save' }}
       </Button>
     </div>

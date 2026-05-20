@@ -15,8 +15,8 @@ future tuning is one edit, not a grep-and-pray sweep.
 
 Used by:
 
-* :class:`GatewayService.send_and_wait_for_reply` (default
-  ``timeout_s``)
+* :class:`GatewayService.send_and_match` (default ``max_timeout_s``
+  via the matcher built per-call)
 * :class:`GatewayService.send_and_wait_with_retries` (per-attempt
   + retry policy for unicast paths)
 * :meth:`RL.setNodeGroupId` (controller.py) — SET_GROUP unicast

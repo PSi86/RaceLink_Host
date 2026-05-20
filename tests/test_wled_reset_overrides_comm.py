@@ -18,7 +18,7 @@ from tests._flask_stub import install_serial
 
 install_serial()
 
-from controller import RaceLink_Host  # noqa: E402  (after install_serial)
+from racelink.controller import RaceLink_Host  # noqa: E402  (after install_serial)
 from racelink.domain import RL_Device, RL_Dev_Type, build_specials_state, state_scope  # noqa: E402
 
 

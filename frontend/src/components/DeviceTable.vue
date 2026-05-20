@@ -51,6 +51,28 @@ const editingAddr = ref<string | null>(null)
 const editDraft = ref<string>('')
 const editSaving = ref(false)
 
+// In-flight indicate requests, keyed by device MAC. Used to debounce
+// repeated clicks on the same name so a second click within the
+// roundtrip doesn't pile up duplicate frames on the gateway queue.
+// (Endpoint + opcode are called "indicate"; the operator-facing verb
+// is "Locate" — "identify" is reserved for OPC_DEVICES RF discovery.)
+const indicating = ref<Set<string>>(new Set())
+
+async function onIndicate(addr: string, name: string) {
+  if (indicating.value.has(addr)) return
+  indicating.value.add(addr)
+  try {
+    const r = await apiPost('/api/devices/indicate', { macs: [addr] })
+    if (!r?.ok) {
+      toast.error(`Locate failed: ${r?.error || 'unknown'}`)
+      return
+    }
+    toast.show(`Locating ${name || addr}…`)
+  } finally {
+    indicating.value.delete(addr)
+  }
+}
+
 function startEditName(addr: string, currentName: string) {
   editingAddr.value = addr
   editDraft.value = currentName ?? ''
@@ -313,7 +335,11 @@ function onRowSelect(addr: string, ev: Event) {
             @blur="commitEditName(row.original.addr, row.original.name ?? '')"
           />
           <div v-else class="flex items-center gap-1.5">
-            <span class="truncate">{{ row.original.name ?? '' }}</span>
+            <span
+              class="truncate cursor-pointer hover:text-accent hover:underline"
+              :title="`Click to locate '${row.original.name || row.original.addr}' — flashes its LEDs ~5 s`"
+              @click.stop="onIndicate(row.original.addr, row.original.name ?? '')"
+            >{{ row.original.name ?? '' }}</span>
             <button
               type="button"
               class="invisible flex-none cursor-pointer rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground hover:text-accent group-hover:visible"

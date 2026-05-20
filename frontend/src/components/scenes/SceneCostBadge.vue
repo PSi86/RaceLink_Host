@@ -37,20 +37,25 @@ const display = computed(() => {
 </script>
 
 <template>
+  <!-- Always render the outer chip so it reserves vertical space even
+       before the first estimate arrives — otherwise the row jumps as
+       soon as ``loadCost`` resolves. ``invisible`` hides the placeholder
+       contents while keeping the slot. -->
   <span
-    v-if="display"
     :class="[
       'inline-flex items-center gap-1 rounded border border-border bg-card/40 px-2 py-0.5 tabular-nums',
       total ? 'text-xs' : 'text-[10px]',
+      !display && 'invisible',
     ]"
-    :title="`Projected wire cost (LoRa airtime, ignores network jitter)`"
+    :title="display ? `Projected wire cost (LoRa airtime, ignores network jitter)` : undefined"
+    :aria-hidden="display ? undefined : 'true'"
   >
     <span v-if="total" class="font-semibold text-muted-foreground">Total:</span>
-    <span>{{ display.packets }}p</span>
+    <span>{{ display ? display.packets : '—' }}p</span>
     <span class="text-muted-foreground">·</span>
-    <span>{{ display.bytes }}B</span>
+    <span>{{ display ? display.bytes : '—' }}B</span>
     <span class="text-muted-foreground">·</span>
-    <span>{{ display.airtime_ms }}ms</span>
+    <span>{{ display ? display.airtime_ms : '—' }}ms</span>
     <template v-if="typeof actualMs === 'number' && Number.isFinite(actualMs)">
       <span class="text-muted-foreground">·</span>
       <span class="font-semibold text-accent">actual: {{ fmt(actualMs) }}ms</span>

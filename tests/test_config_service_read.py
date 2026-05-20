@@ -13,6 +13,7 @@ import unittest
 
 from racelink.domain import RL_Device, RL_Dev_Type
 from racelink.services.config_service import ConfigService
+from racelink.transport import LP
 
 
 class _FakeTransport:
@@ -34,15 +35,26 @@ class _FakeGatewayService:
         self._replies = list(replies or [])
         self.send_calls: list[dict] = []
 
-    def send_and_wait_for_reply(self, recv3, opcode7, send_fn, *, timeout_s=None, discriminator=None):
+    def send_and_match(self, send_fn, matcher):
+        """Phase-2 path: record the matcher's filters for assertions, run
+        send_fn, and replay queued replies through ``matcher.matches`` so the
+        discriminator filter and structured fields are exercised end-to-end."""
+        # Surface the filters the caller built so existing tests can keep
+        # asserting "discriminator was forwarded as 0x05" etc.
         self.send_calls.append({
-            "recv3": bytes(recv3),
-            "opcode7": int(opcode7),
-            "timeout_s": timeout_s,
-            "discriminator": discriminator,
+            "sender_filter": matcher.sender_filter,
+            "expected_opcode": matcher.expected_opcode,
+            "expected_ack_of": matcher.expected_ack_of,
+            "discriminator": matcher.discriminator_value,
+            "max_timeout_s": matcher.max_timeout_s,
         })
         send_fn()
-        return list(self._replies), bool(self._replies)
+        for ev in self._replies:
+            if matcher.matches(ev):
+                matcher.collected.append(ev)
+                if len(matcher.collected) >= matcher.expected_count:
+                    break
+        return list(matcher.collected), "count" if matcher.collected else "no_reply"
 
 
 def _make_dev(addr: str = "AABBCCDDEEFF"):
@@ -52,6 +64,8 @@ def _make_dev(addr: str = "AABBCCDDEEFF"):
 class ReadConfigTests(unittest.TestCase):
     def test_returns_parsed_tuple_on_success(self):
         replies = [{
+            "opc": int(LP.OPC_GET_CONFIG),
+            "sender3": bytes.fromhex("DDEEFF"),
             "reply": "GET_CONFIG_REPLY",
             "option": 0x05,
             "data0": 60,

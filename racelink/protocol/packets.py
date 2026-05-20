@@ -27,6 +27,20 @@ def build_preset_body(group_id: int, flags: int, preset_id: int, brightness: int
     )
 
 
+def build_indicate_body(indicator_type: int, duration_sec: int) -> bytes:
+    """Serialize a fixed-length OPC_INDICATE body (2 B).
+
+    Matches ``P_Indicate`` in ``racelink_proto.h``: { type, durationSec }.
+    ``duration_sec == 0`` is a cancel signal on the receiver (clears any
+    active indicator without showing a new one).
+    """
+    return struct.pack(
+        "<BB",
+        int(indicator_type) & 0xFF,
+        int(duration_sec) & 0xFF,
+    )
+
+
 def build_config_body(option: int = 0, data0: int = 0, data1: int = 0, data2: int = 0, data3: int = 0) -> bytes:
     return struct.pack("<BBBBB", int(option) & 0xFF, int(data0) & 0xFF, int(data1) & 0xFF, int(data2) & 0xFF, int(data3) & 0xFF)
 

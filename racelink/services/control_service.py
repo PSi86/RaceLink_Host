@@ -134,6 +134,35 @@ class ControlService:
                 brightness_present=brightness_present,
             )
 
+    def send_device_indicate(self, target_device, indicator_type: int, duration_sec: int) -> bool:
+        """Send OPC_INDICATE to a single node (receiver = last3 of target_device.addr).
+
+        Returns ``True`` if a frame was queued for the gateway, ``False`` if
+        the transport is not ready. No local state is updated: the indicator
+        is a transient visual overlay on the device, and the device restores
+        its pre-indicator state when ``duration_sec`` expires via the
+        snapshot logic in ``racelink_wled.cpp``.
+        """
+        transport = self._require_transport("sendDeviceIndicate")
+        if transport is None:
+            return False
+
+        recv3 = mac_last3_from_hex(target_device.addr)
+        type_b = int(indicator_type) & 0xFF
+        dur_b = int(duration_sec) & 0xFF
+        transport.send_indicate(
+            recv3=recv3,
+            indicator_type=type_b,
+            duration_sec=dur_b,
+        )
+        logger.debug(
+            "RL: Indicate device %s: type=%d duration=%ds",
+            target_device.addr,
+            type_b,
+            dur_b,
+        )
+        return True
+
     def send_device_preset(self, target_device, flags=None, preset_id=None, brightness=None) -> bool:
         """Send OPC_PRESET to a single node (receiver = last3 of targetDevice.addr).
 

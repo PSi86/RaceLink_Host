@@ -115,11 +115,11 @@ def _entry_points_text() -> str:
 
 
 def _top_level_text() -> str:
-    return "controller\nracelink\n"
+    return "racelink\n"
 
 
 def _iter_sources() -> list[tuple[Path, str]]:
-    sources = [(ROOT / "controller.py", "controller.py")]
+    sources: list[tuple[Path, str]] = []
     sources.extend((path, path.relative_to(ROOT).as_posix()) for path in sorted((ROOT / "racelink").rglob("*.py")))
     sources.extend(_package_data_sources())
     return sources

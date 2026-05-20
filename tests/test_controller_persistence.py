@@ -6,7 +6,7 @@ import json
 import unittest
 from typing import Any
 
-from controller import RaceLink_Host
+from racelink.controller import RaceLink_Host
 from racelink.domain import RL_Device, RL_DeviceGroup, state_scope
 
 

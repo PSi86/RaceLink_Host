@@ -5,70 +5,37 @@ import threading
 import time
 from typing import Optional, Union
 
-try:
-    from racelink.core import HostApi
-    from racelink.domain import (
-        RL_Device,
-        RL_DeviceGroup,
-        RL_FLAG_HAS_BRI,
-        RL_FLAG_POWER_ON,
-        build_specials_state,
-        create_device,
-        state_scope,
-    )
-    from racelink.services import (
-        ConfigService,
-        ControlService,
-        DiscoveryService,
-        GatewayService,
-        StartblockService,
-        StatusService,
-        StreamService,
-        SyncService,
-    )
-    from racelink.state import get_runtime_state_repository
-    from racelink.state.migrations import migrate_state
-    from racelink.state.persistence import (
-        CURRENT_SCHEMA_VERSION,
-        dump_records,
-        dump_state,
-        load_records,
-        load_state,
-        try_parse_legacy_repr,
-    )
-    from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
-except ImportError:  # pragma: no cover - compatibility path for package-style plugin loading
-    from .racelink.core import HostApi
-    from .racelink.domain import (
-        RL_Device,
-        RL_DeviceGroup,
-        RL_FLAG_HAS_BRI,
-        RL_FLAG_POWER_ON,
-        build_specials_state,
-        create_device,
-        state_scope,
-    )
-    from .racelink.services import (
-        ConfigService,
-        ControlService,
-        DiscoveryService,
-        GatewayService,
-        StartblockService,
-        StatusService,
-        StreamService,
-        SyncService,
-    )
-    from .racelink.state import get_runtime_state_repository
-    from .racelink.state.migrations import migrate_state
-    from .racelink.state.persistence import (
-        CURRENT_SCHEMA_VERSION,
-        dump_records,
-        dump_state,
-        load_records,
-        load_state,
-        try_parse_legacy_repr,
-    )
-    from .racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
+from racelink.core import HostApi
+from racelink.domain import (
+    RL_Device,
+    RL_DeviceGroup,
+    RL_FLAG_HAS_BRI,
+    RL_FLAG_POWER_ON,
+    build_specials_state,
+    create_device,
+    state_scope,
+)
+from racelink.services import (
+    ConfigService,
+    ControlService,
+    DiscoveryService,
+    GatewayService,
+    StartblockService,
+    StatusService,
+    StreamService,
+    SyncService,
+)
+from racelink.state import get_runtime_state_repository
+from racelink.state.migrations import migrate_state
+from racelink.state.persistence import (
+    CURRENT_SCHEMA_VERSION,
+    dump_records,
+    dump_state,
+    load_records,
+    load_state,
+    try_parse_legacy_repr,
+)
+from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +48,15 @@ GW_ERR_PORT_BUSY = "PORT_BUSY"   # port exists but held by another process
 GW_ERR_LINK_LOST = "LINK_LOST"   # transport disconnected after being ready
 GW_ERR_HOST_ERROR = "HOST_ERROR"  # catch-all (unexpected local failure)
 
-# Exp-backoff schedule (seconds) for automatic gateway retries. The last entry
+# Backoff schedule (seconds) for automatic gateway retries. The last entry
 # is clamped, i.e. any attempt >= len(schedule) uses the final value.
-_GATEWAY_RETRY_BACKOFF_S = (2.0, 5.0, 10.0, 20.0, 30.0)
+#
+# 2026-05-18 adjustment: shorten the early probes so a USB unplug+replug
+# within the first few seconds is detected quickly (operator-perceived
+# "I plugged it back in, why is the host still waiting?" gap). 
+# 6×5 s mid-cadence → 10 s steady state forever. With
+# attempt-index clamping the resulting cadence is 5,5,5,5,5,5,10,10,10,…
+_GATEWAY_RETRY_BACKOFF_S = (5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 10.0)
 
 
 def classify_gateway_error(reason: str, *, fallback: str = GW_ERR_HOST_ERROR) -> str:
@@ -178,6 +151,12 @@ class RaceLink_Host:
         # a manual retry.
         self._gateway_retry_timer: Optional[threading.Timer] = None
         self._gateway_retry_attempt: int = 0
+        # Absolute wallclock (ms-since-epoch) when the pending retry timer
+        # will fire. Used by gateway_status() to compute live
+        # ``next_retry_in_s`` so the frontend banner countdown reflects the
+        # actual remaining time, not a stale snapshot taken at error-record
+        # time. ``None`` whenever no retry is pending.
+        self._gateway_retry_fires_at_ms: Optional[int] = None
         # Startup-grace: the first discoverPort() runs before the user is even
         # able to click anything. Marking it as ``auto`` suppresses the RH
         # UI ERROR-alert path; subsequent auto-retries stay in the same mode.
@@ -570,6 +549,22 @@ class RaceLink_Host:
                 self._link_recovery_pending = False
                 self._clear_gateway_error()
                 self._install_transport_hooks()
+                # Notify subscribers (e.g. SSEBridge) that the
+                # transport instance was just (re)bound. The SSE
+                # bridge's transport-event hook is gated by a
+                # one-time-install flag; without this callback,
+                # post-reconnect events from the fresh transport
+                # never reach the ``refresh`` SSE broadcast and the
+                # WebUI stops animating unsolicited IDENTIFY_REPLYs.
+                on_rebind = getattr(self, "on_transport_rebind", None)
+                if callable(on_rebind):
+                    try:
+                        on_rebind(self)
+                    except Exception:
+                        logger.debug(
+                            "on_transport_rebind callback raised",
+                            exc_info=True,
+                        )
                 used = self.transport.port or "unknown"
                 mac = getattr(self.transport, "ident_mac", None)
                 if mac:
@@ -635,13 +630,18 @@ class RaceLink_Host:
             idx = min(self._gateway_retry_attempt, len(_GATEWAY_RETRY_BACKOFF_S) - 1)
             next_retry_in_s = _GATEWAY_RETRY_BACKOFF_S[idx]
 
+        # ``next_retry_in_s`` is intentionally NOT stored on the error dict
+        # — gateway_status() recomputes it live from the active retry
+        # timer's fire-time. Snapshotting it here would let the frontend
+        # countdown drift past the actual schedule (e.g. when a transport
+        # error retriggers _record_gateway_error after the timer already
+        # advanced the backoff index).
         self.last_gateway_error = {
             "ts": time.time(),
             "reason": str(reason),
             "origin": origin,
             "code": resolved_code,
             "failure_count": int(self._gateway_failure_count),
-            "next_retry_in_s": next_retry_in_s,
         }
 
         # Only manual retries escalate to ERROR -- automatic / startup probes
@@ -696,11 +696,13 @@ class RaceLink_Host:
         timer.daemon = True
         timer.name = "rl-gateway-retry"  # A8: name daemon threads
         self._gateway_retry_timer = timer
+        self._gateway_retry_fires_at_ms = int((time.time() + float(delay_s)) * 1000)
         timer.start()
 
     def _cancel_gateway_retry(self) -> None:
         timer = self._gateway_retry_timer
         self._gateway_retry_timer = None
+        self._gateway_retry_fires_at_ms = None
         if timer is None:
             return
         try:
@@ -718,10 +720,25 @@ class RaceLink_Host:
             logger.exception("RaceLink: on_gateway_status_changed callback failed")
 
     def gateway_status(self) -> dict:
-        """Return a JSON-serialisable gateway-readiness snapshot (plan P1-1)."""
+        """Return a JSON-serialisable gateway-readiness snapshot (plan P1-1).
+
+        ``last_error.next_retry_in_s`` is computed live from the active
+        retry timer's fire-time at each call, so an SSE ``gateway``
+        broadcast (which serialises ``gateway_status()``) always carries
+        the actual remaining countdown — never a stale snapshot.
+        """
+        last_error: Optional[dict] = None
+        if self.last_gateway_error is not None:
+            last_error = dict(self.last_gateway_error)
+            fires_at = self._gateway_retry_fires_at_ms
+            if fires_at is not None:
+                remaining_ms = max(0, fires_at - int(time.time() * 1000))
+                last_error["next_retry_in_s"] = round(remaining_ms / 1000.0, 3)
+            else:
+                last_error["next_retry_in_s"] = None
         return {
             "ready": bool(self.ready),
-            "last_error": dict(self.last_gateway_error) if self.last_gateway_error else None,
+            "last_error": last_error,
             "failure_count": int(self._gateway_failure_count),
             "retry_attempt": int(self._gateway_retry_attempt),
         }

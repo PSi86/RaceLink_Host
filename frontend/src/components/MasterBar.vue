@@ -18,7 +18,14 @@ const MASTER_STATE_HELP: Record<string, string> = {
     'Error — the gateway reported a fault. May be transient (USB hiccup) or persistent (link lost); check ``last_error`` for the cause and the gateway banner for retry status.',
 }
 
-const stateName = computed<string>(() => String(gateway.master.state || 'UNKNOWN'))
+// When the gateway link is down (banner is visible), master.state is stuck on
+// its last firmware-reported value (typically IDLE) because no further
+// EV_STATE_CHANGED arrives over the dead USB link. Surface the link-lost as
+// ERROR here so the pill matches what the banner is already saying.
+const stateName = computed<string>(() => {
+  if (!gateway.gateway.ready) return 'ERROR'
+  return String(gateway.master.state || 'UNKNOWN')
+})
 const pillLabel = computed(() => (stateName.value === 'RX_WINDOW' ? 'RX-WIN' : stateName.value))
 // Per-state pill colour palette. Each return value is a Tailwind utility
 // string carrying the text / border / background colours; the base shape
@@ -81,7 +88,12 @@ const taskDetail = computed(() => {
   const dur = t.started_ts && t.ended_ts ? Math.max(0, t.ended_ts - t.started_ts) : null
   const tail = dur !== null ? `(${dur.toFixed(1)}s)` : ''
   const err = t.last_error ? `err: ${t.last_error}` : ''
-  const res = t.result ? JSON.stringify(t.result) : ''
+  // Backends that produce a structured per-device result (e.g. the FW
+  // update workflow's 10-device run-down) set ``result.summary`` to a
+  // single-line outcome so the status pill stays scannable. Fall back
+  // to the full JSON for tasks that don't supply one.
+  const summary = typeof t.result?.summary === 'string' ? t.result.summary : ''
+  const res = summary || (t.result ? JSON.stringify(t.result) : '')
   return [`${t.name} ${t.state}`, tail, err || res].filter(Boolean).join(' · ')
 })
 

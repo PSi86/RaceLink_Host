@@ -176,6 +176,25 @@ class SSEBridge:
             for q in dead:
                 self._clients.discard(q)
 
+    def rebind_transport(self, rl_instance) -> None:
+        """Drop the cached transport-hook state and re-install on the
+        current ``rl_instance.transport``.
+
+        Called by the controller after every successful gateway
+        (re)connect so events from a freshly-opened transport reach
+        the SSE broadcast pipeline. Without this, ``ensure_transport_hooked``
+        would short-circuit on its ``_hooked_transport["ok"]`` guard
+        and leave the SSE-mux pointing at the closed pre-reconnect
+        transport — unsolicited events (e.g. a powered-on node's
+        ``IDENTIFY_REPLY``) would update the device repo but never
+        broadcast the ``refresh`` SSE event the WebUI needs to flash
+        the device row.
+        """
+        self._hooked_transport = {"ok": False}
+        self.ensure_transport_hooked(rl_instance)
+        if self._hooked_transport["ok"]:
+            self.log("RaceLink: SSE transport rebound on (re)connect")
+
     def ensure_transport_hooked(self, rl_instance):
         if self._hooked_transport["ok"]:
             return

@@ -284,46 +284,51 @@ function onAddAction() {
 
       <!-- Run pip strip + scene-total cost badge. Sits above the
            action bar so the post-run summary is visible while the
-           action buttons stay anchored at the bottom. -->
+           action buttons stay anchored at the bottom. The badge is
+           rendered unconditionally (the chip reserves its own slot
+           when no estimate is available yet) so the row keeps a
+           stable height across loading / loaded / error states — no
+           vertical layout shift when ``loadCost`` resolves. -->
       <div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">
         <SceneRunPipStrip />
-        <!-- ``ml-auto`` on whichever cost-status element is in the
-             DOM at a time pushes the figure to the right edge of the
-             row, matching the per-action cost badge in
-             ``SceneActionRow.vue`` (column with ``items-end``). -->
-        <SceneCostBadge
-          v-if="scenes.cost?.total"
-          class="ml-auto"
-          :cost="scenes.cost.total"
-          :actual-ms="totalActualMs"
-          total
-        />
-        <!-- ``costError`` may overlap the badge: the store keeps the
-             previous figures on validation failure so the operator still
-             sees the last good estimate next to the new error. The
-             second ``ml-auto`` no-ops when the badge is also present
-             (gap shrinks to ``gap-3``). -->
-        <span v-if="scenes.costError" class="ml-auto text-xs text-destructive">
-          {{ scenes.costError }}
-        </span>
-        <span v-else-if="scenes.costLoading && !scenes.cost?.total" class="ml-auto text-xs text-muted-foreground">
-          Estimating…
-        </span>
+        <!-- Right-aligned cost group: keeps the loading hint / error
+             text and the badge as siblings so ``ml-auto`` lives on the
+             wrapper, not on whichever child happens to be in the DOM
+             this render. ``costError`` keeps the previous figures on
+             validation failure so the operator still sees the last
+             good estimate next to the new error; the badge slot stays
+             reserved either way. -->
+        <div class="ml-auto flex items-center gap-3">
+          <span v-if="scenes.costError" class="text-xs text-destructive">
+            {{ scenes.costError }}
+          </span>
+          <span
+            v-else-if="scenes.costLoading && !scenes.cost?.total"
+            class="text-xs text-muted-foreground"
+          >
+            Estimating…
+          </span>
+          <SceneCostBadge
+            :cost="scenes.cost?.total ?? null"
+            :actual-ms="totalActualMs"
+            total
+          />
+        </div>
       </div>
 
       <!-- Action bar -->
       <div class="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
         <span v-if="isDirty" class="mr-auto text-xs text-muted-foreground">Unsaved changes.</span>
         <template v-if="isExisting">
-          <Button type="button" variant="ghost" :disabled="submitting" @click="onDelete">Delete</Button>
+          <Button type="button" variant="destructive" :disabled="submitting" @click="onDelete">Delete</Button>
           <Button type="button" variant="secondary" :disabled="submitting" @click="onDuplicate">
             Duplicate
           </Button>
         </template>
-        <Button type="button" :disabled="submitting" @click="onSave">{{ submitLabel }}</Button>
+        <Button variant="brand" type="button" :disabled="submitting" @click="onSave">{{ submitLabel }}</Button>
         <Button
+          variant="run"
           type="button"
-          variant="default"
           :disabled="runDisabled"
           :title="runHint || 'Run the scene synchronously'"
           @click="onRun"

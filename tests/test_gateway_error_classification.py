@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from controller import (
+from racelink.controller import (
     GW_ERR_HOST_ERROR,
     GW_ERR_LINK_LOST,
     GW_ERR_NOT_FOUND,

@@ -253,6 +253,24 @@ def create_racelink_web_blueprint(
         # swallow-ok: not every host exposes the attribute; degrade to polling
         pass
 
+    # Re-install the SSE transport-event hook on every gateway (re)connect.
+    # ensure_transport_hooked() is one-time-gated; without this callback the
+    # bridge would stay attached to the closed pre-reconnect transport and
+    # post-reconnect events (e.g. an unsolicited IDENTIFY_REPLY from a
+    # freshly powered-on node) would never fan out to SSE clients — the
+    # WebUI's per-row flash animation would silently stop after the first
+    # disconnect/reconnect cycle.
+    try:
+        setattr(
+            runtime.rl_instance,
+            "on_transport_rebind",
+            sse.rebind_transport,
+        )
+    except Exception:
+        # swallow-ok: degraded behaviour is "SSE refresh broadcasts
+        # missing after a reconnect", not a crash.
+        pass
+
     ctx.sse = sse
     ctx.tasks = tasks
 

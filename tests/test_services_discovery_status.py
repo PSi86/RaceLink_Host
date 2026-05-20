@@ -39,24 +39,17 @@ class FakeGateway:
                     break
         return collected, self.got_closed
 
-    def send_and_collect(
-        self,
-        send_fn,
-        collect_pred,
-        *,
-        expected=None,
-        idle_timeout_s=0.6,
-        max_timeout_s=5.0,
-    ):
-        """Test shim -- prod collector uses idle/max timeouts + Condition."""
+    def send_and_match(self, send_fn, matcher):
+        """Test shim mirroring the prod send_and_match: replay events
+        through matcher.matches(), append to matcher.collected, exit early
+        on expected_count."""
         send_fn()
-        collected = []
         for ev in self.events:
-            if collect_pred(ev):
-                collected.append(ev)
-                if expected is not None and len(collected) >= int(expected):
+            if matcher.matches(ev):
+                matcher.collected.append(ev)
+                if len(matcher.collected) >= matcher.expected_count:
                     break
-        return collected
+        return list(matcher.collected), "count" if matcher.collected else "no_reply"
 
     @staticmethod
     def compute_collect_max_timeout(expected, *, base_s=1.0, per_device_s=0.15, ceiling_s=5.0):

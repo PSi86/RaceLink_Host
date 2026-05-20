@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from controller import RaceLink_Host
+from racelink.controller import RaceLink_Host
 
 
 class _Ui:
@@ -76,7 +76,7 @@ class GatewayStatusTests(unittest.TestCase):
         RotorHazard log-to-UI alert bridge does not fire for lifecycle noise."""
         host = _fresh_host()
 
-        with self.assertLogs("controller", level="WARNING") as captured:
+        with self.assertLogs("racelink.controller", level="WARNING") as captured:
             host._record_gateway_error(reason="r1", origin="programmatic")
             host._record_gateway_error(reason="r2", origin="auto")
             host._record_gateway_error(reason="r3", origin="programmatic")
@@ -90,7 +90,7 @@ class GatewayStatusTests(unittest.TestCase):
         """Only user-initiated retries escalate, so manual failures are loud."""
         host = _fresh_host()
 
-        with self.assertLogs("controller", level="WARNING") as captured:
+        with self.assertLogs("racelink.controller", level="WARNING") as captured:
             host._record_gateway_error(reason="port busy", origin="manual")
 
         self.assertEqual(captured.records[0].levelname, "ERROR")

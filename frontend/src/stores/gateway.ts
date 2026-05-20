@@ -44,6 +44,43 @@ export const useGatewayStore = defineStore('gateway', () => {
 
   const busy = computed(() => task.value.state === 'running')
 
+  // Per-task-name busy selectors used by the long-running dialog
+  // lockdowns (firmware update, presets download, discover). The
+  // dialogs read these to gate their close-control + browser-
+  // navigation guards. Inline ``task.value.name`` checks would be just
+  // as fine, but the named computeds keep the call-sites obviously
+  // intentional.
+  const fwBusy = computed(
+    () => task.value.name === 'fwupdate' && task.value.state === 'running',
+  )
+  const presetsBusy = computed(
+    () => task.value.name === 'presets_download' && task.value.state === 'running',
+  )
+  const discoverBusy = computed(
+    () => task.value.name === 'discover' && task.value.state === 'running',
+  )
+
+  /** Cooperative cancel: ask the server to wind down the current task.
+   *  Returns ``true`` if a running task was signalled, ``false`` if no
+   *  task was running. Optimistically marks ``cancel_requested`` so the
+   *  dialog flips to its "Cancelling…" state without waiting for the
+   *  next SSE update. */
+  async function cancelTask(): Promise<boolean> {
+    const res = (await apiPost('/api/task/cancel', {})) as {
+      ok?: boolean
+      task?: TaskSnapshot
+    }
+    if (res?.ok && res.task) {
+      applyTask(res.task)
+      return true
+    }
+    if (task.value.state === 'running') {
+      // Optimistic: server didn't echo the snapshot back, but we asked.
+      task.value = { ...task.value, cancel_requested: true }
+    }
+    return Boolean(res?.ok)
+  }
+
   function applyMaster(snapshot: Partial<MasterSnapshot> | null | undefined) {
     if (!snapshot) return
     master.value = { ...master.value, ...snapshot }
@@ -64,7 +101,16 @@ export const useGatewayStore = defineStore('gateway', () => {
 
   function applyGateway(status: GatewayStatus | null | undefined) {
     if (!status) return
+    const wasReady = gateway.value.ready
     gateway.value = { ...DEFAULT_GATEWAY, ...status }
+    // Optimistic recovery clear: when the USB link comes back, the stale
+    // master.last_error from the disconnect is no longer relevant. The
+    // backend will overwrite this once a STATE_CHANGED / TASK_*_DONE / reply
+    // arrives, but until then we don't want the err: line to keep echoing
+    // the old USB error string.
+    if (status.ready && !wasReady && master.value.last_error) {
+      master.value = { ...master.value, last_error: null }
+    }
   }
 
   async function loadInitial(): Promise<void> {
@@ -100,11 +146,15 @@ export const useGatewayStore = defineStore('gateway', () => {
     task,
     gateway,
     busy,
+    fwBusy,
+    presetsBusy,
+    discoverBusy,
     applyMaster,
     applyTask,
     applyGateway,
     loadInitial,
     retryGateway,
     queryGatewayState,
+    cancelTask,
   }
 })

@@ -80,7 +80,7 @@ def create_runtime(
     if controller is None:
         runtime_controller_class = controller_class
         if runtime_controller_class is None:
-            from controller import RaceLink_Host as runtime_controller_class
+            from racelink.controller import RaceLink_Host as runtime_controller_class
 
         controller = runtime_controller_class(
             host_api,

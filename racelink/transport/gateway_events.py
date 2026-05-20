@@ -2,67 +2,28 @@
 
 from __future__ import annotations
 
+# ``LP`` is exposed as a module-alias for ``racelink_proto_auto``. Callers
+# read ``LP.OPC_INDICATE``, ``LP.DIR_M2N``, ``LP.make_type(...)`` etc.;
+# module-attribute access is syntactically identical to class-attribute
+# access, so the alias is a drop-in for the legacy hand-maintained ``LP``
+# class. Every wire-protocol constant + the ``make_type`` helper that
+# ships in the auto-mirror is automatically visible — adding a new opcode
+# requires only the ``gen_racelink_proto_py.py`` regen, no Python-side
+# edit here.
+#
+# Historical note: this used to be a hand-typed class with explicit
+# ``OPC_*`` fields plus a ``getattr(RLPA, ...)`` override block. New
+# opcodes silently went missing from ``LP`` until someone manually
+# extended both the class and the override block — the
+# ``LP.OPC_INDICATE`` AttributeError of 2026-05-17 forced this rewrite.
+# ``tests/test_lp_matches_proto_auto.py`` pins the contract.
 try:
     from .. import racelink_proto_auto as RLPA
-
-    _HAVE_AUTO = True
+    from .. import racelink_proto_auto as LP  # noqa: N814 — public alias
 except Exception as exc:
     raise ImportError("RaceLink protocol mirror missing: expected racelink.racelink_proto_auto") from exc
 
-
-class LP:
-    DIR_M2N = 0x00
-    DIR_N2M = 0x80
-
-    OPC_DEVICES = 0x01
-    OPC_SET_GROUP = 0x02
-    OPC_STATUS = 0x03
-    OPC_PRESET = 0x04
-    OPC_CONFIG = 0x05
-    OPC_SYNC = 0x06
-    OPC_STREAM = 0x07
-    OPC_CONTROL = 0x08
-    OPC_OFFSET = 0x09
-    # 0x0A — read-back of an OPC_CONFIG option. Request body is one
-    # byte (the option to read); reply reuses the 5-byte ``P_Config``
-    # shape (option + data0..3) with the N→M direction bit. Added
-    # 2026-05-08 alongside the WLED firmware ``OPC_GET_CONFIG``
-    # dispatcher; once ``racelink_proto.h`` regenerates this constant
-    # appears in ``racelink_proto_auto`` and the ``getattr`` below
-    # picks it up automatically.
-    OPC_GET_CONFIG = 0x0A
-    OPC_ACK = 0x7E
-
-    @staticmethod
-    def make_type(direction: int, opcode7: int) -> int:
-        return direction | (opcode7 & 0x7F)
-
-
-if _HAVE_AUTO:
-    try:
-        LP.DIR_M2N = getattr(RLPA, "DIR_M2N", LP.DIR_M2N)
-        LP.DIR_N2M = getattr(RLPA, "DIR_N2M", LP.DIR_N2M)
-        LP.OPC_DEVICES = getattr(RLPA, "OPC_DEVICES", LP.OPC_DEVICES)
-        LP.OPC_SET_GROUP = getattr(RLPA, "OPC_SET_GROUP", LP.OPC_SET_GROUP)
-        LP.OPC_STATUS = getattr(RLPA, "OPC_STATUS", LP.OPC_STATUS)
-        LP.OPC_PRESET = getattr(RLPA, "OPC_PRESET", LP.OPC_PRESET)
-        LP.OPC_CONFIG = getattr(RLPA, "OPC_CONFIG", LP.OPC_CONFIG)
-        LP.OPC_SYNC = getattr(RLPA, "OPC_SYNC", LP.OPC_SYNC)
-        LP.OPC_STREAM = getattr(RLPA, "OPC_STREAM", LP.OPC_STREAM)
-        LP.OPC_CONTROL = getattr(RLPA, "OPC_CONTROL", LP.OPC_CONTROL)
-        LP.OPC_OFFSET = getattr(RLPA, "OPC_OFFSET", LP.OPC_OFFSET)
-        LP.OPC_GET_CONFIG = getattr(RLPA, "OPC_GET_CONFIG", LP.OPC_GET_CONFIG)
-        LP.OPC_ACK = getattr(RLPA, "OPC_ACK", LP.OPC_ACK)
-
-        make_type = getattr(RLPA, "make_type", LP.make_type)
-
-        def _make_type(direction, opcode):
-            return make_type(direction, opcode)
-
-        LP.make_type = staticmethod(_make_type)
-    except Exception:
-        # swallow-ok: best-effort fallback; caller proceeds with safe default
-        pass
+_HAVE_AUTO = True
 
 
 # Gateway USB events (Master -> Host) — values mirrored from
