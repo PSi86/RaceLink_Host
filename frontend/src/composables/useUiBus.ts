@@ -16,6 +16,7 @@ const rlPresetsRequest = ref(0)
 const wledPresetsRequest = ref(0)
 const fwUpdateRequest = ref(0)
 const hostSettingsRequest = ref(0)
+const gatewayRfConfigRequest = ref(0)
 const batteryDevicesRequest = ref(0)
 const resortGroupsRequest = ref(0)
 
@@ -28,6 +29,7 @@ export function useUiBus() {
     wledPresetsRequest,
     fwUpdateRequest,
     hostSettingsRequest,
+    gatewayRfConfigRequest,
     batteryDevicesRequest,
     resortGroupsRequest,
     requestDiscover() {
@@ -50,6 +52,9 @@ export function useUiBus() {
     },
     requestHostSettings() {
       hostSettingsRequest.value += 1
+    },
+    requestGatewayRfConfig() {
+      gatewayRfConfigRequest.value += 1
     },
     requestBatteryDevices() {
       batteryDevicesRequest.value += 1

@@ -14,6 +14,7 @@ import serial.tools.list_ports
 from .framing import mac_last3_from_hex, u16le
 from .gateway_events import (
     EV_ERROR,
+    EV_RF_CHANGED,
     EV_STATE_CHANGED,
     EV_STATE_REPORT,
     EV_TX_DONE,
@@ -21,11 +22,30 @@ from .gateway_events import (
     GATEWAY_STATE_NAME,
     GATEWAY_STATE_RX_WINDOW,
     GATEWAY_STATE_UNKNOWN,
+    GW_CMD_GET_RF_CONFIG,
+    GW_CMD_SET_RF_CONFIG,
     GW_CMD_STATE_REQUEST,
+    GW_RF_PERSIST_NVS,
+    GW_RF_VOLATILE,
     LP,
+    RF_CHANGE_REASON_NAME,
     TX_REJECT_REASON_NAME,
     TX_REJECT_UNKNOWN,
 )
+
+# P_RfConfig wire format (12 B fixed, little-endian). Used by both the
+# USB-CDC GW_CMD_SET_RF_CONFIG payload and the EV_RF_CHANGED reply body
+# (tail bytes after the leading reason byte). Field order matches the
+# struct in racelink_proto.h exactly:
+#     uint32_t freq_hz       (4 B, LE)
+#     uint16_t bw_khz_x10    (2 B, LE)  -- bandwidth × 10 (125.0 kHz -> 1250)
+#     uint8_t  sf            (1 B)
+#     uint8_t  cr_den        (1 B)
+#     uint8_t  sync_word     (1 B)
+#     int8_t   tx_power_dbm  (1 B, SIGNED)
+#     uint16_t preamble      (2 B, LE)
+_RF_CONFIG_STRUCT = struct.Struct("<IHBBBbH")
+assert _RF_CONFIG_STRUCT.size == 12
 from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
     build_config_body,
@@ -705,6 +725,74 @@ class GatewaySerialTransport:
         logger.debug("TX GW_CMD_STATE_REQUEST (1 byte)")
         return True
 
+    # ---- RF-config commands (USB-only, no LoRa wire) ---------------------
+
+    def send_get_rf_config(self) -> bool:
+        """Write a 1-byte GW_CMD_GET_RF_CONFIG frame to the gateway.
+
+        Replies arrive asynchronously as ``EV_RF_CHANGED(reason, P_RfConfig)``;
+        ``gateway_service.query_gateway_rf_config`` composes this with a
+        wait-for-reply round-trip. Returns ``False`` if the USB write
+        itself failed (the transport is then disconnecting).
+        """
+        frame = bytes([0x00, 0x01, GW_CMD_GET_RF_CONFIG])
+        with self._tx_lock:
+            try:
+                self.ser.write(frame)
+                try:
+                    self.ser.flush()
+                except Exception:
+                    # swallow-ok: best-effort flush; write succeeded.
+                    pass
+            except serial.SerialException as e:
+                self._handle_disconnect(f"USB GET_RF_CONFIG write failed: {e}")
+                return False
+        logger.debug("TX GW_CMD_GET_RF_CONFIG (1 byte)")
+        return True
+
+    def send_set_rf_config(self, rf_config: dict, *, persist: bool) -> bool:
+        """Write a GW_CMD_SET_RF_CONFIG frame to the gateway.
+
+        ``rf_config`` keys (all required): ``freq_hz``, ``bw_khz_x10``,
+        ``sf``, ``cr_den``, ``sync_word``, ``tx_power_dbm``, ``preamble``.
+        ``persist=True`` writes NVS and reboots; ``persist=False`` is
+        volatile (no NVS write, no reboot) for the channel-scan workflow.
+
+        Reply via ``EV_RF_CHANGED(reason, P_RfConfig)``. Returns ``False``
+        if the USB write itself failed.
+        """
+        persist_flag = GW_RF_PERSIST_NVS if persist else GW_RF_VOLATILE
+        body = _RF_CONFIG_STRUCT.pack(
+            int(rf_config["freq_hz"]) & 0xFFFFFFFF,
+            int(rf_config["bw_khz_x10"]) & 0xFFFF,
+            int(rf_config["sf"]) & 0xFF,
+            int(rf_config["cr_den"]) & 0xFF,
+            int(rf_config["sync_word"]) & 0xFF,
+            int(rf_config["tx_power_dbm"]),  # signed int8
+            int(rf_config["preamble"]) & 0xFFFF,
+        )
+        # Frame: [0x00][LEN=14][CMD=0x02][persist_flag (1B)][P_RfConfig (12B)]
+        payload = bytes([persist_flag]) + body
+        frame_len = 1 + len(payload)  # TYPE byte + payload
+        frame = bytes([0x00, frame_len, GW_CMD_SET_RF_CONFIG]) + payload
+        with self._tx_lock:
+            try:
+                self.ser.write(frame)
+                try:
+                    self.ser.flush()
+                except Exception:
+                    # swallow-ok: best-effort flush
+                    pass
+            except serial.SerialException as e:
+                self._handle_disconnect(f"USB SET_RF_CONFIG write failed: {e}")
+                return False
+        logger.info(
+            "TX GW_CMD_SET_RF_CONFIG persist=%s freq=%d sf=%d bw=%d sw=0x%02X",
+            persist, rf_config["freq_hz"], rf_config["sf"],
+            rf_config["bw_khz_x10"], rf_config["sync_word"],
+        )
+        return True
+
     # ---- RX reader thread + frame dispatch -------------------------------
 
     def _reader(self):
@@ -885,6 +973,37 @@ class GatewaySerialTransport:
                 "state_byte": int(state_byte),
                 "state": GATEWAY_STATE_NAME.get(int(state_byte), "UNKNOWN"),
                 "state_metadata_ms": int(metadata_ms),
+                "ts": now,
+            }
+            self._emit(ev)
+            return
+
+        if type_byte == EV_RF_CHANGED:
+            # Body: [reason (1 B), P_RfConfig (12 B)]. Tolerate short
+            # bodies (older firmware that pre-dates the per-event format
+            # might omit fields) by reporting whatever was present and
+            # leaving the missing fields as None / 0.
+            reason = data[0] if len(data) >= 1 else 0
+            rf_config = None
+            if len(data) >= 1 + _RF_CONFIG_STRUCT.size:
+                try:
+                    freq, bw_x10, sf, cr, sw, txp, pre = _RF_CONFIG_STRUCT.unpack_from(data, 1)
+                    rf_config = {
+                        "freq_hz":      int(freq),
+                        "bw_khz_x10":   int(bw_x10),
+                        "sf":           int(sf),
+                        "cr_den":       int(cr),
+                        "sync_word":    int(sw),
+                        "tx_power_dbm": int(txp),  # signed int8 -> python int
+                        "preamble":     int(pre),
+                    }
+                except struct.error:
+                    rf_config = None
+            ev = {
+                "type": EV_RF_CHANGED,
+                "reason": int(reason),
+                "reason_name": RF_CHANGE_REASON_NAME.get(int(reason), "unknown"),
+                "rf_config": rf_config,
                 "ts": now,
             }
             self._emit(ev)

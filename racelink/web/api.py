@@ -491,6 +491,79 @@ def register_api_routes(bp, ctx):
         # here is for the synchronous caller (the WebUI fetch).
         return jsonify(result)
 
+    @bp.route("/api/gateway/rf_config", methods=["GET"])
+    def api_gateway_rf_config_get():
+        """Read the gateway's currently active LoRa PHY config over USB-CDC.
+
+        Sends GW_CMD_GET_RF_CONFIG; replies via EV_RF_CHANGED. Returns
+        ``{"ok": bool, "rf_config": {...}}`` on success.
+
+        Body fields (P_RfConfig wire layout):
+            freq_hz, bw_khz_x10, sf, cr_den, sync_word, tx_power_dbm,
+            preamble.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_gateway_rf_config", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        result = query()
+        if not result.get("ok"):
+            # 504 = gateway timeout (USB connected but no reply within bound).
+            return jsonify(result), 504
+        return jsonify(result)
+
+    @bp.route("/api/gateway/rf_config", methods=["POST"])
+    def api_gateway_rf_config_set():
+        """Write a new LoRa PHY config to the gateway over USB-CDC.
+
+        Expected JSON body:
+            {
+                "rf_config": {
+                    "freq_hz": 867700000,
+                    "bw_khz_x10": 1250,
+                    "sf": 7, "cr_den": 5, "sync_word": 18,
+                    "tx_power_dbm": 14, "preamble": 8
+                },
+                "persist": true  # optional, default true
+            }
+
+        ``persist=true`` writes NVS and reboots the gateway. ``persist=false``
+        live-reconfigures without persisting (channel-scan mode). The reply
+        echoes the EV_RF_CHANGED reason; HTTP 400 for validation rejections,
+        504 for transport timeouts.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+
+        payload = request.get_json(silent=True) or {}
+        rf_config = payload.get("rf_config")
+        if not isinstance(rf_config, dict):
+            return jsonify({"ok": False, "error": "rf_config dict required"}), 400
+
+        required = ("freq_hz", "bw_khz_x10", "sf", "cr_den", "sync_word",
+                    "tx_power_dbm", "preamble")
+        missing = [k for k in required if k not in rf_config]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": f"rf_config missing fields: {missing}",
+            }), 400
+
+        persist = bool(payload.get("persist", True))
+        result = setter(rf_config, persist=persist)
+        if result.get("ok"):
+            return jsonify(result)
+        # reason-based status code: range / NVS rejections are 400 (caller
+        # gave bad input); transport timeouts are 504.
+        reason = result.get("reason")
+        if reason is None:
+            return jsonify(result), 504
+        return jsonify(result), 400
+
     @bp.route("/api/task", methods=["GET"])
     def api_task():
         return jsonify({"ok": True, "task": ctx.tasks.snapshot()})

@@ -42,6 +42,7 @@ from ..protocol import request_direction, response_opcode, response_policy, rule
 from ..transport.framing import mac_last3_from_hex
 from ..transport.gateway_events import (
     EV_ERROR,
+    EV_RF_CHANGED,
     EV_STATE_CHANGED,
     EV_STATE_REPORT,
     EV_TX_DONE,
@@ -52,6 +53,8 @@ from ..transport.gateway_events import (
     GATEWAY_STATE_RX_WINDOW,
     GATEWAY_STATE_UNKNOWN,
     LP,
+    RF_CHANGE_OK,
+    RF_CHANGE_REASON_NAME,
 )
 from .pending_requests import (
     PendingMatcher,
@@ -702,6 +705,149 @@ class GatewayService:
             "state_byte": GATEWAY_STATE_UNKNOWN,
             "state_metadata_ms": 0,
         }
+
+    # ---- Gateway RF config (USB-CDC round-trip, no LoRa) -----------------
+
+    def query_gateway_rf_config(self, *, timeout_s: float = 0.5) -> dict:
+        """Send GW_CMD_GET_RF_CONFIG and wait for the matching EV_RF_CHANGED.
+
+        Returns:
+            ``{"ok": True, "rf_config": {...}}`` on success;
+            ``{"ok": False, "error": "..."}`` on transport unavailable or
+            timeout. The success ``rf_config`` shape is the wire-format
+            P_RfConfig dict (freq_hz / bw_khz_x10 / sf / cr_den /
+            sync_word / tx_power_dbm / preamble).
+
+        The round-trip is a USB write + USB read; 500 ms is generous.
+        """
+        transport = self.transport
+        if transport is None:
+            return {"ok": False, "error": "transport unavailable"}
+
+        replied = threading.Event()
+        result: dict = {}
+
+        def _cb(ev: dict):
+            try:
+                if not isinstance(ev, dict):
+                    return
+                if ev.get("type") != EV_RF_CHANGED:
+                    return
+                cfg = ev.get("rf_config")
+                if isinstance(cfg, dict):
+                    result["rf_config"] = cfg
+                    result["reason"] = int(ev.get("reason", RF_CHANGE_OK))
+                    result["reason_name"] = ev.get(
+                        "reason_name",
+                        RF_CHANGE_REASON_NAME.get(result["reason"], "unknown"),
+                    )
+                    replied.set()
+            except Exception:
+                logger.debug("query_gateway_rf_config callback raised", exc_info=True)
+
+        try:
+            transport.add_listener(_cb)
+        except Exception:
+            logger.debug("query_gateway_rf_config: add_listener failed", exc_info=True)
+
+        try:
+            ok_write = True
+            try:
+                send = getattr(transport, "send_get_rf_config", None)
+                if callable(send):
+                    ok_write = bool(send())
+                else:
+                    ok_write = False
+            except Exception:
+                logger.debug("query_gateway_rf_config: send raised", exc_info=True)
+                ok_write = False
+
+            if ok_write:
+                replied.wait(timeout=float(timeout_s))
+        finally:
+            try:
+                transport.remove_listener(_cb)
+            except Exception:
+                logger.debug("query_gateway_rf_config: remove_listener failed", exc_info=True)
+
+        if "rf_config" in result:
+            result["ok"] = True
+            return result
+
+        return {"ok": False, "error": "no reply within timeout"}
+
+    def set_gateway_rf_config(
+        self,
+        rf_config: dict,
+        *,
+        persist: bool = True,
+        timeout_s: float = 1.0,
+    ) -> dict:
+        """Send GW_CMD_SET_RF_CONFIG and wait for the matching EV_RF_CHANGED.
+
+        ``persist=True`` writes NVS and reboots the gateway (the EV is
+        emitted ~100 ms BEFORE the reboot so we still catch it). With
+        ``persist=False`` the gateway live-reconfigures and stays up.
+
+        Returns ``{"ok": bool, "reason": int, "reason_name": str,
+                   "rf_config": {...} | None}``. ``ok`` is True only for
+        ``reason == RF_CHANGE_OK``; any rejection (range / NVS / CRC)
+        sets ``ok=False`` and carries the still-active config in
+        ``rf_config`` (per the firmware contract).
+        """
+        transport = self.transport
+        if transport is None:
+            return {"ok": False, "error": "transport unavailable"}
+
+        replied = threading.Event()
+        result: dict = {}
+
+        def _cb(ev: dict):
+            try:
+                if not isinstance(ev, dict):
+                    return
+                if ev.get("type") != EV_RF_CHANGED:
+                    return
+                result["reason"] = int(ev.get("reason", 0))
+                result["reason_name"] = ev.get(
+                    "reason_name",
+                    RF_CHANGE_REASON_NAME.get(result["reason"], "unknown"),
+                )
+                result["rf_config"] = ev.get("rf_config")
+                replied.set()
+            except Exception:
+                logger.debug("set_gateway_rf_config callback raised", exc_info=True)
+
+        try:
+            transport.add_listener(_cb)
+        except Exception:
+            logger.debug("set_gateway_rf_config: add_listener failed", exc_info=True)
+
+        try:
+            ok_write = True
+            try:
+                send = getattr(transport, "send_set_rf_config", None)
+                if callable(send):
+                    ok_write = bool(send(rf_config, persist=persist))
+                else:
+                    ok_write = False
+            except Exception:
+                logger.debug("set_gateway_rf_config: send raised", exc_info=True)
+                ok_write = False
+
+            if ok_write:
+                replied.wait(timeout=float(timeout_s))
+        finally:
+            try:
+                transport.remove_listener(_cb)
+            except Exception:
+                logger.debug("set_gateway_rf_config: remove_listener failed", exc_info=True)
+
+        if "reason" in result:
+            result["ok"] = (result["reason"] == RF_CHANGE_OK)
+            return result
+
+        return {"ok": False, "error": "no reply within timeout"}
 
     def opcode_name(self, opcode7: int) -> str:
         return protocol_opcode_name(int(opcode7) & 0x7F)
