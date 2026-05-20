@@ -491,6 +491,86 @@ def register_api_routes(bp, ctx):
         # here is for the synchronous caller (the WebUI fetch).
         return jsonify(result)
 
+    @bp.route("/api/devices/<mac>/rf_config", methods=["GET"])
+    def api_device_rf_config_get(mac):
+        """Read back a node's currently active LoRa PHY config via OPC_GET_RF_CONFIG.
+
+        Returns ``{"ok": bool, "rf_config": {...}}`` on success. 404 if
+        the device is not in the host repo, 504 on transport timeout,
+        503 if gateway_service is unavailable.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_node_rf_config", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return jsonify({"ok": False, "error": "mac must be 12 hex chars"}), 400
+        with ctx.rl_lock:
+            dev = rl.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
+        result = query(mac_str)
+        if not result.get("ok"):
+            return jsonify(result), 504
+        return jsonify(result)
+
+    @bp.route("/api/devices/<mac>/rf_config", methods=["POST"])
+    def api_device_rf_config_post(mac):
+        """Push a new LoRa PHY config to a node via OPC_RF_CONFIG.
+
+        Expected JSON body:
+            { "rf_config": {freq_hz, bw_khz_x10, sf, cr_den, sync_word,
+                            tx_power_dbm, preamble} }
+
+        The node validates the payload, persists to NVS, ACKs, then
+        reboots onto the new config. The reboot drops the link briefly;
+        the success signal is the ACK.
+
+        Returns ``{"ok": bool, "ack_status": int}``; 400 on validation
+        rejection / payload errors, 504 on timeout, 503 if service
+        unavailable, 404 if device unknown.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        setter = getattr(gw, "set_node_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return jsonify({"ok": False, "error": "mac must be 12 hex chars"}), 400
+
+        with ctx.rl_lock:
+            dev = rl.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
+
+        payload = request.get_json(silent=True) or {}
+        rf_config = payload.get("rf_config")
+        if not isinstance(rf_config, dict):
+            return jsonify({"ok": False, "error": "rf_config dict required"}), 400
+        required = ("freq_hz", "bw_khz_x10", "sf", "cr_den", "sync_word",
+                    "tx_power_dbm", "preamble")
+        missing = [k for k in required if k not in rf_config]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": f"rf_config missing fields: {missing}",
+            }), 400
+
+        result = setter(mac_str, rf_config)
+        if result.get("ok"):
+            return jsonify(result)
+        if result.get("error") == "timeout":
+            return jsonify(result), 504
+        # ack_status != 0 = node-side rejection (validation / NVS). 400
+        # to surface "bad parameters" semantics to the operator.
+        if "ack_status" in result:
+            return jsonify(result), 400
+        return jsonify(result), 503
+
     @bp.route("/api/gateway/rf_config", methods=["GET"])
     def api_gateway_rf_config_get():
         """Read the gateway's currently active LoRa PHY config over USB-CDC.

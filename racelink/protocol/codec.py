@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 
 from . import rules
+from .packets import RF_CONFIG_STRUCT, unpack_rf_config_body
 
 
 def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rssi: int, host_snr: int) -> dict:
@@ -87,6 +88,21 @@ def parse_reply_event(type_byte: int, data: bytes, *, timestamp: float, host_rss
             })
         else:
             ev.update({"reply": "GET_CONFIG_REPLY", "body_raw": body})
+    elif opc == 0x0E:
+        # GET_RF_CONFIG reply: 12-byte ``P_RfConfig`` body. Decoded into
+        # the wire-format dict via :func:`unpack_rf_config_body` so the
+        # host's pending-matcher and onboarding-service paths see the
+        # same shape they pass into ``set_node_rf_config``.
+        if len(body) == RF_CONFIG_STRUCT.size:
+            try:
+                ev.update({
+                    "reply": "GET_RF_CONFIG_REPLY",
+                    "rf_config": unpack_rf_config_body(body),
+                })
+            except struct.error:
+                ev.update({"reply": "GET_RF_CONFIG_REPLY", "body_raw": body})
+        else:
+            ev.update({"reply": "GET_RF_CONFIG_REPLY", "body_raw": body})
     elif opc == 0x7E:
         if len(body) >= 2:
             ack_of = body[0] & 0x7F

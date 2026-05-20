@@ -33,30 +33,24 @@ from .gateway_events import (
     TX_REJECT_UNKNOWN,
 )
 
-# P_RfConfig wire format (12 B fixed, little-endian). Used by both the
-# USB-CDC GW_CMD_SET_RF_CONFIG payload and the EV_RF_CHANGED reply body
-# (tail bytes after the leading reason byte). Field order matches the
-# struct in racelink_proto.h exactly:
-#     uint32_t freq_hz       (4 B, LE)
-#     uint16_t bw_khz_x10    (2 B, LE)  -- bandwidth × 10 (125.0 kHz -> 1250)
-#     uint8_t  sf            (1 B)
-#     uint8_t  cr_den        (1 B)
-#     uint8_t  sync_word     (1 B)
-#     int8_t   tx_power_dbm  (1 B, SIGNED)
-#     uint16_t preamble      (2 B, LE)
-_RF_CONFIG_STRUCT = struct.Struct("<IHBBBbH")
-assert _RF_CONFIG_STRUCT.size == 12
+# P_RfConfig wire layout lives in racelink/protocol/packets.py as
+# RF_CONFIG_STRUCT (single source of truth shared with the LoRa-side
+# OPC_RF_CONFIG codec). USB-CDC and LoRa carry the same 12 B body shape.
 from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
+    RF_CONFIG_STRUCT,
     build_config_body,
     build_control_body,
     build_get_config_body,
     build_get_devices_body,
+    build_get_rf_config_body,
     build_indicate_body,
     build_offset_body,
     build_preset_body,
+    build_rf_config_body,
     build_set_group_body,
     build_sync_body,
+    unpack_rf_config_body,
 )
 
 logger = logging.getLogger("racelink_transport")
@@ -645,6 +639,34 @@ class GatewaySerialTransport:
         body = build_get_config_body(option=option)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_CONFIG), recv3, body)
 
+    def send_rf_config(self, recv3: bytes, rf_config: dict) -> SendOutcome:
+        """Send an ``OPC_RF_CONFIG`` packet (12 B P_RfConfig body) to a node.
+
+        Unicast-only by design — broadcasting an RF config change would
+        knock every reachable node off-channel simultaneously. The
+        firmware rejects ``recv3 == FF:FF:FF`` defensively; callers
+        must pass a concrete 3-byte ``recv3``.
+
+        On the node side: validate → persist NVS → ACK_OK → ``delay(50)``
+        → ``ESP.restart()`` onto the new config. The link drops briefly
+        during reboot; callers (``gateway_service.set_node_rf_config``)
+        treat the ACK as the success signal.
+        """
+        body = build_rf_config_body(rf_config)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_RF_CONFIG), recv3, body)
+
+    def send_get_rf_config_to_node(self, recv3: bytes) -> SendOutcome:
+        """Send an ``OPC_GET_RF_CONFIG`` packet (1 B reserved body) to a node.
+
+        Unicast-only (analogous to OPC_GET_CONFIG). The node replies
+        with a 12 B ``P_RfConfig`` body carrying its currently active
+        (NVS-persisted) RF settings; the reply is parsed by
+        ``parse_reply_event`` into a wire-format dict matching
+        ``unpack_rf_config_body``.
+        """
+        body = build_get_rf_config_body(reserved=0)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_RF_CONFIG), recv3, body)
+
     def send_sync(self, recv3: bytes = b"\xFF\xFF\xFF", ts24: int = 0, brightness: int = 0,
                   flags: int = 0) -> SendOutcome:
         body = build_sync_body(ts24=ts24, brightness=brightness, flags=flags)
@@ -762,7 +784,7 @@ class GatewaySerialTransport:
         if the USB write itself failed.
         """
         persist_flag = GW_RF_PERSIST_NVS if persist else GW_RF_VOLATILE
-        body = _RF_CONFIG_STRUCT.pack(
+        body = RF_CONFIG_STRUCT.pack(
             int(rf_config["freq_hz"]) & 0xFFFFFFFF,
             int(rf_config["bw_khz_x10"]) & 0xFFFF,
             int(rf_config["sf"]) & 0xFF,
@@ -985,9 +1007,9 @@ class GatewaySerialTransport:
             # leaving the missing fields as None / 0.
             reason = data[0] if len(data) >= 1 else 0
             rf_config = None
-            if len(data) >= 1 + _RF_CONFIG_STRUCT.size:
+            if len(data) >= 1 + RF_CONFIG_STRUCT.size:
                 try:
-                    freq, bw_x10, sf, cr, sw, txp, pre = _RF_CONFIG_STRUCT.unpack_from(data, 1)
+                    freq, bw_x10, sf, cr, sw, txp, pre = RF_CONFIG_STRUCT.unpack_from(data, 1)
                     rf_config = {
                         "freq_hz":      int(freq),
                         "bw_khz_x10":   int(bw_x10),

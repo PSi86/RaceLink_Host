@@ -55,6 +55,82 @@ def build_get_config_body(option: int = 0) -> bytes:
     return struct.pack("<B", int(option) & 0xFF)
 
 
+# P_RfConfig wire format (12 B fixed, little-endian). Layout mirrors the
+# C struct in racelink_proto.h exactly:
+#     uint32_t freq_hz       (4 B, LE)
+#     uint16_t bw_khz_x10    (2 B, LE)  -- bandwidth × 10 (125.0 kHz -> 1250)
+#     uint8_t  sf            (1 B)
+#     uint8_t  cr_den        (1 B)
+#     uint8_t  sync_word     (1 B)
+#     int8_t   tx_power_dbm  (1 B, SIGNED)
+#     uint16_t preamble      (2 B, LE)
+# Used by:
+#   * USB-CDC GW_CMD_SET_RF_CONFIG payload tail + EV_RF_CHANGED body tail
+#     (gateway_serial.py imports this struct to avoid drift).
+#   * LoRa OPC_RF_CONFIG / OPC_GET_RF_CONFIG reply bodies on the
+#     node-push path (build_rf_config_body / unpack_rf_config_body below).
+RF_CONFIG_STRUCT = struct.Struct("<IHBBBbH")
+assert RF_CONFIG_STRUCT.size == 12, "P_RfConfig wire size must be 12 B"
+
+RF_CONFIG_FIELDS = (
+    "freq_hz",
+    "bw_khz_x10",
+    "sf",
+    "cr_den",
+    "sync_word",
+    "tx_power_dbm",
+    "preamble",
+)
+
+
+def build_rf_config_body(rf_config: dict) -> bytes:
+    """Serialize an ``OPC_RF_CONFIG`` body (12 B fixed: full P_RfConfig).
+
+    ``rf_config`` must carry every key in :data:`RF_CONFIG_FIELDS`; a
+    missing key raises ``KeyError``. Used by the per-node OPC_RF_CONFIG
+    push path (``gateway_service.set_node_rf_config``) to send a node's
+    new PHY config over LoRa. Persistence + reboot on the node side
+    happens after the ACK (see WLED firmware OPC_RF_CONFIG handler).
+
+    Numeric coercions:
+      * ``freq_hz`` masked to 32 bit unsigned.
+      * ``bw_khz_x10`` and ``preamble`` masked to 16 bit unsigned.
+      * ``sf``, ``cr_den``, ``sync_word`` masked to 8 bit unsigned.
+      * ``tx_power_dbm`` is **signed int8** (-128..127); callers passing
+        out-of-range values get a ``struct.error`` here.
+    """
+    return RF_CONFIG_STRUCT.pack(
+        int(rf_config["freq_hz"]) & 0xFFFFFFFF,
+        int(rf_config["bw_khz_x10"]) & 0xFFFF,
+        int(rf_config["sf"]) & 0xFF,
+        int(rf_config["cr_den"]) & 0xFF,
+        int(rf_config["sync_word"]) & 0xFF,
+        int(rf_config["tx_power_dbm"]),  # signed -- no mask
+        int(rf_config["preamble"]) & 0xFFFF,
+    )
+
+
+def unpack_rf_config_body(data: bytes) -> dict:
+    """Deserialize a 12 B P_RfConfig body into a dict.
+
+    Used to decode ``EV_RF_CHANGED`` (USB-CDC, gateway-side reply) and
+    the ``OPC_GET_RF_CONFIG`` reply from a node. Raises ``struct.error``
+    on short / oversized input.
+    """
+    fields = RF_CONFIG_STRUCT.unpack(bytes(data[:RF_CONFIG_STRUCT.size]))
+    return {name: int(value) for name, value in zip(RF_CONFIG_FIELDS, fields)}
+
+
+def build_get_rf_config_body(reserved: int = 0) -> bytes:
+    """Serialize an ``OPC_GET_RF_CONFIG`` body (1 B reserved, MUST be 0).
+
+    The single byte is a future channel-slot selector that today must
+    stay 0; the node's handler treats non-zero as a structurally invalid
+    request (no reply, analogous to the OPC_GET_CONFIG unknown-option path).
+    """
+    return struct.pack("<B", int(reserved) & 0xFF)
+
+
 # OPC_SYNC flags. Mirrors ``SYNC_FLAG_TRIGGER_ARMED`` in ``racelink_proto.h``.
 # Bit 0 gates pending arm-on-sync materialisation device-side; without it,
 # OPC_SYNC only adjusts the device timebase. Autosync (gateway- or

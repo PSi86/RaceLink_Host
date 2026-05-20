@@ -849,6 +849,124 @@ class GatewayService:
 
         return {"ok": False, "error": "no reply within timeout"}
 
+    # ---- Node RF config (LoRa OPC_RF_CONFIG / OPC_GET_RF_CONFIG) ---------
+
+    def set_node_rf_config(
+        self,
+        mac: str,
+        rf_config: dict,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> dict:
+        """Push a new ``P_RfConfig`` to a node over LoRa (OPC_RF_CONFIG).
+
+        The node validates, persists to NVS, ACKs (``ACK_OK`` or
+        ``ACK_BAD_LEN`` / ``ACK_ERROR``), then reboots ~50 ms later
+        onto the new RF settings. The reboot drops the link, which is
+        expected — the operator-facing outcome is the ACK, not a
+        post-reboot heartbeat.
+
+        Returns ``{"ok": bool, "ack_status": int | None, "error": str?}``.
+        ``ok`` is True iff ``ack_status == 0`` (ACK_OK). Range / NVS
+        rejections return ``ok=False`` with the FW's ack_status; transport
+        timeouts return ``ok=False`` with ``error="timeout"``.
+        """
+        transport = self.transport
+        if transport is None:
+            return {"ok": False, "error": "transport unavailable"}
+
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return {"ok": False, "error": "mac must be 12 hex chars"}
+
+        recv3 = mac_last3_from_hex(mac_str)
+        if recv3 == b"\xFF\xFF\xFF":
+            # Defence in depth: the firmware also rejects broadcast for
+            # OPC_RF_CONFIG, but we should never even hit the wire with
+            # a broadcast send — it would brick every reachable node.
+            return {"ok": False, "error": "broadcast forbidden for OPC_RF_CONFIG"}
+
+        # Clear any stale ACK state on the device so the caller's `ok`
+        # signal isn't a stale read from a previous send.
+        dev = self.controller.getDeviceFromAddress(mac_str)
+        if dev is not None:
+            try:
+                dev.ack_clear()
+            except Exception:
+                # swallow-ok: best-effort; ack_clear only fails on
+                # malformed device records that other paths already
+                # log.
+                logger.debug("set_node_rf_config: ack_clear failed for %s", mac_str, exc_info=True)
+
+        def _send():
+            transport.send_rf_config(recv3=recv3, rf_config=rf_config)
+
+        per_attempt = (
+            float(timeout_s)
+            if timeout_s is not None
+            else rf_timing.UNICAST_ATTEMPT_TIMEOUT_S
+        )
+        events, _ = self.send_and_wait_with_retries(
+            recv3,
+            LP.OPC_RF_CONFIG,
+            _send,
+            per_attempt_timeout_s=per_attempt,
+        )
+        if not events:
+            return {"ok": False, "error": "timeout"}
+        ev = events[-1]
+        ack_status = int(ev.get("ack_status", 1))
+        return {
+            "ok": ack_status == 0,
+            "ack_status": ack_status,
+        }
+
+    def query_node_rf_config(
+        self,
+        mac: str,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> dict:
+        """Read back a node's currently active P_RfConfig over LoRa.
+
+        Sends OPC_GET_RF_CONFIG; the node replies with a 12 B P_RfConfig
+        body (decoded by :func:`parse_reply_event`). Returns
+        ``{"ok": bool, "rf_config": {...}}`` on success.
+        """
+        transport = self.transport
+        if transport is None:
+            return {"ok": False, "error": "transport unavailable"}
+
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return {"ok": False, "error": "mac must be 12 hex chars"}
+
+        recv3 = mac_last3_from_hex(mac_str)
+        if recv3 == b"\xFF\xFF\xFF":
+            return {"ok": False, "error": "broadcast forbidden for OPC_GET_RF_CONFIG"}
+
+        def _send():
+            transport.send_get_rf_config_to_node(recv3=recv3)
+
+        per_attempt = (
+            float(timeout_s)
+            if timeout_s is not None
+            else rf_timing.UNICAST_ATTEMPT_TIMEOUT_S
+        )
+        events, _ = self.send_and_wait_with_retries(
+            recv3,
+            LP.OPC_GET_RF_CONFIG,
+            _send,
+            per_attempt_timeout_s=per_attempt,
+        )
+        if not events:
+            return {"ok": False, "error": "timeout"}
+        ev = events[-1]
+        rf_config = ev.get("rf_config")
+        if not isinstance(rf_config, dict):
+            return {"ok": False, "error": "malformed reply", "raw": ev.get("body_raw")}
+        return {"ok": True, "rf_config": rf_config}
+
     def opcode_name(self, opcode7: int) -> str:
         return protocol_opcode_name(int(opcode7) & 0x7F)
 
