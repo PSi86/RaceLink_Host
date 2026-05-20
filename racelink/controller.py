@@ -105,7 +105,11 @@ class RaceLink_Host:
         self.name = name
         self.label = label
         self.state_repository = state_repository or get_runtime_state_repository()
-        self.transport = None
+        # Stage 2: ``_transports`` is the primary list-backed store; the
+        # ``self.transport`` property below preserves the single-transport
+        # read/write contract every existing call site expects. Multi-
+        # transport code paths (Stage 3+) iterate ``self.transports``.
+        self._transports: list = []
         self.ready = False
         self.deviceCfgValid = False
         self.groupCfgValid = False
@@ -254,6 +258,72 @@ class RaceLink_Host:
     @property
     def network_repository(self):
         return self.state_repository.networks
+
+    # ---- Transport-list shim (Stage 2 part 2) ----------------------------
+    #
+    # The pre-Stage-2 code addresses a single attached gateway via
+    # ``self.transport`` (read + write). To stay byte-identical for the
+    # single-gateway deployment while internally supporting N transports,
+    # ``transport`` is now a property that reads/writes the first slot of
+    # ``self._transports``. Multi-transport code paths (Stage 3 + the
+    # routing helpers below) use ``self.transports`` directly.
+    @property
+    def transport(self):
+        return self._transports[0] if self._transports else None
+
+    @transport.setter
+    def transport(self, value):
+        # ``self.transport = None`` clears the list (matches the legacy
+        # disconnect / reconnect cycle's expectations). Any non-None
+        # assignment replaces the single-slot contents — equivalent to
+        # the old ``self.transport = GatewaySerialTransport(...)`` write.
+        if value is None:
+            self._transports = []
+        else:
+            self._transports = [value]
+
+    @property
+    def transports(self):
+        """The live list of attached transports — usually 0 or 1 entries
+        in Stage 2, up to N in Stage 3+. Mutate via ``transport`` setter
+        for the single-slot case or via direct list ops for multi-slot."""
+        return self._transports
+
+    def transport_for_network(self, network_id):
+        """Return the transport bound to the given ``RL_Network.id``.
+
+        Resolves via ``RL_Network.gateway_mac`` against the transport's
+        ``ident_mac`` snapshot. Returns ``None`` if no transport carries
+        that network — either because the gateway is unplugged or
+        because the network has never been bound to a physical unit.
+        """
+        if not network_id:
+            return None
+        net = self.network_repository.get_by_id(network_id)
+        if net is None or not getattr(net, "gateway_mac", None):
+            # If the network has no MAC binding yet, the Stage-2 fallback
+            # is "use the only transport we have" — single-gateway
+            # deployments don't carry a per-network binding.
+            return self._transports[0] if len(self._transports) == 1 else None
+        target_mac = str(net.gateway_mac).upper()
+        for t in self._transports:
+            ident = str(getattr(t, "ident_mac", "") or "").upper()
+            if ident and ident == target_mac:
+                return t
+        return None
+
+    def transport_for_device(self, addr):
+        """Resolve the transport for a device by MAC.
+
+        Looks up the device in the repository, reads its ``network_id``,
+        and delegates to ``transport_for_network``. Single-gateway
+        deployments hit the fallback in ``transport_for_network`` and
+        return the only transport; the Stage 3 multi-network path
+        routes via the explicit ``RL_Network.gateway_mac`` binding.
+        """
+        dev = self.getDeviceFromAddress(addr) if addr else None
+        net_id = getattr(dev, "network_id", None) if dev is not None else None
+        return self.transport_for_network(net_id)
 
     @property
     def backup_device_repository(self):

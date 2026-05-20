@@ -84,6 +84,11 @@ class PendingMatcher:
     expected_ack_of: Optional[int] = None
     discriminator_field: Optional[str] = None
     discriminator_value: Optional[Any] = None
+    # Optional Stage-2 multi-network filter. ``None`` means "wildcard"
+    # — keeps Stage-2 fully backwards-compatible with the single-
+    # gateway code paths that don't yet know about gateway_id. Stage 3
+    # makes this required for every unicast expectation.
+    gateway_id: Optional[str] = None
 
     # --- collection semantics ---
     expected_count: int = 1
@@ -102,6 +107,16 @@ class PendingMatcher:
     def matches(self, ev: dict) -> bool:
         """Full filter evaluation. Registry pre-filters via bucket lookup."""
         try:
+            # Gateway-id filter (Stage 2). When set, only events from the
+            # matching transport count. The transport tags every event it
+            # emits with ``gateway_id`` (its ident_mac); an event without
+            # that tag is treated as "comes from the legacy single
+            # transport" and matches a None filter, but never a concrete
+            # gateway_id filter.
+            if self.gateway_id is not None:
+                ev_gw = ev.get("gateway_id")
+                if ev_gw is None or str(ev_gw) != str(self.gateway_id):
+                    return False
             # Sender filter
             if self.sender_filter is not None:
                 s3 = ev.get("sender3")

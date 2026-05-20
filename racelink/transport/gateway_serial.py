@@ -346,6 +346,70 @@ class GatewaySerialTransport:
 
         return False
 
+    @staticmethod
+    def enumerate_all() -> list[tuple[str, str | None]]:
+        """Probe every USB port and return ``[(port_device, ident_mac), ...]``
+        for every responding RaceLink gateway.
+
+        Unlike :meth:`discover_and_open` which stops at the first hit and
+        binds it to ``self``, this method enumerates the full set so
+        Stage 3's multi-transport controller can attach every connected
+        gateway. The probe protocol is the same (send identify payload,
+        match ``RaceLink_Gateway_v4`` prefix in the reply) — extracted
+        into a classmethod so both call sites share the wire contract.
+
+        Ports that fail to open / time out / aren't gateways are skipped
+        silently. ``ident_mac`` is ``None`` when the reply doesn't carry
+        a parseable MAC string.
+        """
+        found: list[tuple[str, str | None]] = []
+        payload = struct.pack(">BBBB", 0x00, 0x01, 1, 0xFF)
+        ident = b"RaceLink_Gateway_v4"
+        for p in serial.tools.list_ports.comports():
+            try:
+                # Mirror the is-USB filter from discover_and_open.
+                desc = (getattr(p, "description", "") or "").upper()
+                if "USB" not in desc:
+                    continue
+            except Exception:
+                # swallow-ok: portinfo without description -> skip
+                continue
+            tmp = serial.Serial(timeout=0.5)
+            tmp.baudrate = 921600
+            try:
+                tmp.port = p.device
+                try:
+                    tmp.exclusive = True  # type: ignore[attr-defined]
+                except Exception:
+                    # swallow-ok: exclusive flag unsupported on some platforms.
+                    pass
+                tmp.open()
+                time.sleep(0.5)
+                tmp.reset_input_buffer()
+                tmp.write(payload)
+                resp = tmp.read(len(ident) + 17)
+                if not resp or not resp.startswith(ident):
+                    tmp.close()
+                    continue
+                mac_ascii = ""
+                try:
+                    mac_ascii = resp[len(ident):].decode("ascii", errors="ignore").strip().strip("\x00")
+                except Exception:
+                    # swallow-ok: best-effort MAC extraction; tuple still useful with port only.
+                    mac_ascii = ""
+                found.append((p.device, mac_ascii or None))
+            except serial.SerialException:
+                # swallow-ok: busy port / not-a-gateway -> skip silently
+                continue
+            finally:
+                try:
+                    if getattr(tmp, "is_open", False):
+                        tmp.close()
+                except Exception:
+                    # swallow-ok: best-effort close
+                    pass
+        return found
+
     def open(self):
         if not self.port:
             raise RuntimeError("GatewaySerialTransport: no port set")
