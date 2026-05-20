@@ -8,12 +8,19 @@ from .persistence import (
     load_records,
     load_state,
 )
-from .repository import DeviceRepository, GroupRepository, StateRepository, get_runtime_state_repository
+from .repository import (
+    DeviceRepository,
+    GroupRepository,
+    NetworkRepository,
+    StateRepository,
+    get_runtime_state_repository,
+)
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DeviceRepository",
     "GroupRepository",
+    "NetworkRepository",
     "StateRepository",
     "dump_records",
     "dump_state",

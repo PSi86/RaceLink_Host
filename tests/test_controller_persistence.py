@@ -64,10 +64,13 @@ class ControllerPersistenceTests(unittest.TestCase):
         self.assertEqual(key, "rl_state_v1")
 
         payload = json.loads(value)
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(len(payload["devices"]), 1)
         self.assertEqual(payload["devices"][0]["addr"], "AABBCCDDEEFF")
         self.assertEqual(len(payload["groups"]), 2)
+        # Schema v2: networks list is always present, and the v1→v2
+        # migration synthesises the default network.
+        self.assertTrue(len(payload["networks"]) >= 1)
 
     def test_load_from_db_prefers_combined_key(self):
         state = json.dumps(
@@ -140,8 +143,11 @@ class ControllerPersistenceTests(unittest.TestCase):
         combined = db.option("rl_state_v1", None)
         self.assertIsNotNone(combined)
         payload = json.loads(combined)
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["devices"][0]["addr"], "AA11BB22CC33")
+        # v1→v2 migration backfills network_id from the synthesised
+        # default network.
+        self.assertTrue(payload["devices"][0].get("network_id"))
 
         # Legacy keys are preserved for rollback safety.
         self.assertEqual(db.option("rl_device_config", None), legacy_devices)

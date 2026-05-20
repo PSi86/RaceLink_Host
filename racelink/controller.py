@@ -11,6 +11,7 @@ from racelink.domain import (
     RL_DeviceGroup,
     RL_FLAG_HAS_BRI,
     RL_FLAG_POWER_ON,
+    RL_Network,
     build_specials_state,
     create_device,
     state_scope,
@@ -251,6 +252,10 @@ class RaceLink_Host:
         return self.state_repository.groups
 
     @property
+    def network_repository(self):
+        return self.state_repository.networks
+
+    @property
     def backup_device_repository(self):
         return self.state_repository.backup_devices
 
@@ -288,6 +293,7 @@ class RaceLink_Host:
         config_str_state = dump_state(
             self.device_repository.list(),
             groups_to_dump,
+            self.network_repository.list(),
             schema_version=CURRENT_SCHEMA_VERSION,
         )
         self._option_set("rl_state_v1", config_str_state)
@@ -369,6 +375,7 @@ class RaceLink_Host:
         config_list_groups: list[dict]
         needs_migration_save = False
 
+        config_list_networks: list[dict] = []
         if combined_raw in (None, ""):
             legacy_devices, legacy_groups, fresh_install = self._load_from_legacy_keys()
             if fresh_install:
@@ -381,10 +388,11 @@ class RaceLink_Host:
             needs_migration_save = True
             loaded_version = 0
         else:
-            config_list_devices, config_list_groups, loaded_version = load_state(
+            config_list_devices, config_list_groups, config_list_networks, loaded_version = load_state(
                 combined_raw,
                 default_devices=[obj.__dict__ for obj in self.backup_device_repository.list()],
                 default_groups=[obj.__dict__ for obj in self.backup_group_repository.list()],
+                default_networks=[],
                 source="rl_state_v1",
             )
             if loaded_version == 0:
@@ -398,18 +406,20 @@ class RaceLink_Host:
                     config_list_groups = legacy_groups or []
                 needs_migration_save = True
 
-        config_list_devices, config_list_groups, loaded_version = migrate_state(
+        config_list_devices, config_list_groups, config_list_networks, loaded_version = migrate_state(
             list(config_list_devices),
             list(config_list_groups),
+            list(config_list_networks),
             from_version=loaded_version,
         )
         if loaded_version < CURRENT_SCHEMA_VERSION:
             needs_migration_save = True
 
         logger.debug(
-            "RL: Loaded %d devices and %d groups (schema_version=%s)",
+            "RL: Loaded %d devices, %d groups, %d networks (schema_version=%s)",
             len(config_list_devices),
             len(config_list_groups),
+            len(config_list_networks),
             loaded_version,
         )
         loaded_devices = []
@@ -451,20 +461,28 @@ class RaceLink_Host:
                     int(dev_type or 0),
                     device.get("specials") or {},
                 )
-                loaded_devices.append(
-                    create_device(
-                        addr=str(device.get("addr", "")).upper(),
-                        dev_type=int(dev_type or 0),
-                        name=str(device.get("name", "")),
-                        groupId=int(device.get("groupId", 0) or 0),
-                        version=int(device.get("version", 0) or 0),
-                        caps=int(dev_type or 0),
-                        flags=int(flags) & 0xFF,
-                        presetId=int(preset_id) & 0xFF,
-                        brightness=brightness & 0xFF,
-                        specials=special_state,
-                    )
+                dev_obj = create_device(
+                    addr=str(device.get("addr", "")).upper(),
+                    dev_type=int(dev_type or 0),
+                    name=str(device.get("name", "")),
+                    groupId=int(device.get("groupId", 0) or 0),
+                    version=int(device.get("version", 0) or 0),
+                    caps=int(dev_type or 0),
+                    flags=int(flags) & 0xFF,
+                    presetId=int(preset_id) & 0xFF,
+                    brightness=brightness & 0xFF,
+                    specials=special_state,
                 )
+                # Multi-network fields (Stage 2). Backfilled by the
+                # v1→v2 migration above; older payloads see ``None``
+                # which is the by-design "unassigned" sentinel.
+                net_id = device.get("network_id")
+                if net_id:
+                    dev_obj.network_id = str(net_id)
+                lkrf = device.get("last_known_rf_config")
+                if isinstance(lkrf, dict):
+                    dev_obj.last_known_rf_config = dict(lkrf)
+                loaded_devices.append(dev_obj)
             except Exception:
                 logger.exception("RL: failed to load device entry from DB: %r", device)
                 continue
@@ -477,7 +495,11 @@ class RaceLink_Host:
         for group in config_list_groups:
             logger.debug(group)
             group_dev_type = group.get("dev_type", group.get("device_type", 0))
-            loaded_groups.append(RL_DeviceGroup(group["name"], group["static_group"], group_dev_type))
+            grp = RL_DeviceGroup(group["name"], group["static_group"], group_dev_type)
+            net_id = group.get("network_id")
+            if net_id:
+                grp.network_id = str(net_id)
+            loaded_groups.append(grp)
 
         loaded_groups = [
             group
@@ -494,6 +516,29 @@ class RaceLink_Host:
                     group.static_group = 1
                     group.dev_type = 0
         self.group_repository.replace_all(loaded_groups)
+
+        # Networks (Stage 2). The v1→v2 migration ensures at least the
+        # default network is present; we hydrate every record into an
+        # RL_Network object and replace_all so the repository's
+        # identity comparisons (get_by_id / get_by_gateway_mac) work.
+        loaded_networks = []
+        for net in config_list_networks:
+            if not isinstance(net, dict):
+                continue
+            try:
+                loaded_networks.append(RL_Network(
+                    id=net.get("id"),
+                    name=str(net.get("name") or "Default"),
+                    gateway_mac=net.get("gateway_mac"),
+                    region=str(net.get("region") or "EU868"),
+                    channel_id=net.get("channel_id"),
+                    rf_config=net.get("rf_config"),
+                    created_ts=net.get("created_ts"),
+                ))
+            except Exception:
+                logger.exception("RL: failed to load network entry from DB: %r", net)
+                continue
+        self.network_repository.replace_all(loaded_networks)
 
         if needs_migration_save:
             try:
