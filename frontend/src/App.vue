@@ -14,6 +14,7 @@ import WledPresetsDialog from '@/components/modals/WledPresetsDialog.vue'
 import FwUpdateDialog from '@/components/modals/FwUpdateDialog.vue'
 import HostSettingsDialog from '@/components/modals/HostSettingsDialog.vue'
 import GatewayRfConfigDialog from '@/components/modals/GatewayRfConfigDialog.vue'
+import OnboardingWizardDialog from '@/components/modals/OnboardingWizardDialog.vue'
 import BatteryDevicesDialog from '@/components/modals/BatteryDevicesDialog.vue'
 // Resort dialog imports ``vuedraggable`` (~100 kB through Sortable.js).
 // Lazy-load so we only pay that cost when the operator actually opens
@@ -78,6 +79,11 @@ watch(ui.hostSettingsRequest, () => {
 const gatewayRfConfigOpen = ref(false)
 watch(ui.gatewayRfConfigRequest, () => {
   gatewayRfConfigOpen.value = true
+})
+
+const onboardingOpen = ref(false)
+watch(ui.onboardingRequest, () => {
+  onboardingOpen.value = true
 })
 
 const batteryDevicesOpen = ref(false)
@@ -152,6 +158,7 @@ onMounted(async () => {
   <FwUpdateDialog v-model:open="fwUpdateOpen" />
   <HostSettingsDialog v-model:open="hostSettingsOpen" />
   <GatewayRfConfigDialog v-model:open="gatewayRfConfigOpen" />
+  <OnboardingWizardDialog v-model:open="onboardingOpen" />
   <BatteryDevicesDialog v-model:open="batteryDevicesOpen" />
   <ResortGroupsDialog v-model:open="resortGroupsOpen" />
 </template>

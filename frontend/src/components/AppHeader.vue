@@ -79,6 +79,10 @@ function onOpenGatewayRfConfig() {
   ui.requestGatewayRfConfig()
 }
 
+function onOpenOnboarding() {
+  ui.requestOnboarding()
+}
+
 async function onStatusSelection() {
   const macs = Array.from(devices.selected)
   if (macs.length === 0) {
@@ -150,6 +154,14 @@ async function onStatusAll() {
         </button>
         <button class="btn-brand" :disabled="gateway.busy" @click="onSave">Save</button>
         <button :disabled="gateway.busy" @click="onReload">Reload</button>
+        <button
+          title="Pair Assistant (re-pair existing devices to this gateway / migrate RF settings)"
+          aria-label="Pair Assistant"
+          :disabled="gateway.busy"
+          @click="onOpenOnboarding"
+        >
+          🔧
+        </button>
         <button
           title="Gateway RF config (frequency / SF / bandwidth / sync word / TX power)"
           aria-label="Gateway RF config"
