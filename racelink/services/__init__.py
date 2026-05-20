@@ -5,6 +5,7 @@ from .control_service import ControlService
 from .discovery_service import DiscoveryService
 from .gateway_service import GatewayService
 from .host_wifi_service import HostWifiService
+from .onboarding_service import OnboardingService
 from .ota_service import OTAService
 from .ota_workflow_service import OTAWorkflowService
 from .presets_service import PresetsService
@@ -23,6 +24,7 @@ __all__ = [
     "DiscoveryService",
     "GatewayService",
     "HostWifiService",
+    "OnboardingService",
     "OTAService",
     "OTAWorkflowService",
     "PresetsService",

@@ -20,6 +20,7 @@ from racelink.services import (
     ControlService,
     DiscoveryService,
     GatewayService,
+    OnboardingService,
     StartblockService,
     StatusService,
     StreamService,
@@ -202,6 +203,7 @@ class RaceLink_Host:
         self.stream_service = StreamService(self, self.gateway_service)
         self.startblock_service = StartblockService(self, self.stream_service)
         self.sync_service = SyncService(self, self.gateway_service)
+        self.onboarding_service = OnboardingService(self)
 
     def _option(self, key: str, default=None):
         return self._host_api.db.option(key, default)

@@ -491,6 +491,88 @@ def register_api_routes(bp, ctx):
         # here is for the synchronous caller (the WebUI fetch).
         return jsonify(result)
 
+    @bp.route("/api/onboarding/repair", methods=["POST"])
+    def api_onboarding_repair():
+        """Run a single-gateway onboarding repair (Stage 1.5).
+
+        Body shape:
+            {
+                "case": "A" | "B" | "C",
+                "params": { ... }   # case-specific, see below
+            }
+
+        Case A params: {"target_macs": [str, ...] | null, "run_discover": bool?}
+        Case B params: {
+            "old_rf_config": {...},
+            "new_rf_config": {...},
+            "target_macs": [str, ...] | null
+        }
+        Case C params: {"device_rf_config": {...}}
+
+        Long-running cases (B and C reboot the gateway) run inside a
+        TaskManager job; the response carries the task handle and the
+        live progress streams over the existing ``task`` SSE channel.
+        Case A stays inline (typical wall-clock < 2 s per device).
+        """
+        rl = ctx.rl_instance
+        onboarding = getattr(rl, "onboarding_service", None)
+        if onboarding is None:
+            return jsonify({"ok": False, "error": "onboarding_service unavailable"}), 503
+
+        body = request.get_json(silent=True) or {}
+        case = str(body.get("case", "")).strip().upper()
+        params = body.get("params") or {}
+        if case not in ("A", "B", "C"):
+            return jsonify({"ok": False, "error": "case must be 'A', 'B', or 'C'"}), 400
+
+        # Common per-case payload validation. Bad payloads die early so
+        # we never block on a TaskManager job for a malformed request.
+        if case == "B":
+            for key in ("old_rf_config", "new_rf_config"):
+                if not isinstance(params.get(key), dict):
+                    return jsonify({"ok": False, "error": f"params.{key} dict required"}), 400
+        if case == "C":
+            if not isinstance(params.get("device_rf_config"), dict):
+                return jsonify({"ok": False, "error": "params.device_rf_config dict required"}), 400
+
+        # Case A: synchronous (short; no gateway reboot).
+        if case == "A":
+            result = onboarding.case_a_re_pair(
+                target_macs=params.get("target_macs"),
+                run_discover=bool(params.get("run_discover", True)),
+            )
+            return jsonify({"ok": result.get("ok", False), "result": result})
+
+        # Cases B / C: wrap in a TaskManager job so the reboot wait
+        # doesn't tie up the Flask thread.
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(rl)
+
+        def _progress(progress):
+            ctx.tasks.update(meta={**progress, "case": case})
+
+        if case == "B":
+            def _runner():
+                return onboarding.case_b_migrate(
+                    old_rf_config=params["old_rf_config"],
+                    new_rf_config=params["new_rf_config"],
+                    target_macs=params.get("target_macs"),
+                    progress_cb=_progress,
+                )
+            task = ctx.tasks.start("onboarding_case_b", _runner, meta={"case": "B"})
+        else:  # case == "C"
+            def _runner():
+                return onboarding.case_c_align_gateway(
+                    device_rf_config=params["device_rf_config"],
+                    progress_cb=_progress,
+                )
+            task = ctx.tasks.start("onboarding_case_c", _runner, meta={"case": "C"})
+
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
     @bp.route("/api/devices/<mac>/rf_config", methods=["GET"])
     def api_device_rf_config_get(mac):
         """Read back a node's currently active LoRa PHY config via OPC_GET_RF_CONFIG.
