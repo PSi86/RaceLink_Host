@@ -20,12 +20,22 @@ import {
 import { Button } from '@/components/ui/button'
 import { useHostSettingsStore } from '@/stores/hostSettings'
 import { useToast } from '@/composables/useToast'
+import { useUiBus } from '@/composables/useUiBus'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
 
 const hostSettings = useHostSettingsStore()
 const toast = useToast()
+const ui = useUiBus()
+
+function openNetworkManager() {
+  // Hand off to the app-shell-mounted NetworkManagerDialog. Closing
+  // the Host Settings dialog first keeps the z-order predictable —
+  // the operator returns to the AppHeader, not to a stacked modal.
+  emit('update:open', false)
+  ui.requestNetworkManager()
+}
 
 const v2s = ref<number>(6.8)
 const v6s = ref<number>(20.4)
@@ -93,6 +103,20 @@ async function onSubmit(ev?: Event) {
       </DialogHeader>
 
       <form class="grid gap-4" @submit="onSubmit">
+        <section class="rounded-md border border-border bg-card/40 p-3">
+          <h4 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Networks
+          </h4>
+          <div class="flex items-center justify-between text-sm">
+            <div class="text-muted-foreground">
+              Rename, switch channels, or remove configured networks.
+            </div>
+            <Button type="button" variant="secondary" @click="openNetworkManager">
+              Open Network Manager
+            </Button>
+          </div>
+        </section>
+
         <section class="rounded-md border border-border bg-card/40 p-3">
           <h4 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Battery thresholds

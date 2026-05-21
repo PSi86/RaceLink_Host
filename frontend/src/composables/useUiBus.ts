@@ -25,6 +25,11 @@ const resortGroupsRequest = ref(0)
 // per-card action) when an operator wants to recover stranded
 // devices.
 const channelScanRequest = ref(0)
+// Stage 4 Block 3: Network Manager (CRUD on networks). Triggered
+// from the HostSettingsDialog. The SetupChangeAssistant is
+// auto-open-driven by its own diff watcher so it has no UI-bus
+// signal — kept open via its v-model.
+const networkManagerRequest = ref(0)
 
 export function useUiBus() {
   return {
@@ -40,6 +45,7 @@ export function useUiBus() {
     batteryDevicesRequest,
     resortGroupsRequest,
     channelScanRequest,
+    networkManagerRequest,
     requestDiscover() {
       discoverRequest.value += 1
     },
@@ -75,6 +81,9 @@ export function useUiBus() {
     },
     requestChannelScan() {
       channelScanRequest.value += 1
+    },
+    requestNetworkManager() {
+      networkManagerRequest.value += 1
     },
   }
 }

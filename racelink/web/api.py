@@ -510,6 +510,210 @@ def register_api_routes(bp, ctx):
             "default_network_id": masters_snap.get("default_network_id"),
         })
 
+    @bp.route("/api/networks/<network_id>", methods=["PUT"])
+    def api_network_update(network_id: str):
+        """Stage 4 Block 3: rename a network and/or change its
+        region+channel binding.
+
+        Body shape: ``{name?: str, region?: str, channel_id?:
+        int|null, rf_config?: dict|null}``. Channel-driven updates
+        rewrite ``rf_config`` to the channel-table entry's seven
+        wire fields (so the network and the bound gateway speak
+        the same RF); explicit ``rf_config`` overrides the channel
+        lookup for the Advanced-Mode operator who types raw values.
+
+        Returns HTTP 400 on validation failure (unknown channel id,
+        bad region, separation conflict). Persists on success.
+        """
+        from ..domain.rf_channels import channel_rf_config, list_channels
+        from ..domain.rf_policy import (
+            format_conflict, validate_networks_separation,
+        )
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        net = net_repo.get_by_id(network_id)
+        if net is None:
+            return jsonify({"ok": False, "error": f"unknown network_id {network_id!r}"}), 404
+
+        body = request.get_json(silent=True) or {}
+        # Name --------------------------------------------------------
+        new_name = body.get("name", None)
+        if new_name is not None:
+            new_name = str(new_name).strip()
+            if not new_name:
+                return jsonify({"ok": False, "error": "name cannot be empty"}), 400
+        # Region ------------------------------------------------------
+        new_region = body.get("region", None)
+        if new_region is not None:
+            new_region = str(new_region).strip()
+            if not list_channels(new_region):
+                return jsonify({
+                    "ok": False,
+                    "error": f"unknown region {new_region!r}",
+                }), 400
+        effective_region = new_region or getattr(net, "region", None) or "EU868"
+        # Channel + rf_config ----------------------------------------
+        new_channel_id = body.get("channel_id", "__missing__")
+        explicit_rf_config = body.get("rf_config", "__missing__")
+        new_rf_config = None
+        if explicit_rf_config != "__missing__":
+            if explicit_rf_config is None:
+                new_rf_config = None
+            elif isinstance(explicit_rf_config, dict):
+                # Best-effort coercion; the bind/migration validators
+                # also normalise the dict before consuming it.
+                new_rf_config = dict(explicit_rf_config)
+            else:
+                return jsonify({
+                    "ok": False,
+                    "error": "rf_config must be an object",
+                }), 400
+        elif new_channel_id != "__missing__":
+            if new_channel_id is None:
+                new_rf_config = None
+            else:
+                try:
+                    ch_id_int = int(new_channel_id)
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": "channel_id must be an integer"}), 400
+                resolved = channel_rf_config(effective_region, ch_id_int)
+                if resolved is None:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"unknown channel_id {ch_id_int} in region {effective_region!r}",
+                    }), 400
+                new_rf_config = resolved
+        # Speculatively apply on a shallow snapshot so the separation
+        # check sees the would-be state, then run the validator across
+        # every network. Reject before mutating if the policy fails.
+        if new_rf_config is not None:
+            class _SpecView:
+                def __init__(self, real, rf_config):
+                    self._real = real
+                    self.rf_config = rf_config
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+            spec = _SpecView(net, new_rf_config)
+            others = [n for n in net_repo.list() if n is not net]
+            conflicts = validate_networks_separation([spec, *others])
+            if conflicts:
+                return jsonify({
+                    "ok": False,
+                    "error": format_conflict(conflicts[0]),
+                    "detail": {"code": "rf_separation", "conflicts": conflicts},
+                }), 400
+        # Commit ------------------------------------------------------
+        if new_name is not None:
+            net.name = new_name
+        if new_region is not None:
+            net.region = new_region
+        if new_channel_id != "__missing__":
+            try:
+                net.channel_id = int(new_channel_id) if new_channel_id is not None else None
+            except (TypeError, ValueError):
+                net.channel_id = None
+        if new_rf_config is not None or explicit_rf_config is None and new_channel_id is None:
+            net.rf_config = dict(new_rf_config) if new_rf_config is not None else None
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_update: save_to_db failed")
+        # Push the refreshed list to every connected SSE client so
+        # the WebUI's networks store + DeviceTable badge re-render
+        # without a manual refresh.
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({
+            "ok": True,
+            "network": {
+                "id": str(net.id),
+                "name": str(net.name),
+                "region": getattr(net, "region", None),
+                "channel_id": getattr(net, "channel_id", None),
+                "rf_config": getattr(net, "rf_config", None),
+                "gateway_mac": getattr(net, "gateway_mac", None),
+            },
+        })
+
+    @bp.route("/api/networks/<network_id>", methods=["DELETE"])
+    def api_network_delete(network_id: str):
+        """Stage 4 Block 3: delete a network record.
+
+        Refuses when:
+          * the network is the only one left (the device repo and
+            v1→v2 migration both assume at least one network exists);
+          * any device still references it via ``network_id``;
+          * any group still references it via ``network_id``.
+
+        On success the WebUI re-fetches /api/networks via the
+        broadcast refresh and the gateway-bind state machine will
+        re-evaluate any transport whose ident_mac matched the
+        deleted network's ``gateway_mac``.
+        """
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        net = net_repo.get_by_id(network_id)
+        if net is None:
+            return jsonify({"ok": False, "error": f"unknown network_id {network_id!r}"}), 404
+        with ctx.rl_lock:
+            if len(net_repo.list()) <= 1:
+                return jsonify({
+                    "ok": False,
+                    "error": "cannot delete the last network — at least one must exist",
+                }), 400
+            device_refs = [
+                str(getattr(d, "addr", "") or "")
+                for d in ctx.devices()
+                if str(getattr(d, "network_id", "") or "") == str(network_id)
+            ]
+            if device_refs:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"{len(device_refs)} device(s) still reference this "
+                        "network. Migrate or re-assign them first."
+                    ),
+                    "detail": {"code": "devices_attached", "device_macs": device_refs[:8]},
+                }), 400
+            group_refs = [
+                str(getattr(g, "name", "") or "")
+                for g in ctx.groups()
+                if str(getattr(g, "network_id", "") or "") == str(network_id)
+            ]
+            if group_refs:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"{len(group_refs)} group(s) still belong to this "
+                        "network. Reassign them first."
+                    ),
+                    "detail": {"code": "groups_attached", "group_names": group_refs[:8]},
+                }), 400
+            net_repo.remove(net)
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_delete: save_to_db failed")
+        # Drop the bind record for the (possibly now-orphaned) gateway
+        # so the next attach cycle starts clean.
+        bind_service = getattr(rl, "gateway_bind_service", None)
+        gw_mac = str(getattr(net, "gateway_mac", "") or "")
+        if bind_service is not None and gw_mac:
+            try:
+                bind_service.forget(gw_mac)
+            except Exception:
+                logger.exception(
+                    "api_network_delete: bind_service.forget raised",
+                )
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({"ok": True, "deleted_id": str(network_id)})
+
     @bp.route("/api/channels", methods=["GET"])
     def api_channels():
         """Stage 4: shipped region/channel lookup table.

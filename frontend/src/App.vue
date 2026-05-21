@@ -18,6 +18,8 @@ import OnboardingWizardDialog from '@/components/modals/OnboardingWizardDialog.v
 import BatteryDevicesDialog from '@/components/modals/BatteryDevicesDialog.vue'
 import GatewayBindWizard from '@/components/modals/GatewayBindWizard.vue'
 import ChannelScanDialog from '@/components/modals/ChannelScanDialog.vue'
+import NetworkManagerDialog from '@/components/modals/NetworkManagerDialog.vue'
+import SetupChangeAssistant from '@/components/modals/SetupChangeAssistant.vue'
 // Resort dialog imports ``vuedraggable`` (~100 kB through Sortable.js).
 // Lazy-load so we only pay that cost when the operator actually opens
 // the dialog — otherwise it would land in the main bundle on every
@@ -110,6 +112,18 @@ watch(ui.channelScanRequest, () => {
   channelScanOpen.value = true
 })
 
+// Stage 4 Block 3: Network Manager (CRUD). Triggered from
+// HostSettingsDialog's "Open Network Manager" link.
+const networkManagerOpen = ref(false)
+watch(ui.networkManagerRequest, () => {
+  networkManagerOpen.value = true
+})
+
+// Stage 4 Block 3: Setup-Change Assistant. The assistant manages
+// its own open/dismiss state via the derived ``diffs`` watcher
+// inside the component; we just keep a ref for v-model binding.
+const setupAssistantOpen = ref(false)
+
 // Initialise SSE once for the whole app. ``useRaceLinkEvents`` registers
 // onScopeDispose, so when this component unmounts (full-page navigation
 // away) the EventSource is closed synchronously — the structural fix for
@@ -186,4 +200,6 @@ onMounted(async () => {
   <ResortGroupsDialog v-model:open="resortGroupsOpen" />
   <GatewayBindWizard />
   <ChannelScanDialog v-model:open="channelScanOpen" />
+  <NetworkManagerDialog v-model:open="networkManagerOpen" />
+  <SetupChangeAssistant v-model:open="setupAssistantOpen" />
 </template>
