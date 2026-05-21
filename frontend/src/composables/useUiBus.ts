@@ -20,6 +20,11 @@ const gatewayRfConfigRequest = ref(0)
 const onboardingRequest = ref(0)
 const batteryDevicesRequest = ref(0)
 const resortGroupsRequest = ref(0)
+// Stage 4 Block 2: Channel-Scan wizard. Triggered from the
+// AppHeader's wrench-menu (or future GatewayStatusBar's
+// per-card action) when an operator wants to recover stranded
+// devices.
+const channelScanRequest = ref(0)
 
 export function useUiBus() {
   return {
@@ -34,6 +39,7 @@ export function useUiBus() {
     onboardingRequest,
     batteryDevicesRequest,
     resortGroupsRequest,
+    channelScanRequest,
     requestDiscover() {
       discoverRequest.value += 1
     },
@@ -66,6 +72,9 @@ export function useUiBus() {
     },
     requestResortGroups() {
       resortGroupsRequest.value += 1
+    },
+    requestChannelScan() {
+      channelScanRequest.value += 1
     },
   }
 }

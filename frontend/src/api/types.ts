@@ -201,6 +201,34 @@ export interface Channel extends RfConfig {
   name: string
 }
 
+/** Stage 4 Block 2: gateway-bind state machine snapshot (one entry
+ *  per attached gateway, keyed by ``ident_mac``). Emitted by
+ *  ``GET /api/gateways`` and via the SSE ``gateway_bound`` /
+ *  ``gateway_conflict`` / ``gateway_unbound`` events. The wizard
+ *  drives operator-facing resolve actions
+ *  (``POST /api/gateways/{ident_mac}/resolve``). */
+export type GatewayBindState = 'pending' | 'bound' | 'conflict' | 'unbound'
+
+export interface GatewayBindRecord {
+  ident_mac: string
+  state: GatewayBindState
+  network_id?: string | null
+  network_name?: string | null
+  rf_config_actual?: RfConfig | null
+  rf_config_expected?: RfConfig | null
+  conflict_fields?: string[]
+  migration_pending?: boolean
+  last_evaluated_ts?: number
+  /** Wizard continuation token — sent back on resolve so a stale
+   *  dialog answer doesn't override a re-evaluated record. */
+  token: string
+}
+
+export interface GatewaysResponse {
+  ok: boolean
+  gateways: GatewayBindRecord[]
+}
+
 export interface DevicesResponse {
   ok: boolean
   devices: Device[]

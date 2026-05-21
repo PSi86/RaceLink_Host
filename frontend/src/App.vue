@@ -16,6 +16,8 @@ import HostSettingsDialog from '@/components/modals/HostSettingsDialog.vue'
 import GatewayRfConfigDialog from '@/components/modals/GatewayRfConfigDialog.vue'
 import OnboardingWizardDialog from '@/components/modals/OnboardingWizardDialog.vue'
 import BatteryDevicesDialog from '@/components/modals/BatteryDevicesDialog.vue'
+import GatewayBindWizard from '@/components/modals/GatewayBindWizard.vue'
+import ChannelScanDialog from '@/components/modals/ChannelScanDialog.vue'
 // Resort dialog imports ``vuedraggable`` (~100 kB through Sortable.js).
 // Lazy-load so we only pay that cost when the operator actually opens
 // the dialog — otherwise it would land in the main bundle on every
@@ -26,6 +28,7 @@ const ResortGroupsDialog = defineAsyncComponent(
 import { useUiBus } from '@/composables/useUiBus'
 
 import { useGatewayStore } from '@/stores/gateway'
+import { useGatewaysStore } from '@/stores/gateways'
 import { useDevicesStore } from '@/stores/devices'
 import { useGroupsStore } from '@/stores/groups'
 import { useNetworksStore } from '@/stores/networks'
@@ -37,6 +40,7 @@ import { useRaceLinkEvents } from '@/composables/useRaceLinkEvents'
 
 const route = useRoute()
 const gateway = useGatewayStore()
+const gateways = useGatewaysStore()
 const devices = useDevicesStore()
 const groups = useGroupsStore()
 const networks = useNetworksStore()
@@ -98,6 +102,14 @@ watch(ui.resortGroupsRequest, () => {
   resortGroupsOpen.value = true
 })
 
+// Stage 4 Block 2: Channel-Scan wizard. The bind wizard manages its
+// own open state via the gateways store's attentionRecord; only the
+// operator-driven channel-scan dialog needs the UI-bus signal.
+const channelScanOpen = ref(false)
+watch(ui.channelScanRequest, () => {
+  channelScanOpen.value = true
+})
+
 // Initialise SSE once for the whole app. ``useRaceLinkEvents`` registers
 // onScopeDispose, so when this component unmounts (full-page navigation
 // away) the EventSource is closed synchronously — the structural fix for
@@ -117,6 +129,10 @@ onMounted(async () => {
     // ``loadChannels`` call caches for the session.
     networks.load().catch(() => undefined),
     networks.loadChannels().catch(() => undefined),
+    // Stage 4 Block 2: gateway bind-state snapshot. SSE keeps it
+    // live; the initial load fills the wizard's attention check on
+    // a freshly-loaded session.
+    gateways.load().catch(() => undefined),
     specials.load().catch(() => undefined),
     // RL-preset schema + list — needed by the editor dialog AND by the
     // Specials ``rl_preset`` action's preset picker. Loading at boot
@@ -168,4 +184,6 @@ onMounted(async () => {
   <OnboardingWizardDialog v-model:open="onboardingOpen" />
   <BatteryDevicesDialog v-model:open="batteryDevicesOpen" />
   <ResortGroupsDialog v-model:open="resortGroupsOpen" />
+  <GatewayBindWizard />
+  <ChannelScanDialog v-model:open="channelScanOpen" />
 </template>

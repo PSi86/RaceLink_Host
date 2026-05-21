@@ -83,6 +83,10 @@ function onOpenOnboarding() {
   ui.requestOnboarding()
 }
 
+function onOpenChannelScan() {
+  ui.requestChannelScan()
+}
+
 async function onStatusSelection() {
   const macs = Array.from(devices.selected)
   if (macs.length === 0) {
@@ -169,6 +173,14 @@ async function onStatusAll() {
           @click="onOpenGatewayRfConfig"
         >
           📡
+        </button>
+        <button
+          title="Channel scan — sweep the region's channels on one gateway to find stranded devices"
+          aria-label="Channel scan"
+          :disabled="gateway.busy"
+          @click="onOpenChannelScan"
+        >
+          🔎
         </button>
         <button
           title="Host settings (battery thresholds, …)"
