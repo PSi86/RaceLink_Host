@@ -243,6 +243,13 @@ class RaceLink_Host:
         # who's listening on each.
         from racelink.services.channel_scan_service import ChannelScanService
         self.channel_scan_service = ChannelScanService(controller=self)
+        # Round 3: uniform per-network reconnect tracker. Polls
+        # ``soft_rediscover`` while any expected (RL_Network.gateway_mac)
+        # MAC is missing from the attached transports, surfacing the
+        # missing set via the SSE ``gateway_missing`` event. Broadcast
+        # is wired later by the blueprint.
+        from racelink.services.missing_transport_tracker import MissingTransportTracker
+        self.missing_transport_tracker = MissingTransportTracker(controller=self)
 
     def _option(self, key: str, default=None):
         return self._host_api.db.option(key, default)
@@ -794,6 +801,35 @@ class RaceLink_Host:
         hooks, and run the network auto-bind. Returns the bound
         ``network_id`` or ``None``.
         """
+        # Round 4 Task 2: idempotent attach. ``soft_rediscover`` (Round 3)
+        # and the legacy ``discoverPort`` auto-retry path can race on the
+        # same USB device — both opening ``/dev/ttyUSBx`` and calling
+        # _attach_transport in quick succession. Without this guard we'd
+        # end up with two transport objects carrying the same ident_mac,
+        # one of them shadowed and its reader thread doomed to fire
+        # EV_ERROR shortly afterwards. Detecting the duplicate here and
+        # discarding the latecomer keeps ``_transports`` clean.
+        ident = (getattr(transport, "ident_mac", None) or "").upper() or None
+        if ident:
+            for existing in list(self._transports):
+                existing_ident = (getattr(existing, "ident_mac", None) or "").upper() or None
+                if existing_ident == ident:
+                    logger.warning(
+                        "RaceLink: _attach_transport skipped duplicate for "
+                        "ident_mac=%s (already attached on %s); closing the "
+                        "redundant transport",
+                        ident, getattr(existing, "port", "?"),
+                    )
+                    close = getattr(transport, "close", None)
+                    if callable(close):
+                        # Close async — the caller may be holding a lock
+                        # the transport's read thread blocks on.
+                        threading.Thread(
+                            target=close, daemon=True,
+                            name=f"rl-dup-transport-close-{ident}",
+                        ).start()
+                    return str(getattr(existing, "network_id", "") or "") or None
+
         try:
             transport.start()
         except Exception:
@@ -814,7 +850,7 @@ class RaceLink_Host:
         self._transports.append(transport)
         bound_id = self._bind_transport_to_network(transport)
         # Install hooks per-transport (Part 3 made this per-id idempotent).
-        self._install_transport_hooks()
+        self._install_transport_hooks(transport)
         # Stage 3 Part D: run the bind state machine. The service
         # probes the gateway's NVS RF config and broadcasts the
         # ``gateway_bound`` / ``gateway_conflict`` / ``gateway_unbound``
@@ -832,7 +868,151 @@ class RaceLink_Host:
                     "RaceLink: gateway_bind_service.evaluate raised for %s",
                     getattr(transport, "ident_mac", "?"),
                 )
+        # Round 5 follow-up: seed the per-gateway master state so the
+        # MasterBar pill flips to its real colour right after attach
+        # rather than sitting at grey/UNKNOWN until the operator hits
+        # ↻ (or some spontaneous EV_STATE_CHANGED fires). The reply
+        # comes back as EV_STATE_REPORT and the SSE bridge's listener
+        # writes it into MasterStateMap; from there it fans out as a
+        # ``master`` SSE event and the gateways store picks it up.
+        # Fire-and-forget: the 1-byte send is non-blocking and we
+        # don't need the synchronous return.
+        try:
+            send_state = getattr(transport, "send_state_request", None)
+            if callable(send_state):
+                send_state()
+        except Exception:
+            logger.debug(
+                "RaceLink: post-attach send_state_request raised for %s",
+                getattr(transport, "ident_mac", "?"), exc_info=True,
+            )
+        # Round 4 Task 1: cancel the global auto-retry timer that was
+        # armed on the prior _record_gateway_error. Without this, a
+        # successful soft_rediscover attach leaves the 5s timer ticking
+        # — when it fires, ``discoverPort({}, origin="auto")`` calls
+        # _close_all_transports() and tears down the freshly-attached
+        # transport, restarting the disconnect/reconnect cycle.
+        # ``_clear_gateway_error`` also resets failure counters + fires
+        # the on_gateway_status_changed callback so the banner clears.
+        self._clear_gateway_error()
         return bound_id
+
+    def format_gateway_label(self, gateway_id) -> str:
+        """Compact human label for log prefixing: ``[#0 1C:10/Pit-Lane]``.
+
+        Combines three pieces of context to make multi-gateway debug
+        logs scannable without cross-referencing a separate boot line:
+
+          * ``#N`` — index in ``_transports`` (attach order, useful for
+            "is this the primary or secondary?").
+          * ``XXXX`` — last 4 hex chars of ``ident_mac`` (stable per
+            hardware unit, survives reconnects).
+          * Network name from the bound ``RL_Network`` (operator-
+            friendly identifier — Pit-Lane / Default / etc.).
+
+        Returns ``[? unknown]`` when ``gateway_id`` is empty or no
+        transport / network matches it (pre-handshake events,
+        disconnected transports still emitting a final EV_ERROR).
+        """
+        if not gateway_id:
+            return "[? unknown]"
+        mac = str(gateway_id).upper()
+        short = mac.replace(":", "")[-4:] or "????"
+        idx: Optional[int] = None
+        for i, t in enumerate(self._transports):
+            if (getattr(t, "ident_mac", "") or "").upper() == mac:
+                idx = i
+                break
+        network_name: Optional[str] = None
+        try:
+            net = self.network_repository.get_by_gateway_mac(mac)
+            if net is not None:
+                network_name = str(getattr(net, "name", "") or "") or None
+        except Exception:
+            # swallow-ok: label is diagnostic — fall back to MAC-only.
+            network_name = None
+        parts: list[str] = []
+        if idx is not None:
+            parts.append(f"#{idx}")
+        parts.append(short)
+        prefix = " ".join(parts)
+        if network_name:
+            return f"[{prefix}/{network_name}]"
+        return f"[{prefix}]"
+
+    def soft_rediscover(self) -> int:
+        """Enumerate USB-attached RaceLink gateways and attach any that
+        are NOT already present in ``self._transports``. Unlike
+        :meth:`discoverPort`, this does NOT close existing transports —
+        it is the per-network hot-reconnect path driven by
+        :class:`MissingTransportTracker`.
+
+        Returns the number of freshly-attached transports.
+        """
+        # Round 5 follow-up: pass the set of currently-attached ports
+        # to ``enumerate_all`` so it does NOT probe them. Production
+        # ``open()`` does not flock — probing an already-attached
+        # /dev/ttyUSBx writes the IDENTIFY payload onto the live
+        # gateway's USB-CDC stream and corrupts it, eventually firing
+        # EV_ERROR on the previously-healthy transport. (Bench-test #6
+        # cascade: B detach → tracker poll 5s later → enumerate_all
+        # probes /dev/ttyUSB0 still owned by A → A's reader sees garbage
+        # → A also detaches.)
+        attached_ports = {
+            getattr(t, "port", None)
+            for t in self._transports
+            if getattr(t, "port", None)
+        }
+        try:
+            found = GatewaySerialTransport.enumerate_all(exclude_ports=attached_ports)
+        except Exception:
+            logger.exception("RaceLink: soft_rediscover enumerate_all raised")
+            return 0
+
+        attached_macs = {
+            (getattr(t, "ident_mac", "") or "").upper()
+            for t in self._transports
+            if getattr(t, "ident_mac", None)
+        }
+        tracker = getattr(self, "missing_transport_tracker", None)
+        cancelled = tracker.cancelled_macs() if tracker is not None else set()
+
+        new_count = 0
+        for port, ident_mac in found:
+            mac_upper = (ident_mac or "").upper()
+            if mac_upper and mac_upper in attached_macs:
+                continue
+            if mac_upper and mac_upper in cancelled:
+                continue
+            try:
+                t = GatewaySerialTransport(port=port, on_event=None)
+                if ident_mac:
+                    try:
+                        t.ident_mac = ident_mac
+                    except Exception:
+                        logger.debug(
+                            "RaceLink: could not stamp ident_mac=%s on rediscovered transport %s",
+                            ident_mac, port, exc_info=True,
+                        )
+                t.open()
+            except Exception:
+                logger.warning(
+                    "RaceLink: soft_rediscover failed to open %s (ident_mac=%s); skipping",
+                    port, ident_mac, exc_info=True,
+                )
+                continue
+            bound_id = self._attach_transport(t)
+            if bound_id is None and ident_mac is None:
+                # _attach_transport already closed the transport on
+                # start failure; nothing more to do.
+                continue
+            new_count += 1
+            attached_macs.add(mac_upper)
+            logger.info(
+                "RaceLink: soft_rediscover attached %s (ident_mac=%s, network=%s)",
+                port, ident_mac or "?", bound_id or "unbound",
+            )
+        return new_count
 
     def discoverPort(self, args, *, origin: Optional[str] = None) -> None:
         """Initialize the active gateway transports.
@@ -1002,6 +1182,19 @@ class RaceLink_Host:
                     "RaceLink: %d gateways attached (primary=%s ident=%s)",
                     opened_count, primary_port or "?", primary_ident or "?",
                 )
+            # Round 3: re-evaluate the missing-transport tracker after
+            # every successful discovery cycle so the gateway_missing
+            # banner reflects the post-discovery state (and the poll
+            # auto-arms if any RL_Network with a gateway_mac is still
+            # missing from _transports).
+            tracker = getattr(self, "missing_transport_tracker", None)
+            if tracker is not None:
+                try:
+                    tracker.evaluate_and_arm()
+                except Exception:
+                    logger.exception(
+                        "RaceLink: missing_transport_tracker.evaluate_and_arm raised",
+                    )
         except Exception as ex:
             # swallow-ok: discoverPort surfaces failures via the
             # gateway-error record (red banner). Include the type so a
@@ -1079,6 +1272,16 @@ class RaceLink_Host:
         self._gateway_failure_count = 0
         self._gateway_retry_attempt = 0
         self._cancel_gateway_retry()
+        # Round 5 follow-up: clearing the error implies the gateway is
+        # available. Pre-Round-4 only ``discoverPort`` called this and
+        # had set ``self.ready = True`` itself one line earlier; the new
+        # soft_rediscover → _attach_transport → _clear_gateway_error
+        # path didn't, leaving ``controller.ready=False`` even though a
+        # transport was successfully attached — visible as the legacy
+        # "RaceLink Gateway is not available" banner persisting until
+        # the operator hard-refreshed the browser.
+        self.ready = True
+        self._link_recovery_pending = False
         if was_unready:
             self._notify_gateway_status()
 
@@ -1175,6 +1378,14 @@ class RaceLink_Host:
             return
         self._shutdown_called = True
         self._cancel_gateway_retry()
+        tracker = getattr(self, "missing_transport_tracker", None)
+        if tracker is not None:
+            try:
+                tracker.shutdown()
+            except Exception:
+                logger.exception(
+                    "RaceLink: missing_transport_tracker.shutdown raised",
+                )
         # Stage 2 Part 5: close every attached transport, not just the
         # primary slot — at N>1 the secondary transports would
         # otherwise leak their exclusive OS file-descriptor locks past
@@ -1778,8 +1989,17 @@ class RaceLink_Host:
     def _handle_ack_event(self, ev: dict) -> None:
         return self.gateway_service.handle_ack_event(ev)
 
-    def _install_transport_hooks(self) -> None:
-        return self.gateway_service.install_transport_hooks()
+    def _install_transport_hooks(self, transport=None) -> None:
+        # Pass the freshly-attached transport through so the service
+        # installs its RX listener on THAT transport rather than
+        # defaulting to ``self.transport`` (= _transports[0]). Without
+        # this argument every _attach_transport call past the first
+        # would re-install on the primary (already in installed_set
+        # → early return) and the secondary transport's RX would
+        # silently bypass on_transport_event, breaking IDENTIFY_REPLY
+        # handling, link_online updates, and EV_ERROR disconnect
+        # detection on every non-primary gateway.
+        return self.gateway_service.install_transport_hooks(transport=transport)
 
     def _on_transport_tx(self, ev: dict) -> None:
         return self.gateway_service.on_transport_tx(ev)

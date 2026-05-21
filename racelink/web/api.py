@@ -942,6 +942,99 @@ def register_api_routes(bp, ctx):
         # here is for the synchronous caller (the WebUI fetch).
         return jsonify(result)
 
+    @bp.route("/api/gateways/query-state", methods=["POST"])
+    def api_gateways_query_state():
+        """Round 3 Task 4: fan out STATE_REQUEST to every attached
+        transport and return one result per gateway. The new MasterBar
+        ↻-button uses this so all per-gateway pills refresh at once.
+
+        Returns ``{ok: True, gateways: [{ident_mac, state, ...}, ...]}``.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_state", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        transports = list(getattr(rl, "transports", None) or ())
+        results = []
+        for t in transports:
+            r = query(transport=t)
+            if isinstance(r, dict):
+                r = dict(r)
+                r["ident_mac"] = (getattr(t, "ident_mac", "") or "").upper() or None
+            results.append(r)
+        return jsonify({"ok": True, "gateways": results})
+
+    @bp.route("/api/gateway/rediscover", methods=["POST"])
+    def api_gateway_rediscover():
+        """Round 3 Task 3: manual re-discover trigger. Runs
+        ``soft_rediscover`` synchronously and clears the tracker's
+        cancel list so a previously-cancelled MAC becomes pollable
+        again. Operator entry-point lives in the Pair Assistant.
+        """
+        rl = ctx.rl_instance
+        soft = getattr(rl, "soft_rediscover", None)
+        tracker = getattr(rl, "missing_transport_tracker", None)
+        if not callable(soft) or tracker is None:
+            return jsonify({
+                "ok": False,
+                "error": "controller does not support soft rediscover",
+            }), 503
+        try:
+            tracker.clear_cancelled()
+            attached = int(soft())
+        except Exception as ex:
+            logger.exception("api_gateway_rediscover: soft_rediscover failed")
+            return jsonify({
+                "ok": False,
+                "error": f"{type(ex).__name__}: {ex}",
+            }), 500
+        # evaluate_and_arm broadcasts the post-rediscover state.
+        try:
+            tracker.evaluate_and_arm()
+        except Exception:
+            pass  # swallow-ok: re-arm already logs internally
+        return jsonify({
+            "ok": True,
+            "attached": attached,
+            "missing": tracker.snapshot(),
+        })
+
+    @bp.route("/api/gateway/cancel-reconnect", methods=["POST"])
+    def api_gateway_cancel_reconnect():
+        """Round 3 Task 5: operator-driven suppression of the
+        reconnect poll for a specific ident_mac (or all currently-
+        missing transports when body's ``ident_mac`` is null/absent).
+        Re-enable later with ``/api/gateway/rediscover``.
+        """
+        rl = ctx.rl_instance
+        tracker = getattr(rl, "missing_transport_tracker", None)
+        if tracker is None:
+            return jsonify({
+                "ok": False,
+                "error": "missing_transport_tracker unavailable",
+            }), 503
+        body = request.get_json(silent=True) or {}
+        ident_mac = body.get("ident_mac")
+        if ident_mac is not None and not isinstance(ident_mac, str):
+            return jsonify({
+                "ok": False,
+                "error": "ident_mac must be a string or null",
+            }), 400
+        try:
+            tracker.cancel(ident_mac if ident_mac else None)
+        except Exception as ex:
+            logger.exception("api_gateway_cancel_reconnect: tracker.cancel failed")
+            return jsonify({
+                "ok": False,
+                "error": f"{type(ex).__name__}: {ex}",
+            }), 500
+        return jsonify({
+            "ok": True,
+            "cancelled": sorted(tracker.cancelled_macs()),
+            "missing": tracker.snapshot(),
+        })
+
     @bp.route("/api/onboarding/repair", methods=["POST"])
     def api_onboarding_repair():
         """Run a single-gateway onboarding repair (Stage 1.5).
@@ -1104,48 +1197,31 @@ def register_api_routes(bp, ctx):
             return jsonify(result), 400
         return jsonify(result), 503
 
-    @bp.route("/api/gateway/rf_config", methods=["GET"])
-    def api_gateway_rf_config_get():
-        """Read the gateway's currently active LoRa PHY config over USB-CDC.
+    def _resolve_transport_by_ident(ident_mac: str):
+        """Walk the controller's transport list and return the one whose
+        ``ident_mac`` matches. Case-insensitive. Returns ``None`` if no
+        attached gateway carries that MAC."""
+        rl = ctx.rl_instance
+        transports = list(getattr(rl, "transports", None) or [])
+        target = str(ident_mac or "").upper()
+        for t in transports:
+            if str(getattr(t, "ident_mac", "") or "").upper() == target:
+                return t
+        return None
 
-        Sends GW_CMD_GET_RF_CONFIG; replies via EV_RF_CHANGED. Returns
-        ``{"ok": bool, "rf_config": {...}}`` on success.
-
-        Body fields (P_RfConfig wire layout):
-            freq_hz, bw_khz_x10, sf, cr_den, sync_word, tx_power_dbm,
-            preamble.
-        """
+    def _rf_config_get(transport):
         rl = ctx.rl_instance
         gw = getattr(rl, "gateway_service", None)
         query = getattr(gw, "query_gateway_rf_config", None) if gw is not None else None
         if not callable(query):
             return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
-        result = query()
+        result = query(transport=transport) if transport is not None else query()
         if not result.get("ok"):
             # 504 = gateway timeout (USB connected but no reply within bound).
             return jsonify(result), 504
         return jsonify(result)
 
-    @bp.route("/api/gateway/rf_config", methods=["POST"])
-    def api_gateway_rf_config_set():
-        """Write a new LoRa PHY config to the gateway over USB-CDC.
-
-        Expected JSON body:
-            {
-                "rf_config": {
-                    "freq_hz": 867700000,
-                    "bw_khz_x10": 1250,
-                    "sf": 7, "cr_den": 5, "sync_word": 18,
-                    "tx_power_dbm": 14, "preamble": 8
-                },
-                "persist": true  # optional, default true
-            }
-
-        ``persist=true`` writes NVS and reboots the gateway. ``persist=false``
-        live-reconfigures without persisting (channel-scan mode). The reply
-        echoes the EV_RF_CHANGED reason; HTTP 400 for validation rejections,
-        504 for transport timeouts.
-        """
+    def _rf_config_set(transport):
         rl = ctx.rl_instance
         gw = getattr(rl, "gateway_service", None)
         setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
@@ -1167,7 +1243,10 @@ def register_api_routes(bp, ctx):
             }), 400
 
         persist = bool(payload.get("persist", True))
-        result = setter(rf_config, persist=persist)
+        kwargs = {"persist": persist}
+        if transport is not None:
+            kwargs["transport"] = transport
+        result = setter(rf_config, **kwargs)
         if result.get("ok"):
             return jsonify(result)
         # reason-based status code: range / NVS rejections are 400 (caller
@@ -1176,6 +1255,77 @@ def register_api_routes(bp, ctx):
         if reason is None:
             return jsonify(result), 504
         return jsonify(result), 400
+
+    @bp.route("/api/gateway/rf_config", methods=["GET"])
+    def api_gateway_rf_config_get():
+        """Legacy single-gateway read of the LoRa PHY config — defaults
+        to the controller's primary transport slot. New code should use
+        ``GET /api/gateways/<ident_mac>/rf_config`` for explicit
+        addressing on multi-gateway deployments.
+
+        Sends GW_CMD_GET_RF_CONFIG; replies via EV_RF_CHANGED. Returns
+        ``{"ok": bool, "rf_config": {...}}`` on success.
+
+        Body fields (P_RfConfig wire layout):
+            freq_hz, bw_khz_x10, sf, cr_den, sync_word, tx_power_dbm,
+            preamble.
+        """
+        return _rf_config_get(transport=None)
+
+    @bp.route("/api/gateway/rf_config", methods=["POST"])
+    def api_gateway_rf_config_set():
+        """Legacy single-gateway write of the LoRa PHY config — defaults
+        to the controller's primary transport slot. New code should use
+        ``POST /api/gateways/<ident_mac>/rf_config`` for explicit
+        addressing on multi-gateway deployments.
+
+        Expected JSON body:
+            {
+                "rf_config": {
+                    "freq_hz": 867700000,
+                    "bw_khz_x10": 1250,
+                    "sf": 7, "cr_den": 5, "sync_word": 18,
+                    "tx_power_dbm": 14, "preamble": 8
+                },
+                "persist": true  # optional, default true
+            }
+
+        ``persist=true`` writes NVS and reboots the gateway. ``persist=false``
+        live-reconfigures without persisting (channel-scan mode). The reply
+        echoes the EV_RF_CHANGED reason; HTTP 400 for validation rejections,
+        504 for transport timeouts.
+        """
+        return _rf_config_set(transport=None)
+
+    @bp.route("/api/gateways/<ident_mac>/rf_config", methods=["GET"])
+    def api_gateway_rf_config_get_for(ident_mac: str):
+        """Per-gateway read of the LoRa PHY config (multi-gateway).
+
+        Same response shape as ``/api/gateway/rf_config``. Returns 404
+        if no attached transport carries ``ident_mac``.
+        """
+        transport = _resolve_transport_by_ident(ident_mac)
+        if transport is None:
+            return jsonify({
+                "ok": False,
+                "error": f"no attached gateway with ident_mac={ident_mac!r}",
+            }), 404
+        return _rf_config_get(transport=transport)
+
+    @bp.route("/api/gateways/<ident_mac>/rf_config", methods=["POST"])
+    def api_gateway_rf_config_set_for(ident_mac: str):
+        """Per-gateway write of the LoRa PHY config (multi-gateway).
+
+        Same request/response shape as ``/api/gateway/rf_config``.
+        Returns 404 if no attached transport carries ``ident_mac``.
+        """
+        transport = _resolve_transport_by_ident(ident_mac)
+        if transport is None:
+            return jsonify({
+                "ok": False,
+                "error": f"no attached gateway with ident_mac={ident_mac!r}",
+            }), 404
+        return _rf_config_set(transport=transport)
 
     @bp.route("/api/task", methods=["GET"])
     def api_task():

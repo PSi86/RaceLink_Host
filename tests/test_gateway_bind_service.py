@@ -81,10 +81,66 @@ class _FakeTransport:
         self.port = port
 
 
-class _FakeController:
+class _FakeTaskManager:
+    """Mirrors the subset of ``racelink.web.tasks.TaskManager`` that
+    ``_action_accept_host`` touches: ``is_running``, ``start``,
+    ``update``. Tracks every call so tests can assert ordering."""
+
+    def __init__(self, *, start_returns_none=False):
+        self.start_calls: list[dict] = []
+        self.update_calls: list[dict] = []
+        self._running = False
+        self._start_returns_none = start_returns_none
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self, name, target_fn, meta=None):
+        self.start_calls.append({
+            "name": name,
+            "target_fn": target_fn,
+            "meta": dict(meta or {}),
+        })
+        if self._start_returns_none:
+            return None
+        self._running = True
+        return {
+            "id": len(self.start_calls),
+            "name": name,
+            "state": "running",
+            "meta": dict(meta or {}),
+        }
+
+    def update(self, **updates):
+        self.update_calls.append(dict(updates))
+
+    def force_busy(self):
+        self._running = True
+
+
+class _FakeRfMigrationService:
+    """Records the migrate_network_to calls; never actually runs."""
+
     def __init__(self):
+        self.calls: list[dict] = []
+
+    def migrate_network_to(self, *, network_id, target_rf_config, progress_cb=None,
+                           force_offline=False):
+        self.calls.append({
+            "network_id": network_id,
+            "target_rf_config": dict(target_rf_config),
+            "progress_cb": progress_cb,
+            "force_offline": force_offline,
+        })
+        return {"ok": True, "summary": {}}
+
+
+class _FakeController:
+    def __init__(self, *, task_manager=None, rf_migration_service=None):
         self.network_repository = _FakeNetworkRepository()
         self._transports: list[_FakeTransport] = []
+        self._task_manager = task_manager
+        self.rf_migration_service = rf_migration_service
 
     @property
     def transports(self):
@@ -209,8 +265,12 @@ class CaseBKnownGatewayConflictTests(unittest.TestCase):
         # SSE: the conflict event then a fresh bound event.
         self.assertEqual(broadcasts[-1][0], GatewayBindService.EVENT_BOUND)
 
-    def test_resolve_accept_host_parks_migration_pending(self):
-        ctrl, _gw, svc, _broadcasts, _persists = _make_service(
+    def test_resolve_accept_host_starts_migration_task(self):
+        tasks = _FakeTaskManager()
+        migration = _FakeRfMigrationService()
+        ctrl = _FakeController(task_manager=tasks, rf_migration_service=migration)
+        _ctrl, _gw, svc, _broadcasts, _persists = _make_service(
+            ctrl=ctrl,
             gw=_FakeGatewayService(configs={"GW-A": _GATEWAY_CFG_DIVERGE}),
         )
         net = RL_Network(name="Track A", gateway_mac="GW-A",
@@ -224,15 +284,83 @@ class CaseBKnownGatewayConflictTests(unittest.TestCase):
         out = svc.resolve("GW-A", "accept_host", {"token": rec_initial.token})
 
         self.assertTrue(out["ok"])
-        # State stays CONFLICT; migration_pending flips on. Part E
-        # ships the migration job that flips it to BOUND.
+        # State stays CONFLICT; migration_pending flips on. The
+        # migration engine flips state to BOUND on completion.
         self.assertEqual(out["state"], "conflict")
         self.assertTrue(out["migration_pending"])
+        # Wizard receives a task_id so it can subscribe to the SSE
+        # ``task`` channel and render live progress.
+        self.assertIn("task_id", out)
+        self.assertIsNotNone(out["task_id"])
         rec = svc.get("GW-A")
         assert rec is not None
         self.assertTrue(rec.migration_pending)
         # Network's rf_config is unchanged (still the host's).
         self.assertEqual(net.rf_config, _HOST_CFG)
+        # TaskManager.start was called exactly once with the right name.
+        self.assertEqual(len(tasks.start_calls), 1)
+        self.assertEqual(tasks.start_calls[0]["name"], "rf_migration")
+        self.assertEqual(tasks.start_calls[0]["meta"]["network_id"], net.id)
+        self.assertEqual(tasks.start_calls[0]["meta"]["ident_mac"], "GW-A")
+        # The runner is wired up but the FakeTaskManager doesn't spawn
+        # a thread, so migration.migrate_network_to is not invoked
+        # synchronously here. Invoke the runner to verify wiring.
+        runner = tasks.start_calls[0]["target_fn"]
+        runner()
+        self.assertEqual(len(migration.calls), 1)
+        self.assertEqual(migration.calls[0]["network_id"], net.id)
+        self.assertEqual(migration.calls[0]["target_rf_config"], _HOST_CFG)
+        self.assertTrue(callable(migration.calls[0]["progress_cb"]))
+
+    def test_resolve_accept_host_refuses_when_task_manager_busy(self):
+        tasks = _FakeTaskManager()
+        tasks.force_busy()
+        migration = _FakeRfMigrationService()
+        ctrl = _FakeController(task_manager=tasks, rf_migration_service=migration)
+        _ctrl, _gw, svc, _broadcasts, _persists = _make_service(
+            ctrl=ctrl,
+            gw=_FakeGatewayService(configs={"GW-A": _GATEWAY_CFG_DIVERGE}),
+        )
+        net = RL_Network(name="Track A", gateway_mac="GW-A",
+                         rf_config=dict(_HOST_CFG))
+        ctrl.network_repository.append(net)
+        t = _FakeTransport("GW-A", network_id=net.id)
+        ctrl._transports.append(t)
+        rec_initial = svc.evaluate(t)
+        assert rec_initial is not None
+
+        out = svc.resolve("GW-A", "accept_host", {"token": rec_initial.token})
+
+        self.assertFalse(out["ok"])
+        self.assertIn("busy", out["error"])
+        self.assertEqual(out["state"], "conflict")
+        self.assertEqual(tasks.start_calls, [])
+        self.assertEqual(migration.calls, [])
+        # migration_pending was NOT set since the kickoff was refused.
+        rec = svc.get("GW-A")
+        assert rec is not None
+        self.assertFalse(rec.migration_pending)
+
+    def test_resolve_accept_host_errors_when_services_missing(self):
+        # Default _FakeController has no task_manager / rf_migration_service.
+        ctrl, _gw, svc, _broadcasts, _persists = _make_service(
+            gw=_FakeGatewayService(configs={"GW-A": _GATEWAY_CFG_DIVERGE}),
+        )
+        net = RL_Network(name="Track A", gateway_mac="GW-A",
+                         rf_config=dict(_HOST_CFG))
+        ctrl.network_repository.append(net)
+        t = _FakeTransport("GW-A", network_id=net.id)
+        ctrl._transports.append(t)
+        rec_initial = svc.evaluate(t)
+        assert rec_initial is not None
+
+        out = svc.resolve("GW-A", "accept_host", {"token": rec_initial.token})
+
+        self.assertFalse(out["ok"])
+        self.assertIn("not ready", out["error"])
+        rec = svc.get("GW-A")
+        assert rec is not None
+        self.assertFalse(rec.migration_pending)
 
 
 class CaseCUnknownGatewayTests(unittest.TestCase):
@@ -286,6 +414,38 @@ class CaseCUnknownGatewayTests(unittest.TestCase):
         # Persist + SSE bound event.
         self.assertTrue(persists)
         self.assertEqual(broadcasts[-1][0], GatewayBindService.EVENT_BOUND)
+
+    def test_resolve_create_network_errors_when_gateway_did_not_reply(self):
+        # Gateway maps to None — _FakeGatewayService returns ok=False.
+        # The bind service therefore records rf_config_actual=None.
+        ctrl, _gw, svc, broadcasts, persists = _make_service(
+            gw=_FakeGatewayService(configs={"GW-X": None}),
+        )
+        t = _FakeTransport("GW-X")
+        ctrl._transports.append(t)
+        rec_initial = svc.evaluate(t)
+        assert rec_initial is not None
+        self.assertIsNone(rec_initial.rf_config_actual)
+        broadcasts_before = list(broadcasts)
+        persists_before = list(persists)
+
+        out = svc.resolve("GW-X", "create_network", {
+            "token": rec_initial.token,
+            "name": "Heat 1",
+            "region": "EU868",
+        })
+
+        self.assertFalse(out["ok"])
+        self.assertIn("GET_RF_CONFIG", out["error"])
+        # State and network repo are untouched — the operator can plug
+        # the hardware, wait for a proper readback, and retry.
+        self.assertEqual(ctrl.network_repository.list(), [])
+        rec = svc.get("GW-X")
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.UNBOUND)
+        # No extra broadcast / persist beyond the initial evaluate.
+        self.assertEqual(broadcasts, broadcasts_before)
+        self.assertEqual(persists, persists_before)
 
     def test_resolve_rebind_to_existing_network_first_contact_adopt(self):
         ctrl, _gw, svc, _broadcasts, _persists = _make_service(
@@ -451,6 +611,41 @@ class SnapshotTests(unittest.TestCase):
         states = {row["ident_mac"]: row["state"] for row in snap["gateways"]}
         self.assertEqual(states["GW-A"], "bound")
         self.assertEqual(states["GW-B"], "conflict")
+
+
+class EvaluateNoReadbackPendingTests(unittest.TestCase):
+    """Round 4 Task 4: when GET_RF_CONFIG returns nothing (timeout
+    during reconnect-stress) the bind service must park the record at
+    PENDING with NO conflict broadcast — pre-fix, ``_rf_diff`` against
+    ``actual_cfg=None`` flipped state to CONFLICT and popped the
+    wizard with "Gateway reports" cells all blank."""
+
+    def test_no_readback_parks_at_pending_without_broadcast(self):
+        ctrl, _gw, svc, broadcasts, _persists = _make_service(
+            gw=_FakeGatewayService(configs={"GW-A": None}),
+        )
+        net = RL_Network(name="Track A", gateway_mac="GW-A",
+                         rf_config=dict(_HOST_CFG))
+        ctrl.network_repository.append(net)
+        t = _FakeTransport("GW-A", network_id=net.id)
+        ctrl._transports.append(t)
+
+        rec = svc.evaluate(t)
+
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.PENDING)
+        self.assertEqual(rec.conflict_fields, [])
+        # Critical: NO gateway_conflict broadcast — the WebUI wizard
+        # would otherwise open with all "Gateway reports" cells blank.
+        conflict_events = [
+            ev for ev in broadcasts if ev[0] == GatewayBindService.EVENT_CONFLICT
+        ]
+        self.assertEqual(conflict_events, [])
+        # And no spurious gateway_bound either.
+        bound_events = [
+            ev for ev in broadcasts if ev[0] == GatewayBindService.EVENT_BOUND
+        ]
+        self.assertEqual(bound_events, [])
 
 
 if __name__ == "__main__":  # pragma: no cover

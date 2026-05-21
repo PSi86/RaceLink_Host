@@ -29,6 +29,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+
+def _gw_short(gateway_id: Optional[str]) -> str:
+    """Compact gateway suffix for matcher log lines — ``XXXX`` (last
+    4 hex of ident_mac) or ``?`` pre-handshake. Matches the bracket
+    style used by ``controller.format_gateway_label`` so multi-line
+    debug traces correlate by suffix without cross-referencing."""
+    if not gateway_id:
+        return "?"
+    cleaned = str(gateway_id).upper().replace(":", "")
+    return cleaned[-4:] or "?"
+
 from ..transport.gateway_events import LP
 
 logger = logging.getLogger(__name__)
@@ -266,8 +277,9 @@ class PendingMatcherRegistry:
                 self._broadcast.append(m)
             pending_total = sum(len(b) for b in self._unicast.values()) + len(self._broadcast)
         logger.debug(
-            "matcher.register sender_filter=%s opcode=%s ack_of=%s expected=%d "
+            "[%s] matcher.register sender_filter=%s opcode=%s ack_of=%s expected=%d "
             "idle=%.2fs max=%.2fs pending_total=%d",
+            _gw_short(m.gateway_id),
             "any" if m.sender_filter is None else [s.hex().upper() for s in m.sender_filter],
             m.expected_opcode,
             m.expected_ack_of,
@@ -303,7 +315,8 @@ class PendingMatcherRegistry:
         if removed:
             elapsed = time.monotonic() - m.registered_ts
             logger.debug(
-                "matcher.cancel collected=%d done=%s elapsed=%.3fs pending_total=%d",
+                "[%s] matcher.cancel collected=%d done=%s elapsed=%.3fs pending_total=%d",
+                _gw_short(m.gateway_id),
                 len(m.collected),
                 m.done,
                 elapsed,
@@ -351,7 +364,8 @@ class PendingMatcherRegistry:
                     m._done = True
                 m._cond.notify_all()
             logger.debug(
-                "matcher.try_match HIT collected=%d/%d expected_ack_of=%s expected_opcode=%s",
+                "[%s] matcher.try_match HIT collected=%d/%d expected_ack_of=%s expected_opcode=%s",
+                _gw_short(m.gateway_id),
                 len(m.collected),
                 m.expected_count,
                 m.expected_ack_of,
@@ -366,9 +380,12 @@ class PendingMatcherRegistry:
         # waiter (e.g. unsolicited STATUS_REPLY, untracked broadcast); no
         # log noise.
         if opc == int(LP.OPC_ACK) and matched_any_candidate:
+            # gateway_id comes off the event because no single matcher
+            # matched — the candidates list may carry mixed identities.
             logger.debug(
-                "matcher.try_match NO_MATCH opc=ACK sender=%s ack_of=%s "
+                "[%s] matcher.try_match NO_MATCH opc=ACK sender=%s ack_of=%s "
                 "candidates=%d (had right bucket key, full filter failed)",
+                _gw_short(ev.get("gateway_id")),
                 bytes(sender3).hex().upper() if isinstance(sender3, (bytes, bytearray)) else "?",
                 ack_of,
                 len(candidates),

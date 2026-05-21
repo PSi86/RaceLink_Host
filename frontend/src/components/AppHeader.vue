@@ -5,6 +5,7 @@ import type { RouteLocationNormalizedLoaded } from 'vue-router'
 import MasterBar from '@/components/MasterBar.vue'
 import { apiPost } from '@/api/client'
 import { useGatewayStore } from '@/stores/gateway'
+import { useGatewaysStore } from '@/stores/gateways'
 import { useDevicesStore } from '@/stores/devices'
 import { useToast } from '@/composables/useToast'
 import { useUiBus } from '@/composables/useUiBus'
@@ -12,9 +13,20 @@ import { useUiBus } from '@/composables/useUiBus'
 const props = defineProps<{ route: RouteLocationNormalizedLoaded }>()
 
 const gateway = useGatewayStore()
+const gateways = useGatewaysStore()
 const devices = useDevicesStore()
 const toast = useToast()
 const ui = useUiBus()
+
+// Bug 3a re-open path: if any attached gateway is currently in a
+// state that requires operator action (conflict or unbound) AND the
+// operator dismissed the auto-popping wizard with "Later", they have
+// no other way to reach the wizard. The ⚠ Pair button below is
+// rendered while ``needsPairing`` is true; clicking it fires the
+// ui-bus signal that the wizard's extra watcher picks up.
+const needsPairing = computed(() =>
+  gateways.list.some((r) => r.state === 'conflict' || r.state === 'unbound'),
+)
 
 // Surface the per-device retry stats from the StatusService when a
 // "Get Status (All)" run finishes. ``retried`` is the count of
@@ -75,16 +87,16 @@ function onOpenHostSettings() {
   ui.requestHostSettings()
 }
 
-function onOpenGatewayRfConfig() {
-  ui.requestGatewayRfConfig()
-}
-
 function onOpenOnboarding() {
   ui.requestOnboarding()
 }
 
 function onOpenChannelScan() {
   ui.requestChannelScan()
+}
+
+function onOpenBindWizard() {
+  ui.requestBindWizard()
 }
 
 async function onStatusSelection() {
@@ -122,6 +134,19 @@ async function onStatusAll() {
       </span>
     </h1>
     <div class="flex flex-wrap justify-end gap-2">
+      <!-- Bug 3a re-open path: the ⚠ Pair button is rendered on
+           every page whenever some attached gateway needs the
+           operator (conflict or unbound) and the auto-popping wizard
+           was dismissed. amber border so it reads as "attention". -->
+      <button
+        v-if="needsPairing"
+        class="border-amber-500 text-amber-300 hover:border-amber-400"
+        title="A gateway needs operator action — open the bind wizard."
+        aria-label="Open gateway bind wizard"
+        @click="onOpenBindWizard"
+      >
+        ⚠ Pair…
+      </button>
       <!-- Page navigation runs through ``<router-link>`` so the SPA never
            unmounts on Devices ↔ Scenes transitions. A full-page reload
            tears down the EventSource and re-creates it on the next page,
@@ -165,14 +190,6 @@ async function onStatusAll() {
           @click="onOpenOnboarding"
         >
           🔧
-        </button>
-        <button
-          title="Gateway RF config (frequency / SF / bandwidth / sync word / TX power)"
-          aria-label="Gateway RF config"
-          :disabled="gateway.busy"
-          @click="onOpenGatewayRfConfig"
-        >
-          📡
         </button>
         <button
           title="Channel scan — sweep the region's channels on one gateway to find stranded devices"

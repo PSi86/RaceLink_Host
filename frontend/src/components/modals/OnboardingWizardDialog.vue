@@ -190,7 +190,7 @@ const canSubmitC = computed(() => deviceCfg.value.freq_hz > 0)
   <Dialog :open="open" @update:open="(v) => emit('update:open', v)">
     <DialogContent class="max-w-2xl">
       <DialogHeader>
-        <DialogTitle>Pair Assistant (Single Gateway)</DialogTitle>
+        <DialogTitle>Pair Assistant</DialogTitle>
         <DialogDescription>
           Guided repair for the case where pre-existing devices do not
           auto-pair after a gateway change. Pick the situation that

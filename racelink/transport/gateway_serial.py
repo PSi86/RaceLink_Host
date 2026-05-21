@@ -231,7 +231,7 @@ class GatewaySerialTransport:
         port_label = getattr(self.ser, "port", None) or self.port or "?"
         try:
             setter(True)
-            logger.debug("USB low-latency mode enabled on %s", port_label)
+            logger.debug("%s USB low-latency mode enabled on %s", self._log_label(), port_label)
         except (NotImplementedError, OSError, Exception) as e:
             # Windows / macOS / non-USB-serial port → method either raises
             # NotImplementedError or fails silently with OSError. Log at
@@ -347,7 +347,7 @@ class GatewaySerialTransport:
         return False
 
     @staticmethod
-    def enumerate_all() -> list[tuple[str, str | None]]:
+    def enumerate_all(exclude_ports=None) -> list[tuple[str, str | None]]:
         """Probe every USB port and return ``[(port_device, ident_mac), ...]``
         for every responding RaceLink gateway.
 
@@ -361,11 +361,25 @@ class GatewaySerialTransport:
         Ports that fail to open / time out / aren't gateways are skipped
         silently. ``ident_mac`` is ``None`` when the reply doesn't carry
         a parseable MAC string.
+
+        ``exclude_ports`` (Round 5 follow-up): iterable of device paths
+        the caller already owns. Production ``open()`` does NOT use
+        ``exclusive``/``flock``, so probing a port that's currently in
+        use by an attached transport corrupts that transport's USB
+        stream — the IDENTIFY probe payload arrives on the gateway's
+        normal command channel and the active reader sees garbage,
+        eventually firing EV_ERROR. The 5-second cascade pattern
+        observed in bench-test #6 (B detached → A detached 5s later)
+        was driven by ``MissingTransportTracker``'s poll calling
+        ``enumerate_all`` while A was still happily attached.
         """
+        excluded = set(exclude_ports or ())
         found: list[tuple[str, str | None]] = []
         payload = struct.pack(">BBBB", 0x00, 0x01, 1, 0xFF)
         ident = b"RaceLink_Gateway_v4"
         for p in serial.tools.list_ports.comports():
+            if p.device in excluded:
+                continue
             try:
                 # Mirror the is-USB filter from discover_and_open.
                 desc = (getattr(p, "description", "") or "").upper()
@@ -409,6 +423,21 @@ class GatewaySerialTransport:
                     # swallow-ok: best-effort close
                     pass
         return found
+
+    def _log_label(self) -> str:
+        """Compact bracket label for log prefixing — ``[XXXX]`` derived
+        from the last 4 hex chars of ``ident_mac``, or ``[? port]``
+        when the handshake hasn't run yet. Matches the bracket style
+        used by ``controller.format_gateway_label`` so reader can
+        correlate transport-level and service-level lines by suffix.
+        """
+        mac = (self.ident_mac or "").upper().replace(":", "")
+        if mac:
+            return f"[{mac[-4:]}]"
+        port = self.port or "?"
+        # Trim long /dev/ttyUSBx paths to "ttyUSBx" for brevity.
+        port_short = port.rsplit("/", 1)[-1]
+        return f"[? {port_short}]"
 
     def open(self):
         if not self.port:
@@ -500,7 +529,7 @@ class GatewaySerialTransport:
                 )
 
     def _handle_disconnect(self, msg: str) -> None:
-        logger.warning(msg)
+        logger.warning("%s %s", self._log_label(), msg)
         self._emit({"type": EV_ERROR, "data": msg})
         self._stop = True
         try:
@@ -579,7 +608,8 @@ class GatewaySerialTransport:
                 disconnect_msg = f"USB TX failed: {e}"
             else:
                 logger.debug(
-                    "TX M2N type=0x%02X dir=%s opc=0x%02X recv3=%s len=%d body=%s",
+                    "%s TX M2N type=0x%02X dir=%s opc=0x%02X recv3=%s len=%d body=%s",
+                    self._log_label(),
                     type_full,
                     "M2N" if (type_full & 0x80) == LP.DIR_M2N else "N2M",
                     type_full & 0x7F,
@@ -613,9 +643,10 @@ class GatewaySerialTransport:
                         detail=f"no EV_TX_DONE/EV_TX_REJECTED in {wait_timeout:.2f}s",
                     )
                     logger.warning(
-                        "TX outcome timeout (%.0f ms, type=0x%02X opc=0x%02X) — "
+                        "%s TX outcome timeout (%.0f ms, type=0x%02X opc=0x%02X) — "
                         "no EV_TX_DONE / EV_TX_REJECTED arrived. Likely gateway "
                         "or USB stall; consider a STATE_REQUEST to verify.",
+                        self._log_label(),
                         wait_timeout * 1000,
                         type_full,
                         type_full & 0x7F,
@@ -817,7 +848,7 @@ class GatewaySerialTransport:
             except serial.SerialException as e:
                 self._handle_disconnect(f"USB STATE_REQUEST write failed: {e}")
                 return False
-        logger.debug("TX GW_CMD_STATE_REQUEST (1 byte)")
+        logger.debug("%s TX GW_CMD_STATE_REQUEST (1 byte)", self._log_label())
         return True
 
     # ---- RF-config commands (USB-only, no LoRa wire) ---------------------
@@ -842,7 +873,7 @@ class GatewaySerialTransport:
             except serial.SerialException as e:
                 self._handle_disconnect(f"USB GET_RF_CONFIG write failed: {e}")
                 return False
-        logger.debug("TX GW_CMD_GET_RF_CONFIG (1 byte)")
+        logger.debug("%s TX GW_CMD_GET_RF_CONFIG (1 byte)", self._log_label())
         return True
 
     def send_set_rf_config(self, rf_config: dict, *, persist: bool) -> bool:
@@ -882,8 +913,8 @@ class GatewaySerialTransport:
                 self._handle_disconnect(f"USB SET_RF_CONFIG write failed: {e}")
                 return False
         logger.info(
-            "TX GW_CMD_SET_RF_CONFIG persist=%s freq=%d sf=%d bw=%d sw=0x%02X",
-            persist, rf_config["freq_hz"], rf_config["sf"],
+            "%s TX GW_CMD_SET_RF_CONFIG persist=%s freq=%d sf=%d bw=%d sw=0x%02X",
+            self._log_label(), persist, rf_config["freq_hz"], rf_config["sf"],
             rf_config["bw_khz_x10"], rf_config["sync_word"],
         )
         return True

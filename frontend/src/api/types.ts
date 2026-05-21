@@ -35,6 +35,17 @@ export interface MasterMapSnapshot {
   networks: MasterSnapshot[]
 }
 
+/** Round 3 Task 2: one row per currently-missing gateway, fed from
+ *  the ``gateway_missing`` SSE event the host's
+ *  ``MissingTransportTracker`` emits. The Reconnect-Banner renders
+ *  this list with countdowns and offers a "Cancel" button per row. */
+export interface MissingTransport {
+  ident_mac: string
+  network_id?: string | null
+  network_name?: string | null
+  next_retry_in_s?: number | null
+}
+
 export type TaskState = 'idle' | 'running' | 'done' | 'error' | string
 
 /** Authoritative per-device row state for the firmware-update progress

@@ -32,7 +32,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { apiDelete, apiPut } from '@/api/client'
+import { apiDelete, apiPost, apiPut } from '@/api/client'
 import { useConfirm } from '@/composables/useConfirm'
 import { useGatewaysStore } from '@/stores/gateways'
 import { useNetworksStore } from '@/stores/networks'
@@ -161,12 +161,33 @@ const hasUnsavedChanges = computed(() => {
   return false
 })
 
+const RF_FIELDS = [
+  'freq_hz', 'bw_khz_x10', 'sf', 'cr_den', 'sync_word',
+  'tx_power_dbm', 'preamble',
+] as const
+
+function rfConfigEqual(
+  a: Record<string, unknown> | null | undefined,
+  b: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!a || !b) return false
+  for (const f of RF_FIELDS) {
+    const av = a[f]
+    const bv = b[f]
+    if (av == null || bv == null) return false
+    if (Number(av) !== Number(bv)) return false
+  }
+  return true
+}
+
 async function onSave() {
   if (!selectedNetwork.value || !canSave.value) return
+  const targetId = selectedNetwork.value.id
+  const targetName = draftName.value.trim()
   submitting.value = true
   try {
     const body: Record<string, unknown> = {
-      name: draftName.value.trim(),
+      name: targetName,
       region: draftRegion.value,
     }
     // Channel choice rewrites the persisted rf_config server-side
@@ -181,15 +202,58 @@ async function onSave() {
       body.channel_id = null
     }
     const res = (await apiPut(
-      `/api/networks/${encodeURIComponent(selectedNetwork.value.id)}`,
+      `/api/networks/${encodeURIComponent(targetId)}`,
       body,
     )) as { ok?: boolean; error?: string }
-    if (res?.ok) {
-      toast.show(`Saved "${draftName.value.trim()}".`)
-      await networks.load().catch(() => undefined)
-    } else {
+    if (!res?.ok) {
       toast.error(`Save failed: ${res?.error || 'unknown'}`)
+      return
     }
+    toast.show(`Saved "${targetName}".`)
+    await networks.load().catch(() => undefined)
+
+    // Bug 3c-2 fix: when the network's RF config now disagrees with
+    // the actually-running gateway, offer to push immediately via
+    // the rf_migration task. Without this prompt the operator had
+    // to discover the new conflict via the bind wizard on the next
+    // re-evaluate — which is exactly the "settings saved but gateway
+    // still on old values" bench-test symptom.
+    await Promise.all([
+      gateways.load().catch(() => undefined),
+    ])
+    const freshNet = networks.byId[targetId]
+    const mac = freshNet?.gateway_mac
+    if (!freshNet || !mac) return
+    const rec = gateways.get(mac)
+    if (!rec) return
+    const intended = freshNet.rf_config as Record<string, unknown> | null | undefined
+    const actual = rec.rf_config_actual as Record<string, unknown> | null | undefined
+    if (!intended || !actual) return
+    if (rfConfigEqual(intended, actual)) return
+    const proceed = await confirm.confirm(
+      `Network "${targetName}" now uses RF settings that differ from `
+      + `what gateway ${mac} is currently broadcasting. Push the new `
+      + `settings to the gateway and every bound device (migration)?`,
+      {
+        title: 'Push RF settings to gateway?',
+        okLabel: 'Migrate',
+        variant: 'destructive',
+      },
+    )
+    if (!proceed) return
+    const migrateRes = (await apiPost(
+      `/api/networks/${encodeURIComponent(targetId)}/migrate`,
+      { target_rf_config: intended },
+    )) as { ok?: boolean; busy?: boolean; error?: string }
+    if (migrateRes?.busy) {
+      toast.error('Host is busy with another task — try again in a moment.')
+      return
+    }
+    if (!migrateRes?.ok) {
+      toast.error(`Migration failed to start: ${migrateRes?.error || 'unknown'}`)
+      return
+    }
+    toast.show('Migration started — watch the master bar for progress.')
   } finally {
     submitting.value = false
   }

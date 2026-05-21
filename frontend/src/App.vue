@@ -13,7 +13,6 @@ import RlPresetsDialog from '@/components/modals/RlPresetsDialog.vue'
 import WledPresetsDialog from '@/components/modals/WledPresetsDialog.vue'
 import FwUpdateDialog from '@/components/modals/FwUpdateDialog.vue'
 import HostSettingsDialog from '@/components/modals/HostSettingsDialog.vue'
-import GatewayRfConfigDialog from '@/components/modals/GatewayRfConfigDialog.vue'
 import OnboardingWizardDialog from '@/components/modals/OnboardingWizardDialog.vue'
 import BatteryDevicesDialog from '@/components/modals/BatteryDevicesDialog.vue'
 import GatewayBindWizard from '@/components/modals/GatewayBindWizard.vue'
@@ -82,11 +81,6 @@ watch(ui.fwUpdateRequest, () => {
 const hostSettingsOpen = ref(false)
 watch(ui.hostSettingsRequest, () => {
   hostSettingsOpen.value = true
-})
-
-const gatewayRfConfigOpen = ref(false)
-watch(ui.gatewayRfConfigRequest, () => {
-  gatewayRfConfigOpen.value = true
 })
 
 const onboardingOpen = ref(false)
@@ -194,7 +188,6 @@ onMounted(async () => {
   <WledPresetsDialog v-model:open="wledPresetsOpen" />
   <FwUpdateDialog v-model:open="fwUpdateOpen" />
   <HostSettingsDialog v-model:open="hostSettingsOpen" />
-  <GatewayRfConfigDialog v-model:open="gatewayRfConfigOpen" />
   <OnboardingWizardDialog v-model:open="onboardingOpen" />
   <BatteryDevicesDialog v-model:open="batteryDevicesOpen" />
   <ResortGroupsDialog v-model:open="resortGroupsOpen" />

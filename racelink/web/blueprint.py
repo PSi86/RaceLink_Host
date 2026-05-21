@@ -258,6 +258,19 @@ def create_racelink_web_blueprint(
             bind_service.attach_broadcast(sse.broadcast)
         except Exception:
             logger.exception("gateway_bind_service.attach_broadcast raised")
+    # Round 3: same wiring for the missing-transport tracker so the
+    # gateway_missing SSE event fans out to the WebUI.
+    missing_tracker = getattr(runtime.rl_instance, "missing_transport_tracker", None)
+    if missing_tracker is not None:
+        try:
+            missing_tracker.attach_broadcast(sse.broadcast)
+            # The controller boot path already ran discoverPort by the
+            # time the blueprint registers; evaluate now so any post-
+            # boot missing gateways surface immediately on the very
+            # first SSE subscriber.
+            missing_tracker.evaluate_and_arm()
+        except Exception:
+            logger.exception("missing_transport_tracker.attach_broadcast raised")
     tasks = TaskManager(broadcaster=sse.broadcast, master_state=sse.master, logger=runtime.logger)
     sse.attach_task_manager(tasks)
     attach_task_manager = getattr(runtime.rl_instance, "attach_task_manager", None)

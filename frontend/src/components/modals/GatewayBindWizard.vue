@@ -40,20 +40,37 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { useGatewayStore } from '@/stores/gateway'
 import { useGatewaysStore } from '@/stores/gateways'
 import { useNetworksStore } from '@/stores/networks'
 import { useToast } from '@/composables/useToast'
+import { useUiBus } from '@/composables/useUiBus'
 import type { GatewayBindRecord, RfConfig } from '@/api/types'
 
+const gateway = useGatewayStore()
 const gateways = useGatewaysStore()
 const networks = useNetworksStore()
 const toast = useToast()
+const ui = useUiBus()
 
 // The wizard owns the open/close state in response to the
 // ``attentionRecord`` watcher below. There's no v-model on the
 // component — the SSE event drives it.
 const open = ref(false)
 const submitting = ref(false)
+
+// Bug 3b fix: after the operator picks "Push host settings", we
+// switch ``step`` to ``migrating`` and keep the dialog open so they
+// can watch the per-phase progress instead of being thrown back to
+// the main UI with a misleading "watch the task bar" hint. The
+// task-watcher below flips ``step`` to ``done`` / ``error`` on
+// completion; the operator then explicitly closes.
+type Step = 'choose' | 'migrating' | 'done' | 'error'
+const step = ref<Step>('choose')
+/** Captured at the moment ``state === 'done' | 'error'`` so the
+ *  done-screen can survive the next task that comes through the
+ *  same channel (status query, discover, …). */
+const migrationOutcome = ref<{ ok: boolean; message: string } | null>(null)
 
 // We snapshot the record at "open" time so a mid-wizard SSE update
 // doesn't yank the rendered diff out from under the operator. The
@@ -155,18 +172,52 @@ watch(
       newNetworkName.value = ''
       newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
       rebindTargetId.value = rebindOptions.value[0]?.id ?? ''
+      step.value = 'choose'
+      migrationOutcome.value = null
       open.value = true
     }
   },
   { immediate: true },
 )
 
+// Bug 3a fix: manual re-open path. After the operator dismisses the
+// wizard with "Later", ``active.value`` keeps the snapshot of the
+// last record. The watcher above only re-opens when the ident_mac
+// CHANGES — so the same unresolved gateway can never re-trigger
+// without restarting the host. The ⚠ Pair button in AppHeader fires
+// ``ui.requestBindWizard()``; we re-pull from the live attention
+// record and put ourselves back on screen.
+watch(
+  () => ui.bindWizardRequest.value,
+  () => {
+    const next = gateways.attentionRecord
+    if (!next) return
+    active.value = { ...next }
+    conflictChoice.value = 'accept_gateway'
+    unboundChoice.value = 'create_network'
+    newNetworkName.value = ''
+    newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
+    rebindTargetId.value = rebindOptions.value[0]?.id ?? ''
+    step.value = 'choose'
+    migrationOutcome.value = null
+    open.value = true
+  },
+)
+
 function closeDialog() {
   open.value = false
-  // Don't null out ``active`` here — leave the snapshot in place so
-  // the watcher can re-open it if the operator dismisses the dialog
-  // without resolving. The SSE channel will keep nudging until they
-  // either accept gateway/host or the gateway disconnects.
+  if (step.value !== 'choose') {
+    // The operator already kicked the migration off (or finished
+    // viewing the outcome); ``active`` would otherwise keep the
+    // pre-resolve snapshot and confuse the next reopen path. Drop
+    // it and reset to a clean slate.
+    active.value = null
+    step.value = 'choose'
+    migrationOutcome.value = null
+  }
+  // For ``step === 'choose'`` keep ``active`` populated so the
+  // watcher can re-open it if a re-evaluate fires (existing
+  // behaviour preserved).
 }
 
 async function submitConflict() {
@@ -179,21 +230,66 @@ async function submitConflict() {
     })
     if (res.ok) {
       if (conflictChoice.value === 'accept_host' && res.migration_pending) {
-        toast.show('Migration scheduled — watch the task bar for progress.')
+        // Bug 3b fix: keep the dialog open and switch to the
+        // migration-progress step. The task-watcher below flips us
+        // to ``done`` / ``error`` when the rf_migration task lands.
+        migrationOutcome.value = null
+        step.value = 'migrating'
+        toast.show('Migration started — keep the dialog open for progress.')
       } else {
         toast.show(`Gateway ${active.value.ident_mac} resolved.`)
+        // Re-fetch so the store gets the post-resolve state in case
+        // the SSE event lost a race with this POST.
+        await gateways.load().catch(() => undefined)
+        open.value = false
+        active.value = null
       }
-      // Re-fetch so the store gets the post-resolve state in case
-      // the SSE event lost a race with this POST.
-      await gateways.load().catch(() => undefined)
-      open.value = false
-      active.value = null
     } else {
       toast.error(`Resolve failed: ${res.error || 'unknown'}`)
     }
   } finally {
     submitting.value = false
   }
+}
+
+// Bug 3b fix: while the wizard sits at ``step === 'migrating'``,
+// watch the gateway-store task channel for the rf_migration job to
+// transition. ``TaskManager`` only runs one task at a time and
+// ``accept_host`` is the only call site that starts rf_migration, so
+// matching by ``name`` is sufficient — no need to capture a task_id.
+watch(
+  () => gateway.task.state,
+  (state) => {
+    if (step.value !== 'migrating') return
+    if (gateway.task.name !== 'rf_migration') return
+    if (state === 'done') {
+      const result = (gateway.task.result || {}) as Record<string, unknown>
+      const ok = result.ok !== false
+      migrationOutcome.value = {
+        ok,
+        message: ok
+          ? 'Migration complete — gateway and devices are on the host\'s settings.'
+          : `Migration finished with errors: ${String(result.error || 'see task result')}`,
+      }
+      step.value = ok ? 'done' : 'error'
+      // Refresh bind state so the store flips this gateway out of
+      // ``conflict``; the operator sees the close button next.
+      void gateways.load().catch(() => undefined)
+    } else if (state === 'error') {
+      migrationOutcome.value = {
+        ok: false,
+        message: `Migration failed: ${gateway.task.last_error || 'unknown error'}`,
+      }
+      step.value = 'error'
+    }
+  },
+)
+
+function closeMigration() {
+  open.value = false
+  active.value = null
+  step.value = 'choose'
+  migrationOutcome.value = null
 }
 
 async function submitUnbound() {
@@ -274,11 +370,27 @@ async function submitUnbound() {
   <Dialog :open="open" @update:open="(v) => { if (!v) closeDialog() }">
     <DialogContent class="max-w-2xl">
       <DialogHeader>
-        <DialogTitle v-if="active?.state === 'conflict'">
+        <DialogTitle v-if="step === 'migrating'">Migrating gateway and devices…</DialogTitle>
+        <DialogTitle v-else-if="step === 'done'">Migration complete</DialogTitle>
+        <DialogTitle v-else-if="step === 'error'">Migration failed</DialogTitle>
+        <DialogTitle v-else-if="active?.state === 'conflict'">
           Gateway RF config disagrees with network
         </DialogTitle>
         <DialogTitle v-else>Unknown gateway attached</DialogTitle>
-        <DialogDescription v-if="active?.state === 'conflict'">
+        <DialogDescription v-if="step === 'migrating'">
+          Pushing the host's RF config to every bound device, then
+          persist-switching the gateway. This dialog stays open with
+          live progress.
+        </DialogDescription>
+        <DialogDescription v-else-if="step === 'done'">
+          The gateway and every responding device are on the new RF
+          settings.
+        </DialogDescription>
+        <DialogDescription v-else-if="step === 'error'">
+          See the message below; the task channel carries the full
+          per-device error list.
+        </DialogDescription>
+        <DialogDescription v-else-if="active?.state === 'conflict'">
           The gateway is on a different channel than this network expects.
           Decide which one to keep.
         </DialogDescription>
@@ -288,7 +400,60 @@ async function submitUnbound() {
         </DialogDescription>
       </DialogHeader>
 
-      <div v-if="active" class="text-sm">
+      <!-- ====== MIGRATING / DONE / ERROR steps ====== -->
+      <div v-if="step === 'migrating' || step === 'done' || step === 'error'" class="text-sm">
+        <div class="rounded-md border border-border bg-card/60 p-3 text-xs">
+          <div class="font-semibold">
+            Gateway <span class="font-mono">{{ active?.ident_mac || '—' }}</span>
+          </div>
+          <div v-if="active?.network_name" class="mt-0.5 text-muted-foreground">
+            Network: <span class="font-medium">{{ active.network_name }}</span>
+          </div>
+        </div>
+
+        <div v-if="step === 'migrating'" class="mt-3 rounded-md border border-border p-3">
+          <div class="flex items-center justify-between text-xs text-muted-foreground">
+            <span>Phase</span>
+            <span class="font-mono">{{ gateway.task.meta?.stage || 'INIT' }}</span>
+          </div>
+          <div
+            v-if="typeof gateway.task.meta?.index === 'number' && typeof gateway.task.meta?.total === 'number'"
+            class="mt-2"
+          >
+            <div class="flex items-center justify-between text-xs text-muted-foreground">
+              <span>Device</span>
+              <span class="font-mono">{{ gateway.task.meta.index }} / {{ gateway.task.meta.total }}</span>
+            </div>
+            <div class="mt-1 h-2 w-full overflow-hidden rounded bg-card">
+              <div
+                class="h-full bg-amber-500 transition-all"
+                :style="{ width: gateway.task.meta.total > 0
+                  ? `${Math.min(100, Math.round((gateway.task.meta.index / gateway.task.meta.total) * 100))}%`
+                  : '0%' }"
+              ></div>
+            </div>
+          </div>
+          <div v-if="gateway.task.meta?.addr" class="mt-2 text-xs text-muted-foreground">
+            Current device: <span class="font-mono">{{ gateway.task.meta.addr }}</span>
+          </div>
+        </div>
+
+        <div
+          v-else-if="step === 'done'"
+          class="mt-3 rounded-md border border-emerald-700/40 bg-emerald-900/20 p-3 text-xs text-emerald-200"
+        >
+          {{ migrationOutcome?.message || 'Migration complete.' }}
+        </div>
+
+        <div
+          v-else
+          class="mt-3 rounded-md border border-red-700/40 bg-red-900/20 p-3 text-xs text-red-200"
+        >
+          {{ migrationOutcome?.message || gateway.task.last_error || 'Migration failed.' }}
+        </div>
+      </div>
+
+      <div v-else-if="active" class="text-sm">
         <div class="rounded-md border border-border bg-card/60 p-3 text-xs">
           <div class="font-semibold">
             Gateway <span class="font-mono">{{ active.ident_mac }}</span>
@@ -462,25 +627,35 @@ async function submitUnbound() {
       </div>
 
       <DialogFooter>
-        <Button variant="ghost" type="button" :disabled="submitting" @click="closeDialog">
-          Later
-        </Button>
-        <Button
-          v-if="active?.state === 'conflict'"
-          type="button"
-          :disabled="submitting"
-          @click="submitConflict"
-        >
-          Apply
-        </Button>
-        <Button
-          v-else
-          type="button"
-          :disabled="submitting || (unboundChoice === 'create_network' ? !newNetworkName.trim() : !rebindTargetId)"
-          @click="submitUnbound"
-        >
-          {{ unboundChoice === 'create_network' ? 'Create & bind' : 'Rebind' }}
-        </Button>
+        <template v-if="step === 'choose'">
+          <Button variant="ghost" type="button" :disabled="submitting" @click="closeDialog">
+            Later
+          </Button>
+          <Button
+            v-if="active?.state === 'conflict'"
+            type="button"
+            :disabled="submitting"
+            @click="submitConflict"
+          >
+            Apply
+          </Button>
+          <Button
+            v-else
+            type="button"
+            :disabled="submitting || (unboundChoice === 'create_network' ? !newNetworkName.trim() : !rebindTargetId)"
+            @click="submitUnbound"
+          >
+            {{ unboundChoice === 'create_network' ? 'Create & bind' : 'Rebind' }}
+          </Button>
+        </template>
+        <template v-else-if="step === 'migrating'">
+          <Button variant="ghost" type="button" @click="closeDialog">
+            Hide (migration continues)
+          </Button>
+        </template>
+        <template v-else>
+          <Button type="button" @click="closeMigration">Close</Button>
+        </template>
       </DialogFooter>
     </DialogContent>
   </Dialog>

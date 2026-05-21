@@ -30,6 +30,8 @@ const NAMED_EVENTS = [
   'gateway_bound',
   'gateway_conflict',
   'gateway_unbound',
+  'gateway_detached',
+  'gateway_missing',
 ] as const
 
 const TRANSIENT_GRACE_MS = 2000
@@ -226,6 +228,10 @@ export function useRaceLinkEvents() {
     switch (name) {
       case 'master':
         gateway.applyMaster(payload as never)
+        // Round 3 Task 6: also fan the per-network state out into the
+        // gateways store so MasterBar pills can colour-code per-
+        // gateway RF activity (TX/IDLE/RX/ERROR) alongside bind state.
+        gateways.applyMasterMap(payload as never)
         return
       case 'task':
         gateway.applyTask(payload as never)
@@ -242,6 +248,21 @@ export function useRaceLinkEvents() {
         // ident_mac so a duplicate event (e.g. on reconnect) just
         // overwrites the same slot.
         gateways.applyRecord(payload as never)
+        return
+      case 'gateway_detached': {
+        // Per-transport disconnect cleanup in multi-transport setups.
+        // The controller emits this when ONE of N transports dies
+        // while the others stay online — the store drops the dead
+        // record so the MasterBar pill disappears.
+        const ident = (payload as { ident_mac?: string } | null)?.ident_mac
+        if (ident) gateways.removeRecord(ident)
+        return
+      }
+      case 'gateway_missing':
+        // Round 3 Task 6: full list overwrite — the host's
+        // MissingTransportTracker is the source of truth, including
+        // empty arrays (which clear the banner).
+        gateways.applyMissing(payload as never)
         return
       case 'refresh': {
         const what = (payload as { what?: string[] } | null)?.what ?? ['groups', 'devices']

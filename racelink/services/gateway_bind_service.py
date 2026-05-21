@@ -179,6 +179,11 @@ class GatewayBindService:
     EVENT_BOUND = "gateway_bound"
     EVENT_CONFLICT = "gateway_conflict"
     EVENT_UNBOUND = "gateway_unbound"
+    # Task 2 follow-up to the multi-transport listener-install fix:
+    # the per-transport EV_ERROR cleanup in gateway_service emits this
+    # so the WebUI's gateways store can drop the dead transport from
+    # its pills + Pair-button check without a global reconnect.
+    EVENT_DETACHED = "gateway_detached"
 
     def __init__(
         self,
@@ -305,6 +310,29 @@ class GatewayBindService:
                 self._broadcast_event(self.EVENT_BOUND, rec)
                 return rec
 
+            if actual_cfg is None:
+                # Round 4 Task 4: the gateway didn't reply to
+                # GET_RF_CONFIG within the timeout — usually because the
+                # transport was just opened during a reconnect storm and
+                # USB-CDC hasn't settled. We CAN'T tell whether the RF
+                # config actually matches; treating ``None`` as
+                # "differs from every expected field" used to flip the
+                # state to CONFLICT and pop the bind wizard with all
+                # "Gateway reports" cells blank (the "all-dashes
+                # mismatch" the operator hit). Park at PENDING instead;
+                # the next re_evaluate (post-stabilisation or when
+                # EV_RF_CHANGED arrives spontaneously) will resolve.
+                # Skip the SSE broadcast — the WebUI should NOT open
+                # the conflict wizard on an inconclusive readback.
+                rec.state = BindState.PENDING
+                rec.conflict_fields = []
+                logger.info(
+                    "GatewayBindService: parking %s at PENDING — "
+                    "GET_RF_CONFIG returned no readback (no broadcast)",
+                    ident,
+                )
+                return rec
+
             diffs = _rf_diff(actual_cfg, rec.rf_config_expected)
             if not diffs:
                 rec.state = BindState.BOUND
@@ -322,6 +350,26 @@ class GatewayBindService:
         key = str(ident_mac).upper()
         with self._lock:
             self._records.pop(key, None)
+
+    def broadcast_detached(self, ident_mac: str, reason: str = "") -> None:
+        """Emit ``gateway_detached`` on the SSE bus so the WebUI's
+        gateways store drops the dead transport from its records
+        (which in turn removes its MasterBar pill + clears the ⚠ Pair
+        button if no other transports need attention). Called by
+        ``gateway_service.on_transport_event`` after the per-transport
+        EV_ERROR cleanup in multi-transport setups."""
+        if not self._broadcast:
+            return
+        try:
+            self._broadcast(self.EVENT_DETACHED, {
+                "ident_mac": str(ident_mac).upper(),
+                "reason": str(reason or ""),
+            })
+        except Exception:
+            logger.exception(
+                "GatewayBindService: broadcast_detached raised for %s",
+                ident_mac,
+            )
 
     def re_evaluate(self, ident_mac: str):
         """Re-run :meth:`evaluate` for the transport that carries
@@ -391,18 +439,32 @@ class GatewayBindService:
         to ERROR, because the gateway may legitimately be slow to
         come up post-reconnect.
         """
+        ident = getattr(transport, "ident_mac", "?")
         try:
             res = self.gateway_service.query_gateway_rf_config(transport=transport)
         except Exception:
             logger.exception(
                 "GatewayBindService: query_gateway_rf_config raised for %s",
-                getattr(transport, "ident_mac", "?"),
+                ident,
             )
             return None
         if not isinstance(res, dict) or not res.get("ok"):
+            # Loud-on-failure: a silent None here used to propagate into
+            # _action_create_network's seeded_cfg as None, which then
+            # quietly adopted whatever the gateway later reported on
+            # first-contact — masking real hardware/firmware issues.
+            err = res.get("error") if isinstance(res, dict) else "no response"
+            logger.warning(
+                "GatewayBindService: GET_RF_CONFIG failed for %s: %s",
+                ident, err,
+            )
             return None
         cfg = res.get("rf_config")
         if not isinstance(cfg, dict):
+            logger.warning(
+                "GatewayBindService: GET_RF_CONFIG returned no rf_config for %s",
+                ident,
+            )
             return None
         # Strip down to the wire-format fields so the comparison is
         # stable against future EV_RF_CHANGED additions.
@@ -457,29 +519,71 @@ class GatewayBindService:
 
     def _action_accept_host(self, rec: BindRecord) -> dict:
         """Operator wants the host's persisted RF config to win — the
-        gateway and every bound device need to migrate. Stage 3 Part D
-        records the intent (``migration_pending=True``) and leaves the
-        state at CONFLICT; Part E plumbs the migration job in via
-        :mod:`racelink.services.rf_migration_service`."""
+        gateway and every bound device need to migrate. Kicks off the
+        Stage-3 Part-E migration engine through the controller's
+        TaskManager and returns the task_id so the WebUI can stay open
+        and watch progress on the ``task`` SSE channel. The migration
+        runner's on-completion re-evaluate flips ``state`` from CONFLICT
+        to BOUND (mirrors the ``/api/networks/<id>/migrate`` route).
+        """
         if rec.state != BindState.CONFLICT:
             raise _BindActionError(
                 f"accept_host requires state=conflict (current: {rec.state.value})"
             )
         if rec.rf_config_expected is None:
             raise _BindActionError("host has no rf_config to push")
+
+        task_mgr = getattr(self.controller, "_task_manager", None)
+        migration = getattr(self.controller, "rf_migration_service", None)
+        if task_mgr is None or migration is None:
+            raise _BindActionError(
+                "host not ready (TaskManager or rf_migration_service missing)"
+            )
+        if task_mgr.is_running():
+            raise _BindActionError("host busy — another task is running")
+
         rec.migration_pending = True
         rec.token = uuid.uuid4().hex
-        # The state stays CONFLICT — the migration engine flips it to
-        # BOUND when the gateway acknowledges the new config. We
-        # re-broadcast so the WebUI updates its "migration scheduled"
-        # spinner without dropping the conflict highlight.
+        # Re-broadcast so the WebUI flips the "migration scheduled"
+        # spinner without dropping the conflict highlight; the migration
+        # engine will move the bind state to BOUND on completion.
         self._broadcast_event(self.EVENT_CONFLICT, rec)
+
+        target_cfg = dict(rec.rf_config_expected)
+        network_id = rec.network_id
+        ident_mac = rec.ident_mac
+
+        def _progress(payload):
+            try:
+                task_mgr.update(meta=dict(payload))
+            except Exception:
+                logger.debug("accept_host progress_cb raised", exc_info=True)
+
+        def _runner():
+            return migration.migrate_network_to(
+                network_id=network_id,
+                target_rf_config=target_cfg,
+                progress_cb=_progress,
+            )
+
+        task = task_mgr.start(
+            "rf_migration", _runner,
+            meta={"stage": "INIT", "network_id": network_id, "ident_mac": ident_mac},
+        )
+        if not task:
+            # Race: TaskManager became busy between is_running() and
+            # start(). Roll the pending flag back so the operator can
+            # retry once the conflicting task finishes.
+            rec.migration_pending = False
+            raise _BindActionError("host busy — another task started concurrently")
+
         return {
             "ok": True,
             "state": rec.state.value,
             "migration_pending": True,
             "token": rec.token,
-            "note": "migration scheduled (rf_migration_service in Stage 3 Part E)",
+            "task_id": task.get("id"),
+            "task": task,
         }
 
     def _action_create_network(self, rec: BindRecord, params: dict) -> dict:
@@ -496,11 +600,17 @@ class GatewayBindService:
         region = str(params.get("region") or "EU868")
         from ..domain.models import RL_Network
 
-        seeded_cfg = (
-            dict(rec.rf_config_actual)
-            if isinstance(rec.rf_config_actual, dict)
-            else None
-        )
+        if not isinstance(rec.rf_config_actual, dict):
+            # Without a real readback we cannot seed the network and
+            # any later boot would silently adopt whatever the gateway
+            # then reports — exactly the failure mode the operator
+            # tripped over on the first two-gateway bench test. Surface
+            # the hardware problem instead of papering over it.
+            raise _BindActionError(
+                "gateway did not respond to GET_RF_CONFIG — cannot create "
+                "network, please check hardware / firmware and retry"
+            )
+        seeded_cfg = dict(rec.rf_config_actual)
         net = RL_Network(
             name=name,
             gateway_mac=rec.ident_mac,

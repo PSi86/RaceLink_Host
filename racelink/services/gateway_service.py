@@ -248,7 +248,8 @@ class GatewayService:
         finally:
             registry.cancel(matcher)
         logger.debug(
-            "send_and_match EXIT reason=%s collected=%d elapsed=%.3fs",
+            "%s send_and_match EXIT reason=%s collected=%d elapsed=%.3fs",
+            self._gateway_label_for_transport(transport),
             reason,
             len(matcher.collected),
             time.monotonic() - t_start,
@@ -490,8 +491,10 @@ class GatewayService:
                 send_fn()
                 return [], False
             t0 = time.monotonic()
+            gw_label = self._gateway_label_for_transport(routed_transport)
             logger.debug(
-                "send_and_wait ENTER sender=%s opcode=0x%02X(%s) attempt=%d/%d timeout=%.2fs",
+                "%s send_and_wait ENTER sender=%s opcode=0x%02X(%s) attempt=%d/%d timeout=%.2fs",
+                gw_label,
                 sender_filter_hex or "broadcast",
                 opcode7,
                 opcode_name,
@@ -503,8 +506,9 @@ class GatewayService:
             elapsed = time.monotonic() - t0
             if events:
                 logger.debug(
-                    "send_and_wait EXIT  MATCHED sender=%s opcode=0x%02X(%s) reason=%s "
+                    "%s send_and_wait EXIT  MATCHED sender=%s opcode=0x%02X(%s) reason=%s "
                     "attempt=%d/%d elapsed=%.3fs",
+                    gw_label,
                     sender_filter_hex or "broadcast",
                     opcode7,
                     opcode_name,
@@ -525,8 +529,9 @@ class GatewayService:
                     time.sleep(settle)
                 return events, True
             logger.debug(
-                "send_and_wait EXIT  TIMEOUT sender=%s opcode=0x%02X(%s) reason=%s "
+                "%s send_and_wait EXIT  TIMEOUT sender=%s opcode=0x%02X(%s) reason=%s "
                 "attempt=%d/%d elapsed=%.3fs",
+                gw_label,
                 sender_filter_hex or "broadcast",
                 opcode7,
                 opcode_name,
@@ -877,7 +882,7 @@ class GatewayService:
                         return collected, got_closed
         return collected, got_closed
 
-    def query_state(self, *, timeout_s: float = 0.5) -> dict:
+    def query_state(self, *, timeout_s: float = 0.5, transport=None) -> dict:
         """Send GW_CMD_STATE_REQUEST and wait for the matching EV_STATE_REPORT.
 
         Returns a dict with the same shape the SSE layer broadcasts:
@@ -894,8 +899,15 @@ class GatewayService:
         pill ↻ refresh button. ``timeout_s`` is short by design — the round-
         trip is a USB write + USB read with no LoRa airtime; 500 ms is
         generous.
+
+        ``transport`` (Round 3 Task 4): query a specific transport
+        instance instead of the controller's primary slot. The
+        ``/api/gateways/query-state`` route fanouts over every attached
+        transport so the multi-network MasterBar can refresh all pills
+        at once.
         """
-        transport = self.transport
+        if transport is None:
+            transport = self.transport
         if transport is None:
             return {
                 "ok": False,
@@ -974,7 +986,7 @@ class GatewayService:
     def query_gateway_rf_config(
         self,
         *,
-        timeout_s: float = 0.5,
+        timeout_s: float = 1.5,
         transport=None,
     ) -> dict:
         """Send GW_CMD_GET_RF_CONFIG and wait for the matching EV_RF_CHANGED.
@@ -986,7 +998,11 @@ class GatewayService:
             P_RfConfig dict (freq_hz / bw_khz_x10 / sf / cr_den /
             sync_word / tx_power_dbm / preamble).
 
-        The round-trip is a USB write + USB read; 500 ms is generous.
+        Round 4 Task 5: timeout was raised from 500 ms to 1.5 s because
+        the first call right after ``transport.open()`` races the USB-
+        CDC handshake — the gateway firmware can take longer than 500
+        ms to surface its first reply during reconnect-stress. One
+        retry after a 200 ms settle handles the truly-loaded path.
 
         ``transport`` (Stage 3 Part D): query a specific transport
         instance instead of the controller's primary slot. Used by
@@ -1000,57 +1016,71 @@ class GatewayService:
         if transport is None:
             return {"ok": False, "error": "transport unavailable"}
 
-        replied = threading.Event()
-        result: dict = {}
+        def _single_attempt() -> dict:
+            replied = threading.Event()
+            result: dict = {}
 
-        def _cb(ev: dict):
+            def _cb(ev: dict):
+                try:
+                    if not isinstance(ev, dict):
+                        return
+                    if ev.get("type") != EV_RF_CHANGED:
+                        return
+                    cfg = ev.get("rf_config")
+                    if isinstance(cfg, dict):
+                        result["rf_config"] = cfg
+                        result["reason"] = int(ev.get("reason", RF_CHANGE_OK))
+                        result["reason_name"] = ev.get(
+                            "reason_name",
+                            RF_CHANGE_REASON_NAME.get(result["reason"], "unknown"),
+                        )
+                        replied.set()
+                except Exception:
+                    logger.debug("query_gateway_rf_config callback raised", exc_info=True)
+
             try:
-                if not isinstance(ev, dict):
-                    return
-                if ev.get("type") != EV_RF_CHANGED:
-                    return
-                cfg = ev.get("rf_config")
-                if isinstance(cfg, dict):
-                    result["rf_config"] = cfg
-                    result["reason"] = int(ev.get("reason", RF_CHANGE_OK))
-                    result["reason_name"] = ev.get(
-                        "reason_name",
-                        RF_CHANGE_REASON_NAME.get(result["reason"], "unknown"),
-                    )
-                    replied.set()
+                transport.add_listener(_cb)
             except Exception:
-                logger.debug("query_gateway_rf_config callback raised", exc_info=True)
+                logger.debug("query_gateway_rf_config: add_listener failed", exc_info=True)
 
-        try:
-            transport.add_listener(_cb)
-        except Exception:
-            logger.debug("query_gateway_rf_config: add_listener failed", exc_info=True)
-
-        try:
-            ok_write = True
             try:
-                send = getattr(transport, "send_get_rf_config", None)
-                if callable(send):
-                    ok_write = bool(send())
-                else:
+                ok_write = True
+                try:
+                    send = getattr(transport, "send_get_rf_config", None)
+                    if callable(send):
+                        ok_write = bool(send())
+                    else:
+                        ok_write = False
+                except Exception:
+                    logger.debug("query_gateway_rf_config: send raised", exc_info=True)
                     ok_write = False
-            except Exception:
-                logger.debug("query_gateway_rf_config: send raised", exc_info=True)
-                ok_write = False
 
-            if ok_write:
-                replied.wait(timeout=float(timeout_s))
-        finally:
-            try:
-                transport.remove_listener(_cb)
-            except Exception:
-                logger.debug("query_gateway_rf_config: remove_listener failed", exc_info=True)
+                if ok_write:
+                    replied.wait(timeout=float(timeout_s))
+            finally:
+                try:
+                    transport.remove_listener(_cb)
+                except Exception:
+                    logger.debug("query_gateway_rf_config: remove_listener failed", exc_info=True)
 
-        if "rf_config" in result:
-            result["ok"] = True
-            return result
+            if "rf_config" in result:
+                result["ok"] = True
+                return result
+            return {"ok": False, "error": "no reply within timeout"}
 
-        return {"ok": False, "error": "no reply within timeout"}
+        first = _single_attempt()
+        if first.get("ok"):
+            return first
+        # Round 4 Task 5: one retry after a short settle. The cost is
+        # bounded by ``timeout_s`` so a truly-dead gateway still fails
+        # within ~3 s total. The retry catches the common case where
+        # the gateway's USB-CDC stack needed a few hundred ms post-
+        # open before it would honour the first GET_RF_CONFIG.
+        time.sleep(0.2)
+        retry = _single_attempt()
+        if retry.get("ok"):
+            return retry
+        return first  # keep the original error payload
 
     def set_gateway_rf_config(
         self,
@@ -1294,12 +1324,18 @@ class GatewayService:
             if ack_of is None or ack_status is None:
                 return
             ack_name = self.opcode_name(int(ack_of))
-            logger.debug("ACK from %s: ack_of=%s (%s) status=%s seq=%s", sender3_hex, int(ack_of), ack_name, int(ack_status), ack_seq)
+            label = self._gateway_label_for_event(ev)
+            logger.debug(
+                "%s ACK from %s: ack_of=%s (%s) status=%s seq=%s",
+                label, sender3_hex, int(ack_of), ack_name, int(ack_status), ack_seq,
+            )
             return
 
         if opc == int(LP.OPC_STATUS) and ev.get("reply") == "STATUS_REPLY":
+            label = self._gateway_label_for_event(ev)
             logger.debug(
-                "STATUS from %s: flags=0x%02X cfg=0x%02X effect=%s bri=%s vbat=%s rssi=%s snr=%s host_rssi=%s host_snr=%s",
+                "%s STATUS from %s: flags=0x%02X cfg=0x%02X effect=%s bri=%s vbat=%s rssi=%s snr=%s host_rssi=%s host_snr=%s",
+                label,
                 sender3_hex,
                 int(ev.get("flags", 0) or 0) & 0xFF,
                 int(ev.get("configByte", 0) or 0) & 0xFF,
@@ -1318,8 +1354,10 @@ class GatewayService:
             mac12 = bytes(mac6).hex().upper() if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6 else None
             dev_type = ev.get("caps")
             dtype_name = get_dev_type_info(dev_type).get("name")
+            label = self._gateway_label_for_event(ev)
             logger.debug(
-                "IDENTIFY from %s: mac=%s group=%s ver=%s dev_type=%s (%s) host_rssi=%s host_snr=%s",
+                "%s IDENTIFY from %s: mac=%s group=%s ver=%s dev_type=%s (%s) host_rssi=%s host_snr=%s",
+                label,
                 sender3_hex,
                 mac12 or sender3_hex,
                 ev.get("groupId"),
@@ -1332,7 +1370,11 @@ class GatewayService:
             return
 
         if ev.get("reply"):
-            logger.debug("RX %s from %s (opc=0x%02X)", ev.get("reply"), sender3_hex, opc)
+            label = self._gateway_label_for_event(ev)
+            logger.debug(
+                "%s RX %s from %s (opc=0x%02X)",
+                label, ev.get("reply"), sender3_hex, opc,
+            )
 
     def log_state_event(self, ev: dict) -> None:
         """Log a Batch-B EV_STATE_CHANGED / EV_STATE_REPORT event for diagnostics.
@@ -1347,10 +1389,11 @@ class GatewayService:
             return
         state_name = ev.get("state") or GATEWAY_STATE_NAME.get(int(ev.get("state_byte", -1)), "UNKNOWN")
         meta_ms = int(ev.get("state_metadata_ms", 0) or 0)
+        label = self._gateway_label_for_event(ev)
         if state_name == "RX_WINDOW":
-            logger.debug("Gateway state -> RX_WINDOW (min_ms=%s)", meta_ms)
+            logger.debug("%s Gateway state -> RX_WINDOW (min_ms=%s)", label, meta_ms)
         else:
-            logger.debug("Gateway state -> %s", state_name)
+            logger.debug("%s Gateway state -> %s", label, state_name)
 
     def handle_ack_event(self, ev: dict) -> None:
         try:
@@ -1435,6 +1478,15 @@ class GatewayService:
             logger.exception("RaceLink: failed to install transport TX listener")
 
         installed_set.add(key)
+        # Loud confirmation per transport so multi-gateway bench tests
+        # can verify every transport actually has the service's RX
+        # listener (and not just the SSE bridge's). Pre-fix, this line
+        # only ever fired for _transports[0].
+        logger.info(
+            "GatewayService: RX listener attached to transport ident_mac=%s port=%s",
+            getattr(transport, "ident_mac", "?"),
+            getattr(transport, "port", "?"),
+        )
 
     def on_transport_tx(self, ev: dict) -> None:
         try:
@@ -1485,15 +1537,66 @@ class GatewayService:
         except Exception:
             logger.exception("RaceLink: TX hook failed")
 
+    def _gateway_label_for_event(self, ev: dict) -> str:
+        """Round 5 follow-up: short human label for the gateway that
+        emitted ``ev``. Delegates to ``controller.format_gateway_label``
+        when available so all callers render identically. Falls back to
+        ``[? unknown]`` for pre-handshake events without ``gateway_id``."""
+        gateway_id = ev.get("gateway_id") if isinstance(ev, dict) else None
+        return self._gateway_label_for_id(gateway_id)
+
+    def _gateway_label_for_id(self, gateway_id) -> str:
+        """Label by ident_mac — used by send_and_wait / send_and_match
+        where we hold the routed transport directly, not an event."""
+        fmt = getattr(self.controller, "format_gateway_label", None)
+        if callable(fmt):
+            try:
+                label = fmt(gateway_id)
+                if isinstance(label, str):
+                    return label
+            except Exception:
+                logger.debug(
+                    "format_gateway_label raised for gateway_id=%r",
+                    gateway_id, exc_info=True,
+                )
+        return f"[{gateway_id}]" if gateway_id else "[? unknown]"
+
+    def _gateway_label_for_transport(self, transport) -> str:
+        """Label for a transport (or ``None`` when single-gateway default
+        routing falls back to ``self.transport``)."""
+        if transport is None:
+            transport = self.transport
+        ident = getattr(transport, "ident_mac", None) if transport else None
+        return self._gateway_label_for_id(ident)
+
     def on_transport_event(self, ev: dict) -> None:
         try:
             if not isinstance(ev, dict):
                 return
 
             t = ev.get("type")
+            # Round 5 follow-up: compact human label for log prefixing
+            # so multi-gateway traces show ``[#0 1C:10/Pit-Lane]``
+            # rather than uncorrelated lines. Computed once per event.
+            label = self._gateway_label_for_event(ev)
 
             if t == EV_ERROR:
                 reason = str(ev.get("data") or "unknown error")
+                # Round 5 follow-up: per-transport cleanup whenever the
+                # event carries a known gateway_id (post-handshake) —
+                # regardless of N. The previous ``len > 1`` guard meant
+                # the N=1 case fell through to the global reconnect
+                # path; that path then tried ``soft_rediscover`` (Round
+                # 4 Task 3) but ``soft_rediscover`` skips already-in-
+                # _transports MACs, so the dying transport's corpse
+                # never got cleaned up and ``controller.ready=False``
+                # stayed stuck. Per-transport cleanup properly removes
+                # the dead transport, fires ``gateway_detached``, and
+                # arms the tracker for hot-reconnect — all N cases.
+                dead_ident = ev.get("gateway_id")
+                if dead_ident:
+                    self._detach_one_transport(dead_ident, reason)
+                    return
                 self.controller.ready = False
                 now = time.time()
                 if (now - self.controller._last_error_notify_ts) > 2:
@@ -1545,7 +1648,8 @@ class GatewayService:
                 # arrives, knowing whether the Gateway ever emitted TX_DONE
                 # distinguishes "CAD/LBT stuck" from "RF ACK lost".
                 logger.debug(
-                    "EV_TX_DONE last_len=%s ts=%.3f", ev.get("last_len"), ev.get("ts", time.time())
+                    "%s EV_TX_DONE last_len=%s ts=%.3f",
+                    label, ev.get("last_len"), ev.get("ts", time.time()),
                 )
                 return
 
@@ -1554,7 +1658,10 @@ class GatewayService:
                 # Any unknown event byte (e.g. EV_IDLE 0xF4) -- still log so
                 # we can see the full USB event stream during diagnostics.
                 if t is not None:
-                    logger.debug("transport event type=0x%02X data=%r", int(t), ev.get("data"))
+                    logger.debug(
+                        "%s transport event type=0x%02X data=%r",
+                        label, int(t), ev.get("data"),
+                    )
                 return
 
             self.log_transport_reply(ev)
@@ -1930,15 +2037,29 @@ class GatewayService:
         def _reconnect():
             try:
                 logger.warning("RaceLink: attempting gateway transport reconnect after error: %s", reason)
-                # Stage 2 Part 5: close every attached transport, not
-                # just the primary slot. At N>1 the secondary transports
-                # would otherwise hold their exclusive OS file-descriptor
-                # locks across the reconnect and the upcoming
-                # ``enumerate_all`` probe would see every port as
-                # ``PORT_BUSY``. ``_close_all_transports`` is idempotent
-                # and is the same helper ``discoverPort`` uses on entry,
-                # so the cleanup is guaranteed even when ``discoverPort``
-                # bails before its own close step.
+                # Round 4 Task 3: graceful soft-rediscover path first.
+                # When at least one transport is still attached (i.e.
+                # only one of N died and per-transport cleanup already
+                # removed it), ``soft_rediscover`` is enough — it
+                # attaches the missing one(s) WITHOUT closing the live
+                # transports. The nuclear ``_close_all_transports +
+                # discoverPort`` path used to race the
+                # MissingTransportTracker poll, tearing down freshly-
+                # attached transports every 5s.
+                attached = list(getattr(self.controller, "_transports", None) or ())
+                soft = getattr(self.controller, "soft_rediscover", None)
+                if attached and callable(soft):
+                    try:
+                        soft()
+                    except Exception:
+                        logger.exception(
+                            "RaceLink: soft_rediscover during reconnect raised",
+                        )
+                    return
+
+                # Zero attached transports — legacy nuclear path. Close
+                # any lingering OS file-descriptor locks and re-run the
+                # full discoverPort cycle.
                 try:
                     closer = getattr(self.controller, "_close_all_transports", None)
                     if callable(closer):
@@ -1961,6 +2082,97 @@ class GatewayService:
         # A8: named so threading.enumerate() / py-spy outputs are
         # legible during a reconnect storm.
         threading.Thread(target=_reconnect, daemon=True, name="rl-reconnect").start()
+
+    def _detach_one_transport(self, ident_mac: str, reason: str) -> None:
+        """Per-transport EV_ERROR cleanup when N>1 transports are
+        attached and the dying transport carries a positively-known
+        ident_mac. Closes the dead transport, drops it from
+        ``controller._transports``, clears its entry in the
+        per-transport hooks tracker, forgets the bind record, and
+        broadcasts ``gateway_detached`` so the WebUI removes its pill
+        without tearing down the surviving transports.
+
+        Called from :meth:`on_transport_event` on the dying
+        transport's read thread; the read thread itself is on its way
+        out so calling ``close()`` from here is safe.
+        """
+        target = (ident_mac or "").upper()
+        transports = list(getattr(self.controller, "_transports", None) or ())
+        dead = None
+        for t in transports:
+            if str(getattr(t, "ident_mac", "") or "").upper() == target:
+                dead = t
+                break
+        if dead is None:
+            logger.warning(
+                "GatewayService: EV_ERROR with gateway_id=%s but no "
+                "matching transport in _transports — skipping detach",
+                ident_mac,
+            )
+            return
+        logger.warning(
+            "GatewayService: transport ident_mac=%s detached after "
+            "error: %s (per-transport cleanup; other transports stay "
+            "online)", ident_mac, reason,
+        )
+        # close() joins the transport's rx thread — and the EV_ERROR
+        # we are handling RIGHT NOW is delivered from that same thread.
+        # Calling close() synchronously here raises ``RuntimeError:
+        # cannot join current thread``. Spawn a daemon thread to do
+        # the join + ser.close() out-of-band; the read thread is on
+        # its way out already, so the OS FD will be released shortly.
+        close = getattr(dead, "close", None)
+        if callable(close):
+            def _close_async(t=dead, label=ident_mac):
+                try:
+                    t.close()
+                except Exception:
+                    logger.warning(
+                        "GatewayService: close raised on detached transport %s",
+                        label, exc_info=True,
+                    )
+            threading.Thread(
+                target=_close_async, daemon=True,
+                name=f"rl-transport-close-{ident_mac}",
+            ).start()
+        try:
+            self.controller._transports.remove(dead)
+        except ValueError:
+            pass
+        # Forget the per-id hooks-installed marker so a future
+        # re-attach (same MAC, fresh transport instance) reinstalls
+        # the service listener via _install_transport_hooks.
+        hooks_set = getattr(self.controller, "_transport_hooks_installed_for", None)
+        if hooks_set is not None:
+            try:
+                hooks_set.discard(id(dead))
+            except Exception:
+                logger.debug(
+                    "GatewayService: discarding hooks-set entry failed for %s",
+                    ident_mac, exc_info=True,
+                )
+        bind_service = getattr(self.controller, "gateway_bind_service", None)
+        if bind_service is not None:
+            try:
+                bind_service.forget(target)
+                bind_service.broadcast_detached(target, reason)
+            except Exception:
+                logger.exception(
+                    "GatewayService: bind_service forget/broadcast raised for %s",
+                    ident_mac,
+                )
+        # Round 3: kick the reconnect tracker so the gateway_missing
+        # banner picks up the freshly-vacated MAC. evaluate_and_arm is
+        # idempotent — if the MAC is on the operator's cancel list or
+        # not bound to any RL_Network, the tracker stays quiet.
+        tracker = getattr(self.controller, "missing_transport_tracker", None)
+        if tracker is not None:
+            try:
+                tracker.evaluate_and_arm()
+            except Exception:
+                logger.exception(
+                    "GatewayService: missing_transport_tracker.evaluate_and_arm raised",
+                )
 
     def pending_try_match(self, ev: dict) -> None:
         # A5: snapshot via the controller helper, then use compare-and-
