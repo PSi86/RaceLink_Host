@@ -25,6 +25,10 @@ from ..domain import (
 )
 from ..domain.flags import USER_FLAG_DEFS
 from ..domain.indicators import DEFAULT_INDICATE_DURATION_SEC, IndicatorType
+from ..domain.network_boundary import (
+    NetworkBoundaryViolation,
+    validate_group_membership,
+)
 from ..domain.node_config import serialize_node_config_schema
 from ..services import OTAWorkflowService, SpecialsService
 from ..services.scene_cost_estimator import estimate_scene, lora_parameters
@@ -268,9 +272,24 @@ def _prepare_discover_target(ctx, *, target_gid, new_group_name):
     logic can be unit-tested without a Flask request context.
     """
     created_gid = None
+    # Stage 3 Part B: inherit the default network_id so discover-
+    # created groups participate in the boundary check on subsequent
+    # bulk-set operations.
+    net_repo = getattr(ctx.rl_instance, "network_repository", None)
+    default_network_id = None
+    if net_repo is not None:
+        try:
+            items = list(net_repo.list())
+            if items:
+                default_network_id = str(getattr(items[0], "id", "") or "") or None
+        except Exception:
+            logger.exception("_prepare_discover_target: default network lookup raised")
     with ctx.rl_lock:
         if new_group_name:
-            group = ctx.RL_DeviceGroup(str(new_group_name), static_group=0, dev_type=0)
+            group = ctx.RL_DeviceGroup(
+                str(new_group_name), static_group=0, dev_type=0,
+                network_id=default_network_id,
+            )
             if ctx.group_repo is not None:
                 created_gid = ctx.group_repo.append(group)
             else:
@@ -426,13 +445,212 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/master", methods=["GET"])
     def api_master():
+        # Stage 2 Part 4: the ``master`` field carries the multi-network
+        # payload ``{networks: [...], default_network_id: "..."}``. At
+        # N=1 attached gateway the array has a single entry, which the
+        # legacy frontend reads as ``networks[0]`` to preserve the
+        # single-master UX. Stage 4 introduces a proper multi-network
+        # UI driven by the same payload.
         gateway = _gateway_status(ctx)
         return jsonify({
             "ok": True,
-            "master": ctx.sse.master.snapshot(),
+            "master": ctx.sse.masters.snapshot(),
             "task": ctx.tasks.snapshot(),
             "gateway": gateway,
         })
+
+    @bp.route("/api/networks", methods=["GET"])
+    def api_networks():
+        """Read-only listing of the operator's configured RaceLink
+        networks plus their current live state (Stage 2 Part 4).
+
+        Stage 3 adds CRUD; for now this exposes the repository so the
+        WebUI can render network badges / filters on the device table.
+        Each row carries the persisted metadata (id, name,
+        gateway_mac, region, channel_id, rf_config) plus the live
+        :class:`MasterState` snapshot for the same network id.
+        """
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        masters_snap = ctx.sse.masters.snapshot() if ctx.sse else {"networks": [], "default_network_id": None}
+        live_by_id = {
+            row.get("network_id"): row
+            for row in masters_snap.get("networks", [])
+            if isinstance(row, dict) and row.get("network_id")
+        }
+        rows = []
+        if net_repo is not None:
+            try:
+                items = list(net_repo.list())
+            except Exception:
+                logger.exception("/api/networks: repo iteration raised")
+                items = []
+            for net in items:
+                nid = str(getattr(net, "id", "") or "")
+                rows.append({
+                    "id": nid,
+                    "name": str(getattr(net, "name", "") or ""),
+                    "gateway_mac": getattr(net, "gateway_mac", None),
+                    "region": getattr(net, "region", None),
+                    "channel_id": getattr(net, "channel_id", None),
+                    "rf_config": getattr(net, "rf_config", None),
+                    "created_ts": getattr(net, "created_ts", None),
+                    "live": live_by_id.get(nid),
+                })
+        return jsonify({
+            "ok": True,
+            "networks": rows,
+            "default_network_id": masters_snap.get("default_network_id"),
+        })
+
+    @bp.route("/api/gateways", methods=["GET"])
+    def api_gateways_list():
+        """Stage 3 Part D: snapshot of the bind-state machine.
+
+        Returns ``{"ok": True, "gateways": [{ident_mac, state, ...},
+        ...]}``. Drives the WebUI's per-gateway status bar + opens
+        the bind wizard when any record is in ``conflict`` or
+        ``unbound``.
+        """
+        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
+        if bind_service is None:
+            return jsonify({"ok": True, "gateways": []})
+        return jsonify({"ok": True, **bind_service.snapshot()})
+
+    @bp.route("/api/networks/<network_id>/migrate", methods=["POST"])
+    def api_network_migrate(network_id: str):
+        """Stage 3 Part E: kick off the RF-migration task for one
+        network.
+
+        Body: ``{target_rf_config: {...}, force_offline?: bool}``.
+        Returns ``{ok, task}`` immediately; live progress streams on
+        the existing SSE ``task`` channel. The migration engine
+        re-evaluates the bind service when done so the WebUI's
+        ``gateway_bound``/``gateway_conflict`` indicators close out
+        automatically.
+        """
+        migration = getattr(ctx.rl_instance, "rf_migration_service", None)
+        if migration is None:
+            return jsonify({"ok": False, "error": "migration service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        target = body.get("target_rf_config")
+        if not isinstance(target, dict):
+            return jsonify({
+                "ok": False,
+                "error": "target_rf_config required (object with the P_RfConfig fields)",
+            }), 400
+        force_offline = bool(body.get("force_offline", False))
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            # Surface phase + per-device telemetry through the task
+            # meta channel so the WebUI's migration wizard can render
+            # a per-phase progress bar.
+            ctx.tasks.update(meta=dict(payload))
+
+        def _runner():
+            return migration.migrate_network_to(
+                network_id=network_id,
+                target_rf_config=target,
+                force_offline=force_offline,
+                progress_cb=_progress,
+            )
+
+        task = ctx.tasks.start(
+            "rf_migration", _runner,
+            meta={
+                "stage": "INIT",
+                "network_id": network_id,
+                "force_offline": force_offline,
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/gateways/<ident_mac>/channel-scan", methods=["POST"])
+    def api_gateway_channel_scan(ident_mac: str):
+        """Stage 3 Part F: walk a region's channel table on this
+        gateway and report who answers per channel.
+
+        Body: ``{region: str, channel_ids?: [int], identify_dwell_s?: float}``.
+        Returns ``{ok, task}`` immediately; live per-channel
+        progress streams on the existing SSE ``task`` channel. The
+        task result carries the per-channel responders + the
+        union (``all_known``, ``all_unknown``) the WebUI's
+        wizard renders.
+        """
+        scan = getattr(ctx.rl_instance, "channel_scan_service", None)
+        if scan is None:
+            return jsonify({"ok": False, "error": "channel scan service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        region = str(body.get("region") or "").strip()
+        if not region:
+            return jsonify({"ok": False, "error": "region required"}), 400
+        channel_ids = body.get("channel_ids")
+        if channel_ids is not None and not isinstance(channel_ids, list):
+            return jsonify({"ok": False, "error": "channel_ids must be a list"}), 400
+        try:
+            dwell = float(body.get("identify_dwell_s", 2.0))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "identify_dwell_s must be a number"}), 400
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            ctx.tasks.update(meta=dict(payload))
+
+        def _runner():
+            return scan.scan_region(
+                gateway_id=ident_mac,
+                region=region,
+                channel_ids=channel_ids,
+                identify_dwell_s=dwell,
+                progress_cb=_progress,
+            )
+
+        task = ctx.tasks.start(
+            "channel_scan", _runner,
+            meta={
+                "stage": "INIT",
+                "ident_mac": ident_mac,
+                "region": region,
+                "channel_ids": channel_ids,
+                "identify_dwell_s": dwell,
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/gateways/<ident_mac>/resolve", methods=["POST"])
+    def api_gateway_resolve(ident_mac: str):
+        """Stage 3 Part D: operator response to a ``gateway_conflict``
+        / ``gateway_unbound`` wizard. Body shape:
+
+            {
+                "action": "accept_gateway" | "accept_host"
+                          | "create_network" | "rebind",
+                "params": {...action-specific...},
+            }
+
+        ``params`` carries the ``token`` from the inbound SSE event
+        so a stale wizard cannot override a re-evaluated record.
+        """
+        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
+        if bind_service is None:
+            return jsonify({"ok": False, "error": "bind service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip()
+        if not action:
+            return jsonify({"ok": False, "error": "action required"}), 400
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        result = bind_service.resolve(ident_mac, action, params)
+        status = 200 if result.get("ok") else 400
+        return jsonify(result), status
 
     @bp.route("/api/gateway", methods=["GET"])
     def api_gateway_status():
@@ -956,6 +1174,42 @@ def register_api_routes(bp, ctx):
             _sse_refresh(ctx, scopes)
             return jsonify({"ok": True, **result})
 
+        # Stage 3 Part B: hard-enforce the network boundary before
+        # we kick off the task. Catches both "selected devices span
+        # multiple networks" and "target group is on a different
+        # network". Moving to Unconfigured (id 0) short-circuits the
+        # check inside the validator. The check runs under the same
+        # ``rl_lock`` shape the runner uses for in-memory mutations
+        # so a concurrent device delete cannot race us into a stale
+        # decision.
+        with ctx.rl_lock:
+            try:
+                target_group_id = int(new_group)
+            except (TypeError, ValueError):
+                target_group_id = -1
+            groups_list = ctx.groups()
+            target_group = (
+                groups_list[target_group_id]
+                if 0 <= target_group_id < len(groups_list)
+                else None
+            )
+            devices_for_check = [
+                ctx.rl_instance.getDeviceFromAddress(m) for m in macs
+            ]
+            devices_for_check = [d for d in devices_for_check if d is not None]
+        try:
+            validate_group_membership(
+                devices_for_check,
+                target_group,
+                target_group_id=target_group_id,
+            )
+        except NetworkBoundaryViolation as ex:
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
+
         # Group change: wrap in a TaskManager job for live progress.
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
@@ -1032,11 +1286,29 @@ def register_api_routes(bp, ctx):
         dev_type = int(body.get("dev_type", body.get("device_type", 0)) or 0)
         if not name:
             return jsonify({"ok": False, "error": "name required"}), 400
+        # Stage 3 Part B: new groups inherit the default network id
+        # so the boundary validator has a concrete network anchor for
+        # every membership check. Pre-Stage-4 there is no operator UI
+        # to pick a different network at create time; the v1→v2
+        # migration ensures the default network always exists.
+        net_repo = getattr(ctx.rl_instance, "network_repository", None)
+        default_network_id = None
+        if net_repo is not None:
+            try:
+                items = list(net_repo.list())
+                if items:
+                    default_network_id = str(getattr(items[0], "id", "") or "") or None
+            except Exception:
+                logger.exception("api_groups_create: default network lookup raised")
         with ctx.rl_lock:
+            new_group = ctx.RL_DeviceGroup(
+                name, static_group=0, dev_type=dev_type,
+                network_id=default_network_id,
+            )
             if ctx.group_repo is not None:
-                gid = ctx.group_repo.append(ctx.RL_DeviceGroup(name, static_group=0, dev_type=dev_type))
+                gid = ctx.group_repo.append(new_group)
             else:
-                ctx.rl_grouplist.append(ctx.RL_DeviceGroup(name, static_group=0, dev_type=dev_type))
+                ctx.rl_grouplist.append(new_group)
                 gid = len(ctx.rl_grouplist) - 1
             _save_groups_quietly("create")
         _sse_refresh(ctx, {state_scope.GROUPS})
