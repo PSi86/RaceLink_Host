@@ -7,7 +7,10 @@ from racelink.transport import LP
 
 
 class FakeTransport:
-    def __init__(self):
+    def __init__(self, ident_mac="TEST-GW"):
+        # Stage 3 Part C: every transport carries an ident_mac so the
+        # matcher's gateway_id filter has an anchor.
+        self.ident_mac = ident_mac
         self.sent = []
 
     def send_get_devices(self, **kwargs):
@@ -26,8 +29,14 @@ class FakeGateway:
         self.got_closed = got_closed
         self.installed = False
 
-    def install_transport_hooks(self):
+    def install_transport_hooks(self, transport=None):
+        # Stage 3 Part F: signature now matches the production
+        # ``GatewayService.install_transport_hooks`` which accepts an
+        # explicit transport for multi-network call sites. Tests
+        # don't care which transport — the singleton fake stays in
+        # play either way.
         self.installed = True
+        self.last_install_transport = transport
 
     def wait_rx_window(self, send_fn, collect_pred=None, fail_safe_s=8.0, *, stop_on_match=False):
         send_fn()
@@ -39,14 +48,31 @@ class FakeGateway:
                     break
         return collected, self.got_closed
 
-    def send_and_match(self, send_fn, matcher):
+    def send_and_match(self, send_fn, matcher, *, transport=None):
         """Test shim mirroring the prod send_and_match: replay events
         through matcher.matches(), append to matcher.collected, exit early
-        on expected_count."""
+        on expected_count.
+
+        Stage 3 Part C: mirrors the production signature's new
+        ``transport`` kwarg and tags every replayed event with the
+        matcher's gateway_id (if any) so concrete-sender matchers
+        accept the replayed reply — the real transport's ``_emit``
+        applies the same tag.
+        """
         send_fn()
+        # Determine the gateway_id to stamp on events. Prefer the
+        # matcher's filter (if any), otherwise fall back to the
+        # routed transport's ident_mac, otherwise leave events
+        # untagged (legitimate for wildcard matchers).
+        ev_gateway_id = matcher.gateway_id or (
+            getattr(transport, "ident_mac", None) if transport else None
+        )
         for ev in self.events:
-            if matcher.matches(ev):
-                matcher.collected.append(ev)
+            tagged = dict(ev)
+            if ev_gateway_id is not None:
+                tagged.setdefault("gateway_id", ev_gateway_id)
+            if matcher.matches(tagged):
+                matcher.collected.append(tagged)
                 if len(matcher.collected) >= matcher.expected_count:
                     break
         return list(matcher.collected), "count" if matcher.collected else "no_reply"

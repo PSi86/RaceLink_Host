@@ -46,6 +46,58 @@ class ControlService:
             return None
         return transport
 
+    def _transport_for_group_send(self, group_id, context: str):
+        """Stage 3 Part G: resolve the transport that owns the network
+        this group's broadcast should ride. Falls back to the
+        singleton at N=1 / for legacy unmigrated groups.
+
+        Returns ``None`` after logging when no transport is attached
+        — the call site bails the same way :meth:`_require_transport`
+        bails.
+        """
+        controller = getattr(self, "controller", None)
+        routed = None
+        if controller is not None:
+            try:
+                routed = controller.transport_for_group(group_id)
+            except Exception:
+                # swallow-ok: routing helper is best-effort; fall back
+                # to the singleton so single-gateway deployments
+                # always work even if the group repo is malformed.
+                routed = None
+        if routed is None:
+            routed = self.transport
+        if routed is None:
+            logger.warning("%s: communicator not ready", context)
+            return None
+        return routed
+
+    def _transport_for_device_send(self, target_device, context: str):
+        """Stage 3 Part G: resolve the transport bound to the
+        target_device's network. Same fallback pattern as
+        :meth:`_transport_for_group_send`.
+        """
+        controller = getattr(self, "controller", None)
+        routed = None
+        if controller is not None:
+            try:
+                addr = str(getattr(target_device, "addr", "") or "")
+                if addr:
+                    routed = controller.transport_for_device(addr)
+            except Exception:
+                # swallow-ok: routing helper is best-effort. A missing
+                # ``transport_for_device`` (older controller / test
+                # fake) falls through to the singleton below; the
+                # gateway_id contract from Part C still gates the
+                # actual send so a misroute can't silently succeed.
+                routed = None
+        if routed is None:
+            routed = self.transport
+        if routed is None:
+            logger.warning("%s: communicator not ready", context)
+            return None
+        return routed
+
     @staticmethod
     def _coerce_preset_values(flags, preset_id, brightness, *, fallback=None):
         if fallback is not None:
@@ -143,7 +195,7 @@ class ControlService:
         its pre-indicator state when ``duration_sec`` expires via the
         snapshot logic in ``racelink_wled.cpp``.
         """
-        transport = self._require_transport("sendDeviceIndicate")
+        transport = self._transport_for_device_send(target_device, "sendDeviceIndicate")
         if transport is None:
             return False
 
@@ -172,7 +224,7 @@ class ControlService:
         misinterpreted as success — operators saw 200 OK with no packet
         on the wire.
         """
-        transport = self._require_transport("sendDevicePreset")
+        transport = self._transport_for_device_send(target_device, "sendDevicePreset")
         if transport is None:
             return False
 
@@ -212,11 +264,11 @@ class ControlService:
         transport is not ready. Same B2 contract as
         :meth:`send_device_preset`.
         """
-        transport = self._require_transport("sendGroupPreset")
+        group_b = int(group_id) & 0xFF
+        transport = self._transport_for_group_send(group_b, "sendGroupPreset")
         if transport is None:
             return False
 
-        group_b = int(group_id) & 0xFF
         flags_b, preset_b, brightness_b = self._coerce_preset_values(flags, preset_id, brightness)
         self._update_group_preset_cache(group_b, flags_b, preset_b, brightness_b)
 
@@ -286,18 +338,20 @@ class ControlService:
         Returns ``True`` if a frame was queued, ``False`` if the transport is
         not ready or no target was provided.
         """
-        transport = self._require_transport("sendOffset")
-        if transport is None:
-            return False
-
         if targetGroup is not None:
             group_b = int(targetGroup) & 0xFF
+            transport = self._transport_for_group_send(group_b, "sendOffset")
+            if transport is None:
+                return False
             transport.send_offset(
                 recv3=b"\xFF\xFF\xFF", group_id=group_b,
                 mode=mode, **mode_params,
             )
             return True
         if targetDevice is not None:
+            transport = self._transport_for_device_send(targetDevice, "sendOffset")
+            if transport is None:
+                return False
             recv3 = mac_last3_from_hex(targetDevice.addr)
             group_b = int(getattr(targetDevice, "groupId", 0)) & 0xFF
             transport.send_offset(
@@ -401,8 +455,15 @@ class ControlService:
         Flag handling matches :meth:`send_wled_preset`: ``POWER_ON`` derived
         from brightness, ``HAS_BRI`` always set when brightness is provided.
         """
-        transport = self._require_transport("sendControl")
-        if transport is None:
+        # Stage 3 Part G: transport selection moves *after* the
+        # target check below so the group-vs-device path can pick the
+        # right per-network transport. We still need a quick "any
+        # transport at all" probe so the body-build work doesn't run
+        # when the host has no gateway attached.
+        if self.transport is None and not list(
+            getattr(self.controller, "transports", None) or []
+        ):
+            logger.warning("sendControl: communicator not ready")
             return False
 
         params = params or {}
@@ -440,6 +501,9 @@ class ControlService:
 
         if targetGroup is not None:
             group_b = int(targetGroup) & 0xFF
+            transport = self._transport_for_group_send(group_b, "sendControl")
+            if transport is None:
+                return False
             transport.send_control(
                 recv3=b"\xFF\xFF\xFF",
                 group_id=group_b,
@@ -460,6 +524,9 @@ class ControlService:
             )
             return True
         if targetDevice is not None:
+            transport = self._transport_for_device_send(targetDevice, "sendControl")
+            if transport is None:
+                return False
             recv3 = mac_last3_from_hex(targetDevice.addr)
             group_b = int(getattr(targetDevice, "groupId", 0)) & 0xFF
             transport.send_control(

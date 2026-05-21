@@ -52,13 +52,23 @@ class DiscoveryService:
     def transport(self):
         return getattr(self.controller, "transport", None)
 
-    def discover_devices(self, *, group_filter=255, target_device=None, add_to_group=-1) -> dict:
-        transport = self.transport
+    def discover_devices(self, *, group_filter=255, target_device=None,
+                         add_to_group=-1, transport=None) -> dict:
+        """Trigger an ``OPC_DEVICES`` broadcast and collect IDENTIFY_REPLYs.
+
+        ``transport`` (Stage 3 Part F): scan a specific gateway
+        instance instead of the controller's primary slot. The
+        channel-scan service uses this to walk a region's channels
+        on one gateway while the others stay on their own settings.
+        Defaults to ``self.transport`` for backward compatibility.
+        """
+        if transport is None:
+            transport = self.transport
         if transport is None:
             logger.warning("getDevices: communicator not ready")
             return {"found": 0, "responders": set(), "assigned_group": None}
 
-        self.gateway_service.install_transport_hooks()
+        self.gateway_service.install_transport_hooks(transport=transport)
 
         if target_device is None:
             recv3 = b"\xFF\xFF\xFF"
@@ -92,6 +102,7 @@ class DiscoveryService:
         replies, _reason = self.gateway_service.send_and_match(
             lambda: transport.send_get_devices(recv3=recv3, group_id=group_id, flags=0),
             matcher,
+            transport=transport,
         )
 
         responders: set[str] = set()
