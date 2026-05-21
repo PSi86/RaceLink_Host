@@ -28,6 +28,7 @@ import { useUiBus } from '@/composables/useUiBus'
 import { useGatewayStore } from '@/stores/gateway'
 import { useDevicesStore } from '@/stores/devices'
 import { useGroupsStore } from '@/stores/groups'
+import { useNetworksStore } from '@/stores/networks'
 import { useNodeConfigStore } from '@/stores/node_config'
 import { useSpecialsStore } from '@/stores/specials'
 import { useRlPresetsStore } from '@/stores/rl_presets'
@@ -38,6 +39,7 @@ const route = useRoute()
 const gateway = useGatewayStore()
 const devices = useDevicesStore()
 const groups = useGroupsStore()
+const networks = useNetworksStore()
 const nodeConfig = useNodeConfigStore()
 const specials = useSpecialsStore()
 const rlPresets = useRlPresetsStore()
@@ -110,6 +112,11 @@ onMounted(async () => {
     gateway.loadInitial().catch(() => undefined),
     groups.load().catch(() => undefined),
     devices.load().catch(() => undefined),
+    // Stage 4 Block 1: network repo + shipped channel table. The
+    // channel table is compile-time on the server so the
+    // ``loadChannels`` call caches for the session.
+    networks.load().catch(() => undefined),
+    networks.loadChannels().catch(() => undefined),
     specials.load().catch(() => undefined),
     // RL-preset schema + list — needed by the editor dialog AND by the
     // Specials ``rl_preset`` action's preset picker. Loading at boot

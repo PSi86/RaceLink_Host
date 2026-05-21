@@ -115,6 +115,22 @@ export interface GatewayStatus {
   failure_count?: number
 }
 
+/** Stage 3 wire-format ``P_RfConfig`` (the seven fields the LoRa
+ *  modem actually needs). Used by:
+ *    * ``Device.last_known_rf_config`` — last known per-node settings.
+ *    * ``Network.rf_config`` — operator-intended channel for the network.
+ *    * ``Channel.*`` (region table) — pre-defined operator-visible
+ *      channel slots (max 5 per region). */
+export interface RfConfig {
+  freq_hz: number
+  bw_khz_x10: number
+  sf: number
+  cr_den: number
+  sync_word: number
+  tx_power_dbm: number
+  preamble: number
+}
+
 export interface Device {
   addr: string
   name: string | null
@@ -142,6 +158,13 @@ export interface Device {
   // doesn't have to re-derive the rule on every device list refresh.
   battery_class?: '2s' | '6s' | 'unknown'
   battery_low?: boolean
+  // Stage 4: multi-network fields. ``network_id`` is ``null`` for
+  // legacy / unmigrated payloads; the WebUI treats that as the
+  // default network. ``last_known_rf_config`` is what the device
+  // reported on its last contact — drives the diff indicator in the
+  // Network Manager and the migration engine's pre-check.
+  network_id?: string | null
+  last_known_rf_config?: RfConfig | null
   // Special-key flat fields appended by ``serialize_device``
   [key: string]: unknown
 }
@@ -162,6 +185,20 @@ export interface Group {
   dev_type: number
   device_count: number
   caps_in_group: Record<string, number>
+  // Stage 4: ``network_id`` carries the group's network anchor
+  // for the cross-network boundary enforcement (server-side
+  // validates on bulk-set; client-side disables cross-net
+  // selection in the multi-group picker). ``null`` for the
+  // ``Unconfigured`` sink and for pre-migration payloads.
+  network_id?: string | null
+}
+
+/** Stage 4: shipped channel-table entry (one slot in
+ *  :data:`rf_channels.REGION_CHANNELS`). The Network Manager dialog
+ *  renders these as dropdown options per region. */
+export interface Channel extends RfConfig {
+  id: number
+  name: string
 }
 
 export interface DevicesResponse {

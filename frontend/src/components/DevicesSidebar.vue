@@ -4,6 +4,7 @@ import { ArrowUpDown, Pencil } from 'lucide-vue-next'
 
 import { useGroupsStore } from '@/stores/groups'
 import { useDevicesStore } from '@/stores/devices'
+import { useNetworksStore } from '@/stores/networks'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useUiBus } from '@/composables/useUiBus'
@@ -11,9 +12,19 @@ import type { Group } from '@/api/types'
 
 const groups = useGroupsStore()
 const devices = useDevicesStore()
+const networks = useNetworksStore()
 const toast = useToast()
 const confirm = useConfirm()
 const ui = useUiBus()
+
+// Stage 4 Block 1: per-network filter dropdown. ``null`` ↔ ``"all"``
+// represents "All Networks" (no filter applied). The store applies
+// the filter inside ``devices.filteredDevices``; the dropdown just
+// drives the store's ``selectedNetworkId`` slot.
+const networkFilter = computed<string>({
+  get: () => networks.selectedNetworkId ?? 'all',
+  set: (value: string) => networks.setNetworkFilter(value === 'all' ? null : value),
+})
 
 interface GroupAggregate {
   online: number
@@ -184,6 +195,29 @@ function onEditGroupInputMount(el: unknown) {
 
 <template>
   <aside class="flex h-full min-h-0 flex-col rounded-[10px] border border-border bg-card p-2.5">
+    <!-- Stage 4 Block 1: per-network filter. Hidden when only one
+         network exists (N=1 deployment) so the dropdown doesn't add
+         visual noise to the single-gateway UX. -->
+    <div
+      v-if="networks.networks.length > 1"
+      class="mb-2 flex shrink-0 items-center gap-2 text-[12px]"
+    >
+      <label for="rl-network-filter" class="text-muted-foreground">Network:</label>
+      <select
+        id="rl-network-filter"
+        v-model="networkFilter"
+        class="flex-auto rounded border border-border bg-background px-1.5 py-1 text-[12px]"
+      >
+        <option value="all">All Networks</option>
+        <option
+          v-for="n in networks.networks"
+          :key="n.id"
+          :value="n.id"
+        >
+          {{ n.name }}
+        </option>
+      </select>
+    </div>
     <div class="mb-1.5 flex shrink-0 items-center justify-between">
       <span>Groups</span>
       <div class="flex items-center gap-1">

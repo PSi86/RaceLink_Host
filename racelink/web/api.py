@@ -428,6 +428,10 @@ def register_api_routes(bp, ctx):
                 "dev_type": 0,
                 "device_count": int(counts.get(0, 0)),
                 "caps_in_group": dict(caps_counts.get(0, {})),
+                # Stage 4: Unconfigured is the cross-network sink —
+                # devices of any network can land here. Surface as
+                # ``null`` so the WebUI knows not to render a badge.
+                "network_id": None,
             }]
             for gid, group in enumerate(ctx.groups()):
                 name = getattr(group, "name", f"Group {gid}")
@@ -440,6 +444,9 @@ def register_api_routes(bp, ctx):
                     "dev_type": int(getattr(group, "dev_type", 0) or 0),
                     "device_count": int(counts.get(gid, 0)),
                     "caps_in_group": dict(caps_counts.get(gid, {})),
+                    "network_id": (
+                        str(getattr(group, "network_id", "") or "") or None
+                    ),
                 })
         return jsonify({"ok": True, "groups": rows})
 
@@ -501,6 +508,28 @@ def register_api_routes(bp, ctx):
             "ok": True,
             "networks": rows,
             "default_network_id": masters_snap.get("default_network_id"),
+        })
+
+    @bp.route("/api/channels", methods=["GET"])
+    def api_channels():
+        """Stage 4: shipped region/channel lookup table.
+
+        Returns ``{"ok": True, "regions": {"EU868": [{id, name,
+        freq_hz, ...}, ...], "US915": [...]}}``. Drives the WebUI's
+        Network Manager channel dropdown + the Channel Scan
+        wizard's channel-selection checkbox list. The table is a
+        compile-time constant on the server (see
+        :mod:`racelink.domain.rf_channels`); it doesn't need
+        per-request server work and the WebUI can cache the response
+        for the session.
+        """
+        from ..domain.rf_channels import REGION_CHANNELS
+        return jsonify({
+            "ok": True,
+            "regions": {
+                region: [dict(ch) for ch in channels]
+                for region, channels in REGION_CHANNELS.items()
+            },
         })
 
     @bp.route("/api/gateways", methods=["GET"])

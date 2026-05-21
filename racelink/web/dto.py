@@ -49,6 +49,19 @@ def serialize_device(dev, *, battery_helper=None):
         "last_seen_ts": float(getattr(dev, "last_seen_ts", 0.0) or 0.0),
         "last_ack": getattr(dev, "last_ack", None),
         "online": online,
+        # Stage 4: network membership + last-known RF settings drive
+        # the device-table's per-row network badge and the diff
+        # indicator in the Network Manager dialog. ``network_id`` is
+        # ``None`` for legacy / unmigrated payloads; the WebUI treats
+        # that as the default network.
+        "network_id": (
+            str(getattr(dev, "network_id", "") or "") or None
+        ),
+        "last_known_rf_config": (
+            dict(getattr(dev, "last_known_rf_config", {}) or {})
+            if isinstance(getattr(dev, "last_known_rf_config", None), dict)
+            else None
+        ),
     }
     if battery_helper is not None:
         try:
