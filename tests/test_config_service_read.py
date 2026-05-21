@@ -20,7 +20,10 @@ class _FakeTransport:
     """Minimal transport stub: just enough for ``send_get_config`` to
     be call-counted."""
 
-    def __init__(self):
+    def __init__(self, ident_mac: str = "TEST-GW"):
+        # Stage 3 Part C: every transport carries an ident_mac so the
+        # matcher's gateway_id filter has a stable anchor.
+        self.ident_mac = ident_mac
         self.get_config_calls: list[tuple[bytes, int]] = []
 
     def send_get_config(self, recv3, option):
@@ -32,13 +35,26 @@ class _FakeGatewayService:
 
     def __init__(self, *, replies=None):
         self.transport = _FakeTransport()
+        # Stage 3 Part C: production ``ConfigService.read_config`` reads
+        # ``gateway_service.controller.transport_for_device(...)`` to
+        # route the unicast. The fake has no controller, so the route
+        # falls through to ``self.transport``. Mirror the production
+        # contract by exposing ``controller=None`` explicitly.
+        self.controller = None
         self._replies = list(replies or [])
         self.send_calls: list[dict] = []
 
-    def send_and_match(self, send_fn, matcher):
+    def send_and_match(self, send_fn, matcher, *, transport=None):
         """Phase-2 path: record the matcher's filters for assertions, run
         send_fn, and replay queued replies through ``matcher.matches`` so the
-        discriminator filter and structured fields are exercised end-to-end."""
+        discriminator filter and structured fields are exercised end-to-end.
+
+        Stage 3 Part C: accepts the new ``transport`` kwarg the
+        production ``GatewayService`` exposes for multi-network
+        routing. The fake doesn't actually route — it always uses
+        ``self.transport`` — but mirroring the signature keeps the
+        production-vs-fake contract honest.
+        """
         # Surface the filters the caller built so existing tests can keep
         # asserting "discriminator was forwarded as 0x05" etc.
         self.send_calls.append({
@@ -47,11 +63,18 @@ class _FakeGatewayService:
             "expected_ack_of": matcher.expected_ack_of,
             "discriminator": matcher.discriminator_value,
             "max_timeout_s": matcher.max_timeout_s,
+            "gateway_id": matcher.gateway_id,
         })
         send_fn()
+        # Stage 3 Part C: the matcher carries a concrete gateway_id
+        # (from the routed transport); tag each replayed reply so
+        # ``matcher.matches`` accepts it. Mirrors the real transport's
+        # ``_emit`` tagging.
         for ev in self._replies:
-            if matcher.matches(ev):
-                matcher.collected.append(ev)
+            tagged = dict(ev)
+            tagged.setdefault("gateway_id", self.transport.ident_mac)
+            if matcher.matches(tagged):
+                matcher.collected.append(tagged)
                 if len(matcher.collected) >= matcher.expected_count:
                     break
         return list(matcher.collected), "count" if matcher.collected else "no_reply"

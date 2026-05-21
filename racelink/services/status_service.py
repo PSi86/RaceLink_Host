@@ -109,9 +109,50 @@ class StatusService:
             expected_count, ceiling_s=rf_timing.COLLECT_MAX_CEILING_S
         )
 
+        # Stage 3: a unicast STATUS request needs a concrete gateway_id
+        # so the registry can scope the reply to the source transport.
+        # Broadcast polls (target_device is None) keep ``gateway_id=None``
+        # — the matcher's ``sender_filter`` is wildcard and the
+        # registry allows that.
+        status_gateway_id = None
+        if target_device is not None:
+            assert unicast_target is not None  # narrowed by branch above
+            controller = self.controller
+            routed_transport = None
+            try:
+                routed_transport = controller.transport_for_device(
+                    getattr(target_device, "addr", "") or ""
+                )
+            except Exception:
+                # swallow-ok: routing helper is best-effort — a missing
+                # ``transport_for_device`` (older controller / test
+                # fake) falls through to the singleton transport. The
+                # gateway_id check below still gates the actual send.
+                routed_transport = None
+            if routed_transport is None:
+                routed_transport = transport
+            status_gateway_id = getattr(routed_transport, "ident_mac", None) if routed_transport else None
+            if not status_gateway_id:
+                logger.warning(
+                    "get_status: target_device %s has no routed transport ident_mac; skipping",
+                    getattr(target_device, "addr", "?"),
+                )
+                return {
+                    "updated": 0,
+                    "responders": set(),
+                    "got_closed": False,
+                    "retried": 0,
+                    "retried_responders": set(),
+                }
+            # Use the routed transport for the actual send, not the
+            # service's primary slot — multi-network deployments need
+            # the right radio.
+            transport = routed_transport
+
         matcher = PendingMatcher(
             sender_filter=frozenset({unicast_target}) if unicast_target is not None else None,
             expected_opcode=int(LP.OPC_STATUS) & 0x7F,
+            gateway_id=status_gateway_id,
             discriminator_field="reply",
             discriminator_value="STATUS_REPLY",
             # Fall back to a large sentinel when the operator polls into an
@@ -123,6 +164,7 @@ class StatusService:
         replies, _reason = self.gateway_service.send_and_match(
             lambda: transport.send_get_status(recv3=recv3, group_id=group_id, flags=0),
             matcher,
+            transport=transport,
         )
 
         responders: set[str] = set()
