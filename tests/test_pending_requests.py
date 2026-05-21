@@ -19,6 +19,14 @@ from racelink.services.pending_requests import (
 from racelink.transport import LP
 
 
+# Stage 3 Part C: concrete-sender matchers must carry a ``gateway_id``
+# so the registry rejects cross-transport replies. These tests
+# exercise the matcher/registry semantics in isolation, so a single
+# placeholder ident_mac is fine — the matcher rejection rule is
+# verified separately in ``tests/test_multi_transport.py``.
+_TEST_GATEWAY_ID = "test-gw"
+
+
 class UnicastAckMatcherTests(unittest.TestCase):
     """Single-sender, expected_count=1 — replaces the old unicast-ACK tests."""
 
@@ -27,6 +35,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         sender = bytes.fromhex("DDEEFF")
         m = PendingMatcher(
             sender_filter=frozenset({sender}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
@@ -38,6 +47,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
                 "ack_of": int(LP.OPC_SET_GROUP),
                 "ack_status": 0,
                 "sender3": sender,
+                "gateway_id": _TEST_GATEWAY_ID,
             }
         )
         self.assertIs(matched, m)
@@ -49,6 +59,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m = PendingMatcher(
             sender_filter=frozenset({bytes.fromhex("AAAAAA")}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
@@ -60,6 +71,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
                 "ack_of": int(LP.OPC_SET_GROUP),
                 "ack_status": 0,
                 "sender3": bytes.fromhex("BBBBBB"),
+                "gateway_id": _TEST_GATEWAY_ID,
             }
         )
         self.assertIsNone(matched)
@@ -70,6 +82,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         sender = bytes.fromhex("DDEEFF")
         m = PendingMatcher(
             sender_filter=frozenset({sender}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
@@ -78,9 +91,10 @@ class UnicastAckMatcherTests(unittest.TestCase):
         matched = reg.try_match(
             {
                 "opc": LP.OPC_ACK,
-                "ack_of": int(LP.OPC_CONFIG),  # ACK for something else
+                "ack_of": int(LP.OPC_CONFIG),
                 "ack_status": 0,
                 "sender3": sender,
+                "gateway_id": _TEST_GATEWAY_ID,
             }
         )
         self.assertIsNone(matched)
@@ -91,6 +105,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         sender = bytes.fromhex("DDEEFF")
         m = PendingMatcher(
             sender_filter=frozenset({sender}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_opcode=int(LP.OPC_STATUS),
             expected_count=1,
             max_timeout_s=1.0,
@@ -101,6 +116,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
                 "opc": LP.OPC_STATUS,
                 "reply": "STATUS_REPLY",
                 "sender3": sender,
+                "gateway_id": _TEST_GATEWAY_ID,
             }
         )
         self.assertIs(matched, m)
@@ -110,6 +126,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m = PendingMatcher(
             sender_filter=frozenset({bytes.fromhex("DDEEFF")}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
@@ -123,12 +140,14 @@ class UnicastAckMatcherTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m1 = PendingMatcher(
             sender_filter=frozenset({bytes.fromhex("111111")}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
         )
         m2 = PendingMatcher(
             sender_filter=frozenset({bytes.fromhex("222222")}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=1.0,
@@ -141,6 +160,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
                 "ack_of": int(LP.OPC_SET_GROUP),
                 "ack_status": 0,
                 "sender3": bytes.fromhex("222222"),
+                "gateway_id": _TEST_GATEWAY_ID,
             }
         )
         self.assertFalse(m1.done)
@@ -152,6 +172,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
         sender = bytes.fromhex("DDEEFF")
         m = PendingMatcher(
             sender_filter=frozenset({sender}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_SET_GROUP),
             expected_count=1,
             max_timeout_s=2.0,
@@ -166,6 +187,7 @@ class UnicastAckMatcherTests(unittest.TestCase):
                     "ack_of": int(LP.OPC_SET_GROUP),
                     "ack_status": 0,
                     "sender3": sender,
+                    "gateway_id": _TEST_GATEWAY_ID,
                 }
             )
 
@@ -189,6 +211,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
         c = bytes.fromhex("CCCCCC")
         m = PendingMatcher(
             sender_filter=frozenset({a, b, c}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_STREAM),
             expected_count=3,
             idle_timeout_s=0.5,
@@ -202,6 +225,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
                     "ack_of": int(LP.OPC_STREAM),
                     "ack_status": 0,
                     "sender3": sender3,
+                    "gateway_id": _TEST_GATEWAY_ID,
                 }
             )
         self.assertTrue(m.done)
@@ -215,6 +239,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
         b = bytes.fromhex("BBBBBB")
         m = PendingMatcher(
             sender_filter=frozenset({a, b}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_STREAM),
             expected_count=2,  # we'll only deliver 1
             idle_timeout_s=0.1,
@@ -230,6 +255,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
                     "ack_of": int(LP.OPC_STREAM),
                     "ack_status": 0,
                     "sender3": a,
+                    "gateway_id": _TEST_GATEWAY_ID,
                 }
             )
         t = threading.Thread(target=dispatcher)
@@ -248,6 +274,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m = PendingMatcher(
             sender_filter=frozenset({bytes.fromhex("DDEEFF")}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_STREAM),
             expected_count=1,
             idle_timeout_s=0.5,
@@ -265,6 +292,7 @@ class MultiSenderCollectorTests(unittest.TestCase):
         c_other = bytes.fromhex("CCCCCC")
         m = PendingMatcher(
             sender_filter=frozenset({a, b}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_ack_of=int(LP.OPC_STREAM),
             expected_count=2,
             max_timeout_s=0.5,
@@ -327,7 +355,3 @@ class WildcardSenderTests(unittest.TestCase):
         )
         self.assertIsNone(matched)
         self.assertEqual(len(m.collected), 0)
-
-
-if __name__ == "__main__":
-    unittest.main()

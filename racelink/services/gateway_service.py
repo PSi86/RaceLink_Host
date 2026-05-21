@@ -79,7 +79,11 @@ class GatewayService:
     def __init__(self, controller):
         self.controller = controller
         self._auto_reassign_cooldown_s = 2.0
-        self._auto_reassign_recent: dict[str, float] = {}
+        # Stage 2 Part 3: cooldown keyed by ``(gateway_id, mac)``. The
+        # leading ``Optional[str]`` element is ``None`` for the legacy
+        # single-gateway code path (gateway_id unknown / wildcard) and
+        # the transport's ``ident_mac`` once events carry the tag.
+        self._auto_reassign_recent: dict[tuple[Optional[str], str], float] = {}
         self._auto_reassign_lock = threading.Lock()
         # A7: bounded executor for auto-restore workers. The previous
         # implementation kept a ``list[Thread]`` and pruned dead
@@ -115,7 +119,21 @@ class GatewayService:
         # unblocks unicast waiters as soon as the expected frame arrives; any
         # unmatched frame continues through the existing unsolicited pipeline
         # in ``on_transport_event``.
-        self._pending_registry = PendingMatcherRegistry()
+        #
+        # Stage 2 Part 3: the registry is now keyed per-transport (by
+        # ``gateway_id`` = transport.ident_mac). At N=1 attached gateway,
+        # every matcher/event lands in the same default-bucket and the
+        # behaviour is byte-identical to Stage 2 Part 2. With multiple
+        # transports, matchers tagged with a concrete ``gateway_id``
+        # only see events from their own transport, eliminating the
+        # bucket-key collision risk for two devices that share the
+        # same last-3 MAC bytes across different gateways.
+        self._pending_registries: dict[Optional[str], PendingMatcherRegistry] = {}
+        self._pending_registries_lock = threading.Lock()
+        # Default / wildcard registry: matchers with ``gateway_id=None``
+        # (legacy single-gateway code paths) live here. Eagerly created
+        # so ``self._pending_registry`` always resolves without locking.
+        self._pending_registries[None] = PendingMatcherRegistry()
         # Reserved for future use; disabled by default because the observed
         # "bulk set group times out on the second device" problem turned out
         # to be a host-side deadlock (web thread held ``ctx.rl_lock`` across
@@ -128,6 +146,35 @@ class GatewayService:
     @property
     def transport(self):
         return getattr(self.controller, "transport", None)
+
+    @property
+    def _pending_registry(self) -> PendingMatcherRegistry:
+        """Back-compat accessor for the default / wildcard registry.
+
+        Stage 2 Part 3 keeps a per-gateway dict of registries; this
+        property returns the ``gateway_id=None`` bucket, which is the
+        bucket the single-gateway code paths used before the split.
+        Tests and any non-routing call site can keep using this name.
+        """
+        return self._pending_registries[None]
+
+    def _registry_for(self, gateway_id: Optional[str]) -> PendingMatcherRegistry:
+        """Return (lazily creating) the registry for ``gateway_id``.
+
+        ``None`` always resolves to the default/wildcard registry that
+        was created eagerly in ``__init__``. A concrete ``ident_mac``
+        gets its own registry so the fast-bucket lookup keys cannot
+        collide across transports that happen to share the same
+        last-3 MAC bytes on different devices.
+        """
+        if gateway_id is None:
+            return self._pending_registries[None]
+        with self._pending_registries_lock:
+            reg = self._pending_registries.get(gateway_id)
+            if reg is None:
+                reg = PendingMatcherRegistry()
+                self._pending_registries[gateway_id] = reg
+            return reg
 
     def _state_lock(self):
         """Return the state-repository mutation lock, or a no-op fallback.
@@ -145,6 +192,8 @@ class GatewayService:
         self,
         send_fn,
         matcher: PendingMatcher,
+        *,
+        transport=None,
     ) -> tuple[list[dict], str]:
         """Unified send + wait-for-matching-events primitive.
 
@@ -161,12 +210,33 @@ class GatewayService:
         The single primitive for all "outbound TX → inbound reply"
         coordination — covers unicast 1-reply, multi-sender N-reply,
         and wildcard discovery flows.
+
+        ``transport``: Stage 2 Part 3 hook for explicit multi-network
+        routing. When supplied, hooks are installed on that specific
+        transport and the matcher inherits its ``ident_mac`` as the
+        ``gateway_id`` filter (so cross-transport replies cannot
+        accidentally satisfy the wait). Defaults to ``self.transport``
+        which is ``_transports[0]`` — i.e. legacy single-gateway
+        behaviour.
         """
-        if not self.transport:
+        if transport is None:
+            transport = self.transport
+        if not transport:
             return [], "no_reply"
 
-        self.install_transport_hooks()
-        self._pending_registry.register(matcher)
+        # If the caller did not pre-set ``matcher.gateway_id`` and the
+        # routed transport has a known identity, tag the matcher so
+        # the per-gateway registry routes events from sibling
+        # transports past it. Concrete-id callers (e.g. tests) keep
+        # whatever value they put on the matcher.
+        if matcher.gateway_id is None:
+            ident = getattr(transport, "ident_mac", None)
+            if ident:
+                matcher.gateway_id = ident
+
+        self.install_transport_hooks(transport=transport)
+        registry = self._registry_for(matcher.gateway_id)
+        registry.register(matcher)
         t_start = time.monotonic()
         try:
             send_fn()
@@ -176,11 +246,66 @@ class GatewayService:
             # drift (≤ ms) is irrelevant.
             reason = matcher.wait(on_send_complete=t_start)
         finally:
-            self._pending_registry.cancel(matcher)
+            registry.cancel(matcher)
         logger.debug(
             "send_and_match EXIT reason=%s collected=%d elapsed=%.3fs",
             reason,
             len(matcher.collected),
+            time.monotonic() - t_start,
+        )
+        return list(matcher.collected), reason
+
+    def send_broadcast_and_match(
+        self,
+        send_factory,
+        matcher: PendingMatcher,
+    ) -> tuple[list[dict], str]:
+        """Broadcast variant of :meth:`send_and_match` — fan out across
+        every attached transport, collect replies through a single
+        wildcard matcher.
+
+        ``send_factory(transport)`` is invoked once per transport in
+        ``controller.transports`` to fire the broadcast through that
+        specific port. The matcher must use ``gateway_id=None``
+        (wildcard) so it collects replies from any transport; this
+        helper enforces that constraint defensively. RX events from
+        every transport land in the default registry where the
+        wildcard matcher lives — see ``on_transport_event``'s dispatch
+        that always offers each event to the ``None`` bucket.
+
+        At N=1 attached gateway this collapses to one ``send_factory``
+        call and is byte-identical to ``send_and_match``. Stage 3
+        callers (discovery, multi-network broadcast streams) swap
+        their fixed ``send_fn`` over to this fan-out.
+        """
+        transports = list(getattr(self.controller, "transports", None) or [])
+        if not transports:
+            return [], "no_reply"
+        # The matcher must be wildcard so replies from any transport
+        # can collect into it; force-clear any concrete gateway_id.
+        matcher.gateway_id = None
+        for t in transports:
+            self.install_transport_hooks(transport=t)
+        registry = self._registry_for(None)
+        registry.register(matcher)
+        t_start = time.monotonic()
+        try:
+            for t in transports:
+                try:
+                    send_factory(t)
+                except Exception:
+                    logger.exception(
+                        "send_broadcast_and_match: send_factory raised for transport %r",
+                        getattr(t, "ident_mac", "?"),
+                    )
+            reason = matcher.wait(on_send_complete=t_start)
+        finally:
+            registry.cancel(matcher)
+        logger.debug(
+            "send_broadcast_and_match EXIT reason=%s collected=%d transports=%d elapsed=%.3fs",
+            reason,
+            len(matcher.collected),
+            len(transports),
             time.monotonic() - t_start,
         )
         return list(matcher.collected), reason
@@ -191,6 +316,8 @@ class GatewayService:
         opcode7: int,
         timeout_s: float,
         discriminator: Optional[int] = None,
+        *,
+        gateway_id: Optional[str] = None,
     ) -> Optional[PendingMatcher]:
         """Build a single-reply matcher for unicast request/response.
 
@@ -199,6 +326,13 @@ class GatewayService:
         that case. Broadcast targets (``recv3 == FFFFFF``) get a
         wildcard ``sender_filter`` with idle-timeout enabled so the
         first reply wins and stragglers tail off cleanly.
+
+        ``gateway_id`` (Stage 3): the ``ident_mac`` of the routed
+        transport, stamped onto the matcher so the registry refuses
+        replies from sibling transports. Required for unicast
+        targets (non-broadcast ``recv3``); pure-broadcast matchers
+        (``recv3 == FFFFFF``) keep ``gateway_id=None`` as the
+        wildcard semantics.
         """
         opcode7 = int(opcode7) & 0x7F
         recv3_b = bytes(recv3 or b"")
@@ -219,10 +353,17 @@ class GatewayService:
         )
         idle_s = rf_timing.COLLECT_IDLE_TIMEOUT_S if sender_filter is None else 0.0
 
+        # Stage 3: concrete sender_filter requires gateway_id; the
+        # registry's ``register`` would otherwise raise. We let the
+        # error propagate from there rather than swallowing here so
+        # the call-site stacktrace is meaningful when this misfires.
+        matcher_gateway_id = gateway_id if sender_filter is not None else None
+
         if policy == int(protocol_rules.RESP_ACK):
             return PendingMatcher(
                 sender_filter=sender_filter,
                 expected_ack_of=opcode7,
+                gateway_id=matcher_gateway_id,
                 expected_count=1,
                 idle_timeout_s=idle_s,
                 max_timeout_s=float(timeout_s),
@@ -232,6 +373,7 @@ class GatewayService:
         return PendingMatcher(
             sender_filter=sender_filter,
             expected_opcode=rsp_opc,
+            gateway_id=matcher_gateway_id,
             discriminator_field="option" if discriminator is not None else None,
             discriminator_value=discriminator,
             expected_count=1,
@@ -248,6 +390,7 @@ class GatewayService:
         attempts: Optional[int] = None,
         per_attempt_timeout_s: Optional[float] = None,
         retry_delay_s: Optional[float] = None,
+        transport=None,
     ) -> tuple[list[dict], bool]:
         """Wait-for-reply with bounded retries on transient timeout.
 
@@ -263,6 +406,15 @@ class GatewayService:
         which with the defaults is ~4.7 s — *shorter* than the
         old 8 s single-attempt timeout this helper replaces, even
         for genuinely-offline devices.
+
+        ``transport``: Stage 2 Part 3 multi-network routing hook. When
+        ``None`` (the default), the unicast target's transport is
+        derived from ``controller.transport_for_device(recv3)``. At
+        N=1 attached gateway this resolves to the same transport every
+        caller already closed over in ``send_fn`` — behaviour is
+        identical to the pre-Part-3 path. Callers that already chose a
+        transport explicitly (e.g. ``setNodeGroupId``) pass it through
+        so the matcher's ``gateway_id`` tag matches the actual sender.
         """
         opcode7 = int(opcode7) & 0x7F
         n = int(attempts if attempts is not None else rf_timing.UNICAST_MAX_ATTEMPTS)
@@ -277,9 +429,6 @@ class GatewayService:
             retry_delay_s if retry_delay_s is not None else rf_timing.UNICAST_RETRY_DELAY_S
         )
 
-        if not self.transport:
-            return [], False
-
         # Resolve the optional sender device once for the mark_online hook.
         recv3_b = bytes(recv3 or b"")
         sender_filter_bytes = recv3_b if recv3_b and recv3_b != b"\xFF\xFF\xFF" else None
@@ -290,14 +439,54 @@ class GatewayService:
             else None
         )
 
+        # Resolve the routed transport. Explicit ``transport=`` wins;
+        # otherwise prefer the device's network binding (multi-network
+        # path); finally fall back to ``self.transport`` (single-
+        # gateway default).
+        routed_transport = transport
+        if routed_transport is None and sender_filter_hex:
+            try:
+                routed_transport = self.controller.transport_for_device(sender_filter_hex)
+            except Exception:
+                # swallow-ok: routing helper is best-effort, fall back
+                # to the singleton.
+                routed_transport = None
+        if routed_transport is None:
+            routed_transport = self.transport
+        if not routed_transport:
+            return [], False
+        gateway_id_filter = getattr(routed_transport, "ident_mac", None)
+
+        # Stage 3: a unicast send requires a concrete ``gateway_id``
+        # so the matcher can reject cross-transport replies. The only
+        # case ``ident_mac`` is ``None`` is the brief pre-handshake
+        # window before ``discover_and_open`` populates it; refusing
+        # to send here is strictly safer than stamping a wildcard
+        # matcher and letting a sibling transport's RX feed satisfy
+        # it. Broadcast sends (``recv3 == FFFFFF``) still flow — the
+        # matcher's ``sender_filter`` is ``None`` there and the
+        # registry allows wildcard gateway_id.
+        if sender_filter_hex and not gateway_id_filter:
+            logger.warning(
+                "send_and_wait_with_retries: routed transport has no "
+                "ident_mac yet (pre-handshake?); refusing to send unicast "
+                "opcode=0x%02X to %s",
+                opcode7, sender_filter_hex,
+            )
+            return [], False
+
         opcode_name = self.opcode_name(opcode7)
         last_events: list[dict] = []
         for attempt in range(n):
-            matcher = self._build_unicast_matcher(recv3, opcode7, per, discriminator=None)
+            matcher = self._build_unicast_matcher(
+                recv3, opcode7, per,
+                discriminator=None,
+                gateway_id=gateway_id_filter,
+            )
             if matcher is None:
                 # Opcode with no expected reply — fire-and-forget; no point
                 # retrying. Mirrors the legacy ``RESP_NONE`` short-circuit.
-                self.install_transport_hooks()
+                self.install_transport_hooks(transport=routed_transport)
                 send_fn()
                 return [], False
             t0 = time.monotonic()
@@ -310,7 +499,7 @@ class GatewayService:
                 n,
                 per,
             )
-            events, reason = self.send_and_match(send_fn, matcher)
+            events, reason = self.send_and_match(send_fn, matcher, transport=routed_transport)
             elapsed = time.monotonic() - t0
             if events:
                 logger.debug(
@@ -435,13 +624,72 @@ class GatewayService:
         return True
 
     def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
-        if not self.transport:
-            logger.warning("sendSync: communicator not ready")
-            return
+        """Send an ``OPC_SYNC`` clock-tick packet.
+
+        Stage 3 Part G: a broadcast sync (``recv3 == FFFFFF``) fans
+        out across *every* attached transport so each network's
+        devices receive a tick on their own radio. Unicast syncs
+        (``recv3 != FFFFFF``) route through the device's bound
+        transport via ``transport_for_device`` so the tick lands on
+        the right radio. At N=1 attached gateway the fan-out
+        collapses to a single send and behaviour is byte-identical
+        to the pre-Part-G path.
+
+        ``trigger_armed`` adds ``SYNC_FLAG_TRIGGER_ARMED`` to the
+        wire body (operator-driven sync that materialises pending
+        arm-on-sync state). Autosync MUST leave it ``False``.
+        """
         from ..protocol.packets import SYNC_FLAG_TRIGGER_ARMED
         flags = SYNC_FLAG_TRIGGER_ARMED if trigger_armed else 0
-        self.transport.send_sync(recv3=recv3, ts24=int(ts24) & 0xFFFFFF,
-                                 brightness=int(brightness) & 0xFF, flags=flags)
+        ts24_int = int(ts24) & 0xFFFFFF
+        brightness_int = int(brightness) & 0xFF
+        recv3_b = bytes(recv3 or b"")
+
+        # Unicast: route to the device's network-bound transport.
+        if recv3_b and recv3_b != b"\xFF\xFF\xFF":
+            controller = getattr(self, "controller", None)
+            routed = None
+            if controller is not None:
+                try:
+                    sender_hex = recv3_b.hex().upper()
+                    routed = controller.transport_for_device(sender_hex)
+                except Exception:
+                    # swallow-ok: routing helper is best-effort; the
+                    # fallback singleton still works at N=1.
+                    routed = None
+            if routed is None:
+                routed = self.transport
+            if routed is None:
+                logger.warning("sendSync: communicator not ready")
+                return
+            routed.send_sync(recv3=recv3_b, ts24=ts24_int,
+                             brightness=brightness_int, flags=flags)
+            return
+
+        # Broadcast: fan out across every attached transport. Each
+        # transport's TX-barrier serialises sends per-radio; the
+        # cross-transport calls run sequentially on the caller
+        # thread, but each USB-CDC write is sub-millisecond so the
+        # whole fan-out is well under the LoRa airtime budget.
+        transports = list(getattr(self.controller, "transports", None) or [])
+        if not transports:
+            primary = self.transport
+            if primary is None:
+                logger.warning("sendSync: communicator not ready")
+                return
+            transports = [primary]
+        for t in transports:
+            try:
+                t.send_sync(recv3=recv3_b, ts24=ts24_int,
+                            brightness=brightness_int, flags=flags)
+            except Exception:
+                # swallow-ok: one misbehaving transport must not abort
+                # the sync fan-out on its siblings. The next OPC_SYNC
+                # tick (autosync runs every few hundred ms) re-tries.
+                logger.exception(
+                    "RaceLink: send_sync failed on transport %r",
+                    getattr(t, "ident_mac", None),
+                )
 
     def send_stream(
         self,
@@ -510,6 +758,19 @@ class GatewayService:
             max_ceiling,
             self.compute_collect_max_timeout(expected, ceiling_s=max_ceiling),
         )
+        # Stage 3: multi-sender N-reply matchers also require a concrete
+        # gateway_id (the target group lives on one network — Part-B
+        # boundary enforcement guarantees this). The transport this
+        # stream goes out on owns that network; use its ident_mac as
+        # the matcher's filter.
+        stream_gateway_id = getattr(transport, "ident_mac", None)
+        if not stream_gateway_id:
+            logger.warning(
+                "send_stream: transport has no ident_mac yet; refusing "
+                "to send to %d target(s) (recv3=%s)",
+                expected, recv3.hex().upper(),
+            )
+            return {"expected": expected, "acked": 0}
         for attempt in range(max(0, int(retries)) + 1):
             remaining = target_last3 - acked
             if not remaining:
@@ -517,6 +778,7 @@ class GatewayService:
             matcher = PendingMatcher(
                 sender_filter=frozenset(remaining),
                 expected_ack_of=int(LP.OPC_STREAM) & 0x7F,
+                gateway_id=stream_gateway_id,
                 expected_count=len(remaining),
                 idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
                 max_timeout_s=max_timeout,
@@ -524,6 +786,7 @@ class GatewayService:
             replies, _reason = self.send_and_match(
                 lambda: transport.send_stream(recv3=recv3, payload=data),
                 matcher,
+                transport=transport,
             )
             for ev in replies:
                 s3 = ev.get("sender3")
@@ -708,7 +971,12 @@ class GatewayService:
 
     # ---- Gateway RF config (USB-CDC round-trip, no LoRa) -----------------
 
-    def query_gateway_rf_config(self, *, timeout_s: float = 0.5) -> dict:
+    def query_gateway_rf_config(
+        self,
+        *,
+        timeout_s: float = 0.5,
+        transport=None,
+    ) -> dict:
         """Send GW_CMD_GET_RF_CONFIG and wait for the matching EV_RF_CHANGED.
 
         Returns:
@@ -719,8 +987,16 @@ class GatewayService:
             sync_word / tx_power_dbm / preamble).
 
         The round-trip is a USB write + USB read; 500 ms is generous.
+
+        ``transport`` (Stage 3 Part D): query a specific transport
+        instance instead of the controller's primary slot. Used by
+        the bind service to evaluate every newly-attached transport
+        in turn — at N=1 the default of ``self.transport`` is the
+        right transport anyway, but multi-gateway deployments need
+        to address the right one.
         """
-        transport = self.transport
+        if transport is None:
+            transport = self.transport
         if transport is None:
             return {"ok": False, "error": "transport unavailable"}
 
@@ -782,6 +1058,7 @@ class GatewayService:
         *,
         persist: bool = True,
         timeout_s: float = 1.0,
+        transport=None,
     ) -> dict:
         """Send GW_CMD_SET_RF_CONFIG and wait for the matching EV_RF_CHANGED.
 
@@ -789,13 +1066,19 @@ class GatewayService:
         emitted ~100 ms BEFORE the reboot so we still catch it). With
         ``persist=False`` the gateway live-reconfigures and stays up.
 
+        ``transport`` (Stage 3 Part E): address a specific gateway
+        instance instead of the controller's primary slot. The
+        migration engine targets one network at a time and routes the
+        switch via the bound transport.
+
         Returns ``{"ok": bool, "reason": int, "reason_name": str,
                    "rf_config": {...} | None}``. ``ok`` is True only for
         ``reason == RF_CHANGE_OK``; any rejection (range / NVS / CRC)
         sets ``ok=False`` and carries the still-active config in
         ``rf_config`` (per the firmware contract).
         """
-        transport = self.transport
+        if transport is None:
+            transport = self.transport
         if transport is None:
             return {"ok": False, "error": "transport unavailable"}
 
@@ -857,6 +1140,7 @@ class GatewayService:
         rf_config: dict,
         *,
         timeout_s: Optional[float] = None,
+        transport=None,
     ) -> dict:
         """Push a new ``P_RfConfig`` to a node over LoRa (OPC_RF_CONFIG).
 
@@ -866,12 +1150,35 @@ class GatewayService:
         expected — the operator-facing outcome is the ACK, not a
         post-reboot heartbeat.
 
+        ``transport`` (Stage 3 Part E): route the push via a specific
+        gateway transport, e.g. when the migration engine is talking
+        through a particular network's gateway. The default
+        ``transport_for_device(mac)`` resolution covers single-gateway
+        callers; multi-network callers pass it explicitly.
+
         Returns ``{"ok": bool, "ack_status": int | None, "error": str?}``.
         ``ok`` is True iff ``ack_status == 0`` (ACK_OK). Range / NVS
         rejections return ``ok=False`` with the FW's ack_status; transport
         timeouts return ``ok=False`` with ``error="timeout"``.
         """
-        transport = self.transport
+        # ``transport`` chooses both the wire-send transport and the
+        # routed matcher. Falling back to ``self.transport`` mirrors
+        # the pre-Stage-3 behaviour at N=1.
+        if transport is None:
+            # Prefer the device's network-bound transport so the actual
+            # ``send_rf_config`` goes via the right radio.
+            controller = getattr(self, "controller", None)
+            if controller is not None:
+                try:
+                    transport = controller.transport_for_device(
+                        str(mac or "").strip().upper()
+                    )
+                except Exception:
+                    # swallow-ok: routing helper is best-effort; the
+                    # fallback singleton still works at N=1.
+                    transport = None
+        if transport is None:
+            transport = self.transport
         if transport is None:
             return {"ok": False, "error": "transport unavailable"}
 
@@ -911,6 +1218,7 @@ class GatewayService:
             LP.OPC_RF_CONFIG,
             _send,
             per_attempt_timeout_s=per_attempt,
+            transport=transport,
         )
         if not events:
             return {"ok": False, "error": "timeout"}
@@ -1075,11 +1383,28 @@ class GatewayService:
         except Exception:
             logger.exception("ACK handling failed")
 
-    def install_transport_hooks(self) -> None:
-        if self.controller._transport_hooks_installed:
-            return
-        transport = self.transport
+    def install_transport_hooks(self, transport=None) -> None:
+        """Idempotently wire RX + TX listeners onto ``transport``.
+
+        Stage 2 Part 3: ``transport`` defaults to ``self.transport``
+        (the controller's primary slot) for full backwards-compat. When
+        the controller holds multiple transports each one must be
+        wired separately; callers that have already routed via
+        ``transport_for_device`` pass the resolved transport through
+        so its RX events also reach this service's dispatcher.
+
+        Tracked per-transport via ``controller._transport_hooks_installed_for``
+        keyed by ``id(transport)`` — the new identity replaces the
+        prior single-bool flag that blocked re-installing onto
+        sibling transports.
+        """
+        if transport is None:
+            transport = self.transport
         if not transport:
+            return
+        key = id(transport)
+        installed_set = self.controller._transport_hooks_installed_for
+        if key in installed_set:
             return
 
         try:
@@ -1109,7 +1434,7 @@ class GatewayService:
         except Exception:
             logger.exception("RaceLink: failed to install transport TX listener")
 
-        self.controller._transport_hooks_installed = True
+        installed_set.add(key)
 
     def on_transport_tx(self, ev: dict) -> None:
         try:
@@ -1145,12 +1470,17 @@ class GatewayService:
 
             # A5: stash via the controller helper so the TX-listener
             # write is atomic against the RX-reader's match/clear path.
+            # Stage 2 Part 3: keyed per-gateway so two transports cannot
+            # overwrite each other's in-flight expectations. The
+            # transport layer tags every TX event with ``gateway_id``
+            # (its ident_mac) in ``_emit_tx``.
             self.controller.set_pending_expect(
                 dev=dev,
                 rule=rule,
                 opcode7=opcode7,
                 sender_last3=(dev.addr or "").upper()[-6:],
                 ts=time.time(),
+                gateway_id=ev.get("gateway_id"),
             )
         except Exception:
             logger.exception("RaceLink: TX hook failed")
@@ -1234,8 +1564,20 @@ class GatewayService:
             # blocking caller in ``send_and_match``; the remainder of this
             # handler then updates device state for the same event so the
             # unsolicited pipeline keeps working.
+            #
+            # Stage 2 Part 3: dispatch into the per-gateway registry
+            # whose ``gateway_id`` matches the event's source transport,
+            # then also offer it to the wildcard (None) registry so any
+            # legacy unrouted matcher still sees it. Concrete matchers
+            # in foreign registries never see this event — that is the
+            # whole point of the split.
             try:
-                self._pending_registry.try_match(ev)
+                ev_gw = ev.get("gateway_id")
+                if ev_gw is not None:
+                    routed_reg = self._pending_registries.get(ev_gw)
+                    if routed_reg is not None:
+                        routed_reg.try_match(ev)
+                self._pending_registries[None].try_match(ev)
             except Exception:
                 logger.exception("RaceLink: pending-registry match raised")
 
@@ -1296,13 +1638,25 @@ class GatewayService:
                             identify_event = threading.Event()
                             self._identify_events[mac12] = identify_event
                     identify_event.set()
-                    self._restore_known_device_group(dev, reported_group=ev.get("groupId"), is_known_device=is_known_device)
+                    self._restore_known_device_group(
+                        dev,
+                        reported_group=ev.get("groupId"),
+                        is_known_device=is_known_device,
+                        gateway_id=ev.get("gateway_id"),
+                    )
 
             self.pending_try_match(ev)
         except Exception:
             logger.exception("RaceLink: RX hook failed")
 
-    def _restore_known_device_group(self, dev, *, reported_group, is_known_device: bool) -> None:
+    def _restore_known_device_group(
+        self,
+        dev,
+        *,
+        reported_group,
+        is_known_device: bool,
+        gateway_id: Optional[str] = None,
+    ) -> None:
         if not is_known_device or not dev:
             return
 
@@ -1343,14 +1697,20 @@ class GatewayService:
         mac = str(getattr(dev, "addr", "") or "").upper()
         if not mac:
             return
-        if self._auto_reassign_suppressed(mac):
+        # Stage 2 Part 3: cooldown keyed by (gateway_id, mac) so an
+        # auto-restore on gateway-A doesn't suppress a parallel
+        # restore on gateway-B for the same MAC (degenerate but
+        # logically possible after a hardware swap). At N=1 the key
+        # collapses to ``(None, mac)`` and is functionally identical
+        # to the prior MAC-only key.
+        if self._auto_reassign_suppressed(mac, gateway_id=gateway_id):
             return
 
         # Plan P2-6: wait for the ACK, but do it off the transport thread so
         # blocking here never stalls reply collection. A 3s timeout bounds
         # the worker; on failure we mark the device offline so the UI shows
         # the mismatch instead of silently masking it.
-        self._mark_auto_reassign(mac)
+        self._mark_auto_reassign(mac, gateway_id=gateway_id)
         self._spawn_auto_reassign_worker(dev, stored_group=stored_group)
 
     def _spawn_auto_reassign_worker(self, dev, *, stored_group: int) -> None:
@@ -1525,16 +1885,23 @@ class GatewayService:
             # swallow-ok: best-effort query; when in doubt we assume "no discovery"
             return False
 
-    def _auto_reassign_suppressed(self, mac: str) -> bool:
+    def _auto_reassign_suppressed(self, mac: str, *, gateway_id: Optional[str] = None) -> bool:
+        # Stage 2 Part 3: cooldown key is ``(gateway_id, mac)`` so the
+        # same MAC tracked under two transports has independent
+        # cooldowns. ``gateway_id=None`` at N=1 preserves Stage-2
+        # behaviour byte-for-byte (all entries share the same first
+        # tuple element).
+        key = (gateway_id, mac)
         now = time.time()
         with self._auto_reassign_lock:
             self._prune_auto_reassign_cache_locked(now)
-            last_ts = float(self._auto_reassign_recent.get(mac, 0.0) or 0.0)
+            last_ts = float(self._auto_reassign_recent.get(key, 0.0) or 0.0)
         return (now - last_ts) < float(self._auto_reassign_cooldown_s)
 
-    def _mark_auto_reassign(self, mac: str) -> None:
+    def _mark_auto_reassign(self, mac: str, *, gateway_id: Optional[str] = None) -> None:
+        key = (gateway_id, mac)
         with self._auto_reassign_lock:
-            self._auto_reassign_recent[mac] = time.time()
+            self._auto_reassign_recent[key] = time.time()
 
     def _prune_auto_reassign_cache(self, now: float | None = None) -> None:
         """Public variant (kept for backwards compatibility in tests)."""
@@ -1544,9 +1911,9 @@ class GatewayService:
     def _prune_auto_reassign_cache_locked(self, now: float | None = None) -> None:
         now_ts = time.time() if now is None else float(now)
         expiry = max(float(self._auto_reassign_cooldown_s) * 4.0, 5.0)
-        stale = [mac for mac, ts in self._auto_reassign_recent.items() if (now_ts - float(ts or 0.0)) >= expiry]
-        for mac in stale:
-            self._auto_reassign_recent.pop(mac, None)
+        stale = [key for key, ts in self._auto_reassign_recent.items() if (now_ts - float(ts or 0.0)) >= expiry]
+        for key in stale:
+            self._auto_reassign_recent.pop(key, None)
 
     def schedule_reconnect(self, reason: str) -> None:
         now = time.time()
@@ -1563,12 +1930,27 @@ class GatewayService:
         def _reconnect():
             try:
                 logger.warning("RaceLink: attempting gateway transport reconnect after error: %s", reason)
+                # Stage 2 Part 5: close every attached transport, not
+                # just the primary slot. At N>1 the secondary transports
+                # would otherwise hold their exclusive OS file-descriptor
+                # locks across the reconnect and the upcoming
+                # ``enumerate_all`` probe would see every port as
+                # ``PORT_BUSY``. ``_close_all_transports`` is idempotent
+                # and is the same helper ``discoverPort`` uses on entry,
+                # so the cleanup is guaranteed even when ``discoverPort``
+                # bails before its own close step.
                 try:
-                    if self.transport:
-                        self.transport.close()
+                    closer = getattr(self.controller, "_close_all_transports", None)
+                    if callable(closer):
+                        closer()
+                    else:
+                        # Older fakes / tests may not have the helper —
+                        # fall back to the legacy single-slot close.
+                        if self.transport:
+                            self.transport.close()
+                        self.controller.transport = None
                 except Exception:
-                    logger.debug("RaceLink: error closing transport during reconnect", exc_info=True)
-                self.controller.transport = None
+                    logger.debug("RaceLink: error closing transports during reconnect", exc_info=True)
                 # Transport-level disconnect is automatic by definition -- mark
                 # the reconnect attempt accordingly so it does not escalate to
                 # ERROR on the RotorHazard log bridge.
@@ -1584,7 +1966,9 @@ class GatewayService:
         # A5: snapshot via the controller helper, then use compare-and-
         # clear semantics so a freshly-stamped expectation from the TX
         # thread cannot be silently wiped by our clear below.
-        p = self.controller.read_pending_expect()
+        # Stage 2 Part 3: scope the lookup to the event's source gateway
+        # so transport-B's window-closed cannot wipe transport-A's slot.
+        p = self.controller.read_pending_expect(gateway_id=ev.get("gateway_id"))
         if not p:
             return
 
@@ -1625,7 +2009,9 @@ class GatewayService:
         # tracking* timed out — if the TX thread has since stamped a
         # new one, that new request is for a different operation and
         # must not be wiped.
-        p = self.controller.read_pending_expect()
+        # Stage 2 Part 3: only the source-gateway's slot can be cleared
+        # by its own window-closed event.
+        p = self.controller.read_pending_expect(gateway_id=ev.get("gateway_id"))
         if not p:
             return
 

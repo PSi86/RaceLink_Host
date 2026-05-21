@@ -40,7 +40,14 @@ class SyncService:
         return getattr(self.controller, "transport", None)
 
     def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
-        if not self.transport:
+        # Stage 3 Part G: ``GatewayService.send_sync`` now fans out
+        # across every attached transport for a broadcast recv3 and
+        # routes unicast syncs via ``transport_for_device``. The
+        # readiness check below covers the "no transport at all"
+        # case; multi-network deployments where one transport is
+        # mid-reconnect still get a tick on the remaining radios.
+        transports = list(getattr(self.controller, "transports", None) or [])
+        if not transports and self.transport is None:
             logger.warning("sendSync: communicator not ready")
             return
         self.gateway_service.send_sync(ts24, brightness, recv3=recv3, trigger_armed=trigger_armed)

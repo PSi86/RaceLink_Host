@@ -21,6 +21,12 @@ _RX_WINDOW_CLOSED_TRANSITION = {
 
 class FakeTransport:
     def __init__(self):
+        # Stage 3 Part C: every transport carries an ident_mac (set by
+        # ``discover_and_open`` / ``enumerate_all``) so the matcher's
+        # ``gateway_id`` filter has a stable anchor. Pin a synthetic
+        # value here so this fake satisfies the Stage-3 contract
+        # without any test having to remember the field exists.
+        self.ident_mac = "TEST-GW"
         self.listeners = []
         self.tx_listeners = []
         self.sent_config = []
@@ -47,6 +53,11 @@ class FakeTransport:
         self.sent_set_group.append({"recv3": recv3, "group_id": group_id})
 
     def emit(self, ev):
+        # Stage 3 Part C: mirror the real transport's ``_emit`` tag —
+        # every event leaving a transport carries its ident_mac so
+        # downstream matcher / pending_expect lookups route correctly.
+        if isinstance(ev, dict) and self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         for cb in list(self.listeners):
             cb(ev)
 
@@ -58,14 +69,18 @@ class FakeController:
     def __init__(self):
         self.dev = RL_Device("AABBCCDDEEFF", 1, "Node")
         self.transport = FakeTransport()
-        self._pending_expect = None
+        # Stage 2 Part 3: pending-expect dict is keyed by gateway_id.
+        # Tests stamp under the legacy ``None`` slot for backwards-
+        # compat with the existing single-gateway assertions.
+        self._pending_expect = {}
         self._pending_config = {}
-        self._transport_hooks_installed = False
+        self._transport_hooks_installed_for: set[int] = set()
         self.applied = []
         self.group_assignments = []
         self._device_repository = DeviceRepository([self.dev])
         self._group_repository = GroupRepository([object(), object(), object(), object()])
         self.discovery_active = False
+        self._transports = [self.transport]
 
     # Mirror the real controller's pending-config helpers (A3). Tests
     # remain single-threaded so a real lock is not required, but the
@@ -80,27 +95,41 @@ class FakeController:
     def take_pending_config(self, recv3_hex: str):
         return self._pending_config.pop(recv3_hex, None)
 
-    # A5: same pattern for the unicast pending-expect slot.
-    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts):
-        self._pending_expect = {
+    # A5 + Stage 2 Part 3: same pattern for the unicast pending-expect
+    # slot, now keyed by gateway_id so tests cover the multi-transport
+    # behaviour. ``None`` keeps the legacy single-gateway code path.
+    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts, *, gateway_id=None):
+        self._pending_expect[gateway_id] = {
             "dev": dev,
             "rule": rule,
             "opcode7": int(opcode7),
             "sender_last3": str(sender_last3 or "").upper(),
             "ts": float(ts),
+            "gateway_id": gateway_id,
         }
 
-    def read_pending_expect(self):
-        return self._pending_expect
+    def read_pending_expect(self, gateway_id=None):
+        entry = self._pending_expect.get(gateway_id)
+        if entry is not None:
+            return entry
+        if gateway_id is None and len(self._pending_expect) == 1:
+            return next(iter(self._pending_expect.values()))
+        return None
 
     def clear_pending_expect_if(self, expected) -> bool:
-        if self._pending_expect is expected:
-            self._pending_expect = None
+        if expected is None:
+            return False
+        gw_id = expected.get("gateway_id") if isinstance(expected, dict) else None
+        if self._pending_expect.get(gw_id) is expected:
+            self._pending_expect.pop(gw_id, None)
             return True
         return False
 
-    def clear_pending_expect(self) -> None:
-        self._pending_expect = None
+    def clear_pending_expect(self, gateway_id=None) -> None:
+        if gateway_id is None:
+            self._pending_expect.clear()
+        else:
+            self._pending_expect.pop(gateway_id, None)
 
     def _to_hex_str(self, value):
         if isinstance(value, (bytes, bytearray)):
@@ -218,18 +247,25 @@ class GatewayServiceTests(unittest.TestCase):
     def test_pending_window_closed_marks_device_offline(self):
         controller = FakeController()
         service = GatewayService(controller)
-        controller._pending_expect = {
+        # Stage 2 Part 3: legacy slot is keyed by ``None``. The
+        # pending_window_closed event we drive below has no
+        # ``gateway_id`` tag (mirroring the pre-Part-3 single-gateway
+        # path) so the lookup falls through to the legacy slot.
+        controller._pending_expect[None] = {
             "dev": controller.dev,
             "rule": type("Rule", (), {"name": "STATUS"})(),
             "opcode7": LP.OPC_STATUS,
             "sender_last3": "DDEEFF",
+            "gateway_id": None,
         }
 
         service.pending_window_closed(dict(_RX_WINDOW_CLOSED_TRANSITION))
 
         self.assertFalse(controller.dev.link_online)
         self.assertEqual(controller.dev.link_error, "Missing reply (STATUS)")
-        self.assertIsNone(controller._pending_expect)
+        # Stage 2 Part 3: the CAS-clear drops the matching slot from
+        # the per-gateway dict — the dict itself stays (now empty).
+        self.assertEqual(controller._pending_expect, {})
 
     def test_send_stream_passes_raw_payload_to_transport(self):
         controller = FakeController()
@@ -251,11 +287,15 @@ class GatewayServiceTests(unittest.TestCase):
         # synchronously so the matcher hits ``expected_count`` on the spot.
         original_match = service.send_and_match
 
-        def wrapped_match(send_fn, matcher):
+        # Stage 3 Part C: ``send_and_match`` now accepts an explicit
+        # ``transport`` kwarg so multi-network call sites can route
+        # through a specific transport. Mirror the new signature
+        # (**kwargs is forward-compatible with future additions).
+        def wrapped_match(send_fn, matcher, **kwargs):
             def wrapped_send():
                 send_fn()
                 emit_ack_and_close()
-            return original_match(wrapped_send, matcher)
+            return original_match(wrapped_send, matcher, **kwargs)
 
         service.send_and_match = wrapped_match
 

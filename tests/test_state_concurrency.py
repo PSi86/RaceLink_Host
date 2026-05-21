@@ -40,9 +40,11 @@ class LockAwareController:
         )
         self.state_repository = repo
         self.transport = FakeTransport()
-        self._pending_expect = None
+        self._transports = [self.transport]
+        # Stage 2 Part 3: pending-expect dict keyed by gateway_id.
+        self._pending_expect = {}
         self._pending_config = {}
-        self._transport_hooks_installed = False
+        self._transport_hooks_installed_for: set[int] = set()
 
     def _to_hex_str(self, value):
         if isinstance(value, (bytes, bytearray)):
@@ -105,30 +107,45 @@ class LockAwareController:
             self.__dict__["_pexp_lock"] = lock
         return lock
 
-    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts):
+    # Stage 2 Part 3: per-gateway pending-expect dict (matches the
+    # real controller's signature; legacy single-gateway callers
+    # leave ``gateway_id`` defaulted to ``None``).
+    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts, *, gateway_id=None):
         with self._pending_expect_lock:
-            self._pending_expect = {
+            self._pending_expect[gateway_id] = {
                 "dev": dev,
                 "rule": rule,
                 "opcode7": int(opcode7),
                 "sender_last3": str(sender_last3 or "").upper(),
                 "ts": float(ts),
+                "gateway_id": gateway_id,
             }
 
-    def read_pending_expect(self):
+    def read_pending_expect(self, gateway_id=None):
         with self._pending_expect_lock:
-            return self._pending_expect
+            entry = self._pending_expect.get(gateway_id)
+            if entry is not None:
+                return entry
+            if gateway_id is None and len(self._pending_expect) == 1:
+                return next(iter(self._pending_expect.values()))
+            return None
 
     def clear_pending_expect_if(self, expected) -> bool:
+        if expected is None:
+            return False
+        gw_id = expected.get("gateway_id") if isinstance(expected, dict) else None
         with self._pending_expect_lock:
-            if self._pending_expect is expected:
-                self._pending_expect = None
+            if self._pending_expect.get(gw_id) is expected:
+                self._pending_expect.pop(gw_id, None)
                 return True
             return False
 
-    def clear_pending_expect(self) -> None:
+    def clear_pending_expect(self, gateway_id=None) -> None:
         with self._pending_expect_lock:
-            self._pending_expect = None
+            if gateway_id is None:
+                self._pending_expect.clear()
+            else:
+                self._pending_expect.pop(gateway_id, None)
 
 
 class StateLockTests(unittest.TestCase):
@@ -226,9 +243,15 @@ class StateLockTests(unittest.TestCase):
         for t in threads:
             t.join()
 
-        # Cache should be bounded by the pruner and all entries are strings->floats.
-        for mac, ts in service._auto_reassign_recent.items():
-            self.assertIsInstance(mac, str)
+        # Cache should be bounded by the pruner and all entries are
+        # ``(gateway_id, mac)`` tuples -> floats (Stage 2 Part 3 key
+        # change; ``gateway_id`` is ``None`` for the legacy single-
+        # gateway path the hammer above exercises).
+        for key, ts in service._auto_reassign_recent.items():
+            self.assertIsInstance(key, tuple)
+            self.assertEqual(len(key), 2)
+            self.assertIsNone(key[0])
+            self.assertIsInstance(key[1], str)
             self.assertIsInstance(ts, float)
 
     def test_pending_expect_compare_and_clear_preserves_fresh_stamp(self):

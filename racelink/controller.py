@@ -127,10 +127,20 @@ class RaceLink_Host:
         # snapshot and its clear (lost-update). The clear helpers below
         # implement compare-and-clear semantics so a stale matcher
         # cannot wipe a freshly-stamped expectation either.
-        self._pending_expect: Optional[dict] = None
+        #
+        # Stage 2 Part 3: keyed by gateway_id (transport.ident_mac) so a
+        # TX on transport-A does not overwrite a still-pending
+        # expectation on transport-B. The legacy single-gateway path
+        # stamps under key ``None`` and is unchanged at N=1.
+        self._pending_expect: dict[Optional[str], dict] = {}
         self._pending_expect_lock = threading.Lock()
 
-        self._transport_hooks_installed = False
+        # Stage 2 Part 3: track per-transport hook installation. The
+        # earlier single ``bool`` would block re-installing on a second
+        # attached transport. ``id(transport)`` is the identity key
+        # because a freshly-built transport may not yet have an
+        # ``ident_mac`` (set during discover_and_open).
+        self._transport_hooks_installed_for: set[int] = set()
         # ``_pending_config`` is mutated from two threads:
         # the web request thread (``GatewayService.send_config`` stashes the
         # outgoing option/data0 keyed by recv3) and the RX reader thread
@@ -209,6 +219,30 @@ class RaceLink_Host:
         self.startblock_service = StartblockService(self, self.stream_service)
         self.sync_service = SyncService(self, self.gateway_service)
         self.onboarding_service = OnboardingService(self)
+        # Stage 3 Part D: gateway bind-state machine. Wired up here so
+        # ``_attach_transport`` can call ``evaluate`` during the boot/
+        # reconnect flow; the SSE broadcaster is attached later by the
+        # blueprint via ``gateway_bind_service.attach_broadcast``.
+        from racelink.services.gateway_bind_service import GatewayBindService
+        self.gateway_bind_service = GatewayBindService(
+            controller=self,
+            gateway_service=self.gateway_service,
+            persist=lambda: self.save_to_db({}, scopes={state_scope.FULL}),
+        )
+        # Stage 3 Part E: multi-network RF migration engine. Bound back
+        # to the bind service so the post-migration ``re_evaluate``
+        # closes the conflict/pending loop on the SSE channel.
+        from racelink.services.rf_migration_service import RfMigrationService
+        self.rf_migration_service = RfMigrationService(
+            controller=self,
+            bind_service=self.gateway_bind_service,
+        )
+        # Stage 3 Part F: channel-scan service. Recovers devices that
+        # got stranded on a previous migration by sweeping the
+        # region's channel table on a chosen gateway and reporting
+        # who's listening on each.
+        from racelink.services.channel_scan_service import ChannelScanService
+        self.channel_scan_service = ChannelScanService(controller=self)
 
     def _option(self, key: str, default=None):
         return self._host_api.db.option(key, default)
@@ -324,6 +358,33 @@ class RaceLink_Host:
         dev = self.getDeviceFromAddress(addr) if addr else None
         net_id = getattr(dev, "network_id", None) if dev is not None else None
         return self.transport_for_network(net_id)
+
+    def transport_for_group(self, group_id):
+        """Resolve the transport that owns the network this group lives
+        on (Stage 3 Part G).
+
+        Group sends (``OPC_PRESET`` / ``OPC_OFFSET`` / ``OPC_CONTROL``
+        broadcast with ``recv3=FF:FF:FF``) need to land on the gateway
+        whose radio actually carries the group's network. The
+        boundary enforcement in Part B guarantees every group belongs
+        to at most one network, so the resolution is unambiguous.
+
+        Falls back to the single-transport slot when the group has
+        no ``network_id`` (legacy / unmigrated payload) or no
+        transport carries that network yet — matches the Stage-2
+        N=1 behaviour.
+        """
+        try:
+            gid_int = int(group_id) & 0xFF
+        except (TypeError, ValueError):
+            return self._transports[0] if len(self._transports) == 1 else None
+        groups = list(self.group_repository.list())
+        if 0 <= gid_int < len(groups):
+            net_id = getattr(groups[gid_int], "network_id", None)
+            routed = self.transport_for_network(net_id) if net_id else None
+            if routed is not None:
+                return routed
+        return self._transports[0] if len(self._transports) == 1 else None
 
     @property
     def backup_device_repository(self):
@@ -620,8 +681,161 @@ class RaceLink_Host:
             # plain load so plugins can refresh panels (plan P2-2).
             self._fire_persistence_changed({state_scope.FULL})
 
+    def _close_all_transports(self) -> None:
+        """Release every attached transport and reset the slot list.
+
+        Stage 2 Part 5: with multi-transport boot, every entry in
+        ``self._transports`` holds an exclusive OS file-descriptor lock
+        on its USB port. A fresh ``discoverPort`` walks
+        :meth:`GatewaySerialTransport.enumerate_all` which probes every
+        port — that probe would race the existing transports for the
+        same locks, making each look ``PORT_BUSY``. Closing them all
+        first preserves the pre-Part-5 cleanup invariant.
+        """
+        transports = list(self._transports)
+        self._transports = []
+        for t in transports:
+            try:
+                close = getattr(t, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.debug(
+                    "RaceLink: error closing transport %r during reset",
+                    getattr(t, "port", None), exc_info=True,
+                )
+
+    def _bind_transport_to_network(self, transport) -> Optional[str]:
+        """Auto-bind ``transport`` to a persisted ``RL_Network`` (Stage 2 Part 5).
+
+        Resolution order:
+
+        1. If the transport carries an ``ident_mac`` and a network with
+           the matching ``gateway_mac`` exists, bind to that network.
+        2. If no exact match but the deployment is single-transport,
+           bind to the first network without a ``gateway_mac`` and
+           persist the MAC. Covers the v1→v2 default network's first
+           contact: the migration leaves ``gateway_mac=None`` and this
+           step fills it in.
+        3. Otherwise leave the transport unbound and emit a WARNING.
+           Stage 3 turns that into a ``gateway_unbound`` SSE event +
+           operator wizard.
+
+        Returns the bound ``network_id`` (or ``None`` if no binding was
+        made). The binding is also stored on the transport as
+        ``transport.network_id`` for the Stage-3 routing helpers.
+        """
+        ident = getattr(transport, "ident_mac", None) or None
+        repo = self.network_repository
+        bound_id: Optional[str] = None
+
+        if ident:
+            existing = repo.get_by_gateway_mac(ident)
+            if existing is not None:
+                bound_id = str(getattr(existing, "id", "") or "") or None
+
+        if bound_id is None and ident:
+            networks = list(repo.list())
+            unbound = [n for n in networks if not getattr(n, "gateway_mac", None)]
+            single_transport = len(self._transports) <= 1
+            # Stage-2 policy: only auto-bind when we are confident the
+            # operator has just one gateway. With multiple unknown
+            # gateways we leave the rest unbound (Stage-3 wizard).
+            if single_transport and unbound:
+                target = unbound[0]
+                target.gateway_mac = ident
+                bound_id = str(getattr(target, "id", "") or "") or None
+                try:
+                    self.save_to_db({}, scopes={state_scope.FULL})
+                except Exception:
+                    logger.exception(
+                        "RaceLink: failed to persist auto-bound gateway_mac=%s on network %s",
+                        ident, bound_id,
+                    )
+
+        if bound_id is None and ident:
+            # Stage-3 will turn this into a ``gateway_unbound`` SSE
+            # event so the operator's wizard picks it up. Stage-2 just
+            # logs — the transport stays attached but multi-network
+            # routing helpers will return ``None`` for it.
+            logger.warning(
+                "RaceLink: gateway ident_mac=%s did not match any "
+                "RL_Network (and auto-bind policy did not apply); "
+                "transport stays unbound", ident,
+            )
+
+        try:
+            setattr(transport, "network_id", bound_id)
+        except Exception:
+            # swallow-ok: read-only fake transports in tests are fine —
+            # the canonical lookup is still via network.gateway_mac.
+            logger.debug(
+                "RaceLink: could not stamp network_id on transport %r",
+                getattr(transport, "port", None), exc_info=True,
+            )
+        return bound_id
+
+    def _fire_transport_rebind(self) -> None:
+        """Notify subscribers (e.g. SSEBridge) that the transport set
+        was just (re)bound. Pre-Part-5 this was inlined in
+        ``discoverPort``; Part 5's multi-transport branches both need
+        it so it moved out into a tiny helper.
+        """
+        on_rebind = getattr(self, "on_transport_rebind", None)
+        if not callable(on_rebind):
+            return
+        try:
+            on_rebind(self)
+        except Exception:
+            logger.debug("on_transport_rebind callback raised", exc_info=True)
+
+    def _attach_transport(self, transport) -> Optional[str]:
+        """Start ``transport``, append it to the slot list, install
+        hooks, and run the network auto-bind. Returns the bound
+        ``network_id`` or ``None``.
+        """
+        try:
+            transport.start()
+        except Exception:
+            logger.exception(
+                "RaceLink: transport.start() failed on %s",
+                getattr(transport, "port", None),
+            )
+            try:
+                close = getattr(transport, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.debug(
+                    "RaceLink: cleanup-close after failed start raised",
+                    exc_info=True,
+                )
+            return None
+        self._transports.append(transport)
+        bound_id = self._bind_transport_to_network(transport)
+        # Install hooks per-transport (Part 3 made this per-id idempotent).
+        self._install_transport_hooks()
+        # Stage 3 Part D: run the bind state machine. The service
+        # probes the gateway's NVS RF config and broadcasts the
+        # ``gateway_bound`` / ``gateway_conflict`` / ``gateway_unbound``
+        # SSE event so the WebUI can render the operator wizard. We
+        # run inline here — the round-trip is ~500 ms USB-CDC and the
+        # caller is already willing to wait for ``transport.start()``.
+        # ``getattr`` keeps older tests that build the controller
+        # without the bind service working unchanged.
+        bind_service = getattr(self, "gateway_bind_service", None)
+        if bind_service is not None:
+            try:
+                bind_service.evaluate(transport)
+            except Exception:
+                logger.exception(
+                    "RaceLink: gateway_bind_service.evaluate raised for %s",
+                    getattr(transport, "ident_mac", "?"),
+                )
+        return bound_id
+
     def discoverPort(self, args, *, origin: Optional[str] = None) -> None:
-        """Initialize the active gateway transport.
+        """Initialize the active gateway transports.
 
         ``origin`` describes who initiated the attempt and controls logging /
         UI notifications:
@@ -631,84 +845,163 @@ class RaceLink_Host:
           first startup probe -- silent, WARNING-level on failure.
         - ``programmatic``: any other caller (legacy).
 
+        Stage 2 Part 5: when no ``psi_comms_port`` hint is set, the
+        controller enumerates every USB-attached RaceLink gateway
+        (:meth:`GatewaySerialTransport.enumerate_all`) and attaches one
+        transport per hit. At N=1 attached gateway the end state is
+        identical to the pre-Part-5 single-transport path. A pinned
+        port (``psi_comms_port``) keeps the legacy single-port semantics
+        — the operator opted in to a specific device.
+
         Persistent failure state (``ready``, ``last_gateway_error``) is tracked
         in all cases so the UI can render its banner without relying on
         toasts.
         """
         if origin is None:
             origin = "manual" if "manual" in args else "programmatic"
-        port = self._option("psi_comms_port", None)
+        port_hint = self._option("psi_comms_port", None)
 
-        # Always release the previous transport before building a new one.
-        # Skipping this step means two ``GatewaySerialTransport`` instances
-        # fight over the same OS file descriptor: the old one keeps the
-        # exclusive lock while the new one's ``discover_and_open`` walks
-        # the port list, making every port look busy. That in turn was the
-        # source of the manual-retry-after-auto-recovery regression
-        # (user saw ``NOT_FOUND`` although the gateway was already wired up).
-        old_transport = self.transport
-        self.transport = None
-        if old_transport is not None:
-            try:
-                close = getattr(old_transport, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                logger.debug("RaceLink: error closing previous transport", exc_info=True)
+        # Release every previously-attached transport. Skipping this
+        # step means the next ``enumerate_all`` probe (or the legacy
+        # ``discover_and_open`` walk) fights the existing exclusive
+        # locks and every port looks ``PORT_BUSY`` — see the
+        # manual-retry-after-auto-recovery regression in Part 5 commit
+        # history.
+        self._close_all_transports()
 
         try:
-            self._transport_hooks_installed = False
-            self.transport = GatewaySerialTransport(port=port, on_event=None)
-            ok = self.transport.discover_and_open()
-            if ok:
-                self.transport.start()
+            # Drop any stale per-transport hook flags so the upcoming
+            # ``_install_transport_hooks`` actually re-installs against
+            # the fresh transport instances.
+            self._transport_hooks_installed_for.clear()
+
+            if port_hint:
+                # Manual pin — preserve the legacy single-port path.
+                # ``discover_and_open`` with an explicit port skips the
+                # walk and just opens the OS device; ident_mac stays
+                # ``None`` unless the next IDENTIFY round-trip fills
+                # it in.
+                t = GatewaySerialTransport(port=port_hint, on_event=None)
+                opened = False
+                try:
+                    opened = t.discover_and_open()
+                except Exception:
+                    raise
+                if not opened:
+                    if getattr(t, "last_discovery_had_busy_port", False):
+                        reason = (
+                            "RaceLink Gateway port busy: another process still holds "
+                            "an exclusive lock. Retrying automatically."
+                        )
+                        self._record_gateway_error(
+                            reason=reason, origin=origin, code=GW_ERR_PORT_BUSY,
+                        )
+                        if origin == "manual":
+                            self._notify(self._translate(reason))
+                        return
+                    reason = "No RaceLink Gateway module discovered or configured"
+                    self._record_gateway_error(
+                        reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
+                    )
+                    if origin == "manual":
+                        self._notify(self._translate(reason))
+                    return
+                bound_id = self._attach_transport(t)
                 self.ready = True
                 self._link_recovery_pending = False
                 self._clear_gateway_error()
-                self._install_transport_hooks()
-                # Notify subscribers (e.g. SSEBridge) that the
-                # transport instance was just (re)bound. The SSE
-                # bridge's transport-event hook is gated by a
-                # one-time-install flag; without this callback,
-                # post-reconnect events from the fresh transport
-                # never reach the ``refresh`` SSE broadcast and the
-                # WebUI stops animating unsolicited IDENTIFY_REPLYs.
-                on_rebind = getattr(self, "on_transport_rebind", None)
-                if callable(on_rebind):
-                    try:
-                        on_rebind(self)
-                    except Exception:
-                        logger.debug(
-                            "on_transport_rebind callback raised",
-                            exc_info=True,
-                        )
-                used = self.transport.port or "unknown"
-                mac = getattr(self.transport, "ident_mac", None)
+                self._fire_transport_rebind()
+                used = t.port or "unknown"
+                mac = getattr(t, "ident_mac", None)
                 if mac:
-                    logger.info("RaceLink Gateway ready on %s with MAC: %s", used, mac)
+                    logger.info(
+                        "RaceLink Gateway ready on %s with MAC: %s (network=%s)",
+                        used, mac, bound_id or "unbound",
+                    )
                     if origin == "manual":
-                        self._notify(self._translate("RaceLink Gateway ready on {} with MAC: {}").format(used, mac))
+                        self._notify(self._translate(
+                            "RaceLink Gateway ready on {} with MAC: {}"
+                        ).format(used, mac))
                 return
-            # ``discover_and_open`` returned False. Distinguish between "no
-            # matching device present" (NOT_FOUND) and "device is there but
-            # locked by another process" (PORT_BUSY).
-            if getattr(self.transport, "last_discovery_had_busy_port", False):
-                reason = (
-                    "RaceLink Gateway port busy: another process still holds "
-                    "an exclusive lock. Retrying automatically."
-                )
+
+            # No pinned port — enumerate every USB-attached gateway.
+            try:
+                gateways = GatewaySerialTransport.enumerate_all()
+            except Exception:
+                logger.exception("RaceLink: enumerate_all raised")
+                gateways = []
+
+            if not gateways:
+                reason = "No RaceLink Gateway module discovered or configured"
                 self._record_gateway_error(
-                    reason=reason, origin=origin, code=GW_ERR_PORT_BUSY,
+                    reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
                 )
                 if origin == "manual":
                     self._notify(self._translate(reason))
                 return
-            reason = "No RaceLink Gateway module discovered or configured"
-            self._record_gateway_error(
-                reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
-            )
-            if origin == "manual":
-                self._notify(self._translate(reason))
+
+            opened_count = 0
+            primary_ident: Optional[str] = None
+            primary_port: Optional[str] = None
+            for port, ident_mac in gateways:
+                try:
+                    t = GatewaySerialTransport(port=port, on_event=None)
+                    # ``enumerate_all`` already probed the gateway and
+                    # extracted ident_mac. Stamp it before
+                    # ``open()`` so the auto-bind step (and the SSE
+                    # bridge's per-network routing) has it immediately.
+                    if ident_mac:
+                        try:
+                            t.ident_mac = ident_mac
+                        except Exception:
+                            logger.debug(
+                                "RaceLink: could not stamp ident_mac=%s on transport %s",
+                                ident_mac, port, exc_info=True,
+                            )
+                    t.open()
+                except Exception:
+                    logger.warning(
+                        "RaceLink: failed to open enumerated gateway %s "
+                        "(ident_mac=%s); skipping",
+                        port, ident_mac, exc_info=True,
+                    )
+                    continue
+                bound_id = self._attach_transport(t)
+                if bound_id is None and ident_mac is None:
+                    # Could not even start the RX thread — _attach_transport
+                    # closed the port. Move on.
+                    continue
+                if opened_count == 0:
+                    primary_ident = ident_mac
+                    primary_port = port
+                opened_count += 1
+                if origin == "manual":
+                    self._notify(self._translate(
+                        "RaceLink Gateway ready on {} with MAC: {}"
+                    ).format(port, ident_mac or "?"))
+                logger.info(
+                    "RaceLink Gateway ready on %s with MAC: %s (network=%s)",
+                    port, ident_mac or "?", bound_id or "unbound",
+                )
+
+            if opened_count == 0:
+                reason = "No RaceLink Gateway module discovered or configured"
+                self._record_gateway_error(
+                    reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
+                )
+                if origin == "manual":
+                    self._notify(self._translate(reason))
+                return
+
+            self.ready = True
+            self._link_recovery_pending = False
+            self._clear_gateway_error()
+            self._fire_transport_rebind()
+            if opened_count > 1:
+                logger.info(
+                    "RaceLink: %d gateways attached (primary=%s ident=%s)",
+                    opened_count, primary_port or "?", primary_ident or "?",
+                )
         except Exception as ex:
             # swallow-ok: discoverPort surfaces failures via the
             # gateway-error record (red banner). Include the type so a
@@ -882,15 +1175,11 @@ class RaceLink_Host:
             return
         self._shutdown_called = True
         self._cancel_gateway_retry()
-        transport = self.transport
-        self.transport = None
-        if transport is not None:
-            try:
-                close = getattr(transport, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                logger.exception("RaceLink: error closing transport during shutdown")
+        # Stage 2 Part 5: close every attached transport, not just the
+        # primary slot — at N>1 the secondary transports would
+        # otherwise leak their exclusive OS file-descriptor locks past
+        # shutdown.
+        self._close_all_transports()
         task_manager = getattr(self, "_task_manager", None)
         if task_manager is not None:
             try:
@@ -979,7 +1268,13 @@ class RaceLink_Host:
         return int(result.get("updated", 0) or 0)
 
     def setNodeGroupId(self, targetDevice: RL_Device, forceSet: bool = False, wait_for_ack: bool = True) -> bool:
-        transport = getattr(self, "transport", None)
+        # Stage 2 Part 3: route the SET_GROUP through the transport that
+        # owns this device's network. At N=1 ``transport_for_device``
+        # falls back to the only attached transport — behaviour is
+        # identical to the pre-multi-network path. With multiple
+        # transports the SET_GROUP for an A-network device goes via
+        # the A-network gateway, never via B.
+        transport = self.transport_for_device(targetDevice.addr) or getattr(self, "transport", None)
         if transport is None:
             logger.warning("setNodeGroupId: communicator not ready")
             return False
@@ -1001,7 +1296,7 @@ class RaceLink_Host:
             return True
 
         events, _ = self.gateway_service.send_and_wait_with_retries(
-            recv3, LP.OPC_SET_GROUP, _send,
+            recv3, LP.OPC_SET_GROUP, _send, transport=transport,
         )
         if not events:
             logger.warning("No ACK_OK for SET_GROUP to %s (timeout)", targetDevice.addr)
@@ -1356,31 +1651,60 @@ class RaceLink_Host:
         with self._pending_config_lock:
             return self._pending_config.pop(recv3_hex, None)
 
-    def set_pending_expect(self, dev, rule, opcode7: int, sender_last3: str, ts: float) -> None:
+    def set_pending_expect(
+        self,
+        dev,
+        rule,
+        opcode7: int,
+        sender_last3: str,
+        ts: float,
+        *,
+        gateway_id: Optional[str] = None,
+    ) -> None:
         """Stamp a pending unicast expectation. Called from the TX
-        listener path right after a unicast request is on the wire."""
+        listener path right after a unicast request is on the wire.
+
+        ``gateway_id`` is the originating transport's ``ident_mac``;
+        ``None`` means the legacy single-gateway path. Stamping under a
+        per-gateway key prevents a TX on transport-A from wiping an
+        in-flight expectation on transport-B.
+        """
         with self._pending_expect_lock:
-            self._pending_expect = {
+            self._pending_expect[gateway_id] = {
                 "dev": dev,
                 "rule": rule,
                 "opcode7": int(opcode7),
                 "sender_last3": str(sender_last3 or "").upper(),
                 "ts": float(ts),
+                "gateway_id": gateway_id,
             }
 
-    def read_pending_expect(self) -> Optional[dict]:
-        """Return the current pending-expect dict (the live reference,
-        not a copy). Callers must treat it as read-only and use
-        :meth:`clear_pending_expect_if` for compare-and-clear semantics
-        — clearing without the reference check would let a stale RX
-        matcher wipe a freshly-stamped expectation from the TX thread.
+    def read_pending_expect(self, gateway_id: Optional[str] = None) -> Optional[dict]:
+        """Return the pending-expect dict for ``gateway_id`` (the live
+        reference, not a copy). Callers must treat it as read-only and
+        use :meth:`clear_pending_expect_if` for compare-and-clear
+        semantics — clearing without the reference check would let a
+        stale RX matcher wipe a freshly-stamped expectation from the
+        TX thread.
+
+        ``gateway_id=None`` returns the legacy single-gateway slot; a
+        concrete value returns the per-transport slot. When no entry
+        exists under the requested key but exactly one entry exists
+        overall (single-transport runtime), the lone entry is returned
+        — preserves the Stage-2 behaviour where untagged TX hooks /
+        RX events still see the same expectation.
         """
         with self._pending_expect_lock:
-            return self._pending_expect
+            entry = self._pending_expect.get(gateway_id)
+            if entry is not None:
+                return entry
+            if gateway_id is None and len(self._pending_expect) == 1:
+                return next(iter(self._pending_expect.values()))
+            return None
 
     def clear_pending_expect_if(self, expected: Optional[dict]) -> bool:
-        """Atomic compare-and-clear: clear ``_pending_expect`` only if
-        it is still the same object reference as ``expected``. Returns
+        """Atomic compare-and-clear: clear the matching slot only if it
+        still holds the same dict reference as ``expected``. Returns
         True on a successful clear, False if the value has changed
         (i.e. a new TX-side stamp arrived in the meantime).
 
@@ -1388,22 +1712,33 @@ class RaceLink_Host:
         RX-thread "I matched the reply, drop the expectation" path —
         prevents the lost-update where the RX thread reads ``p``, the
         TX thread immediately stamps a new expectation, and the RX
-        thread's clear wipes it.
+        thread's clear wipes it. The expectation's own ``gateway_id``
+        identifies which per-transport slot to drop.
         """
+        if expected is None:
+            return False
+        gw_id = expected.get("gateway_id") if isinstance(expected, dict) else None
         with self._pending_expect_lock:
-            if self._pending_expect is expected:
-                self._pending_expect = None
+            current = self._pending_expect.get(gw_id)
+            if current is expected:
+                self._pending_expect.pop(gw_id, None)
                 return True
             return False
 
-    def clear_pending_expect(self) -> None:
+    def clear_pending_expect(self, gateway_id: Optional[str] = None) -> None:
         """Unconditional clear. Used by paths that own the lifetime of
         the expectation (e.g. shutdown / reconnect) and are intentionally
         wiping any in-flight state. Most timeout/match callers should
         prefer :meth:`clear_pending_expect_if`.
+
+        ``gateway_id=None`` wipes every slot (legacy and any per-
+        transport entries); pass a concrete value to drop only one.
         """
         with self._pending_expect_lock:
-            self._pending_expect = None
+            if gateway_id is None:
+                self._pending_expect.clear()
+            else:
+                self._pending_expect.pop(gateway_id, None)
 
     def sendSync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
         """Compatibility entrypoint forwarding sync packets to SyncService.

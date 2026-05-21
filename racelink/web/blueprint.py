@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 from typing import Any, Callable
 
 from flask import Blueprint, templating
+
+logger = logging.getLogger(__name__)
 
 from ..services import HostWifiService, OTAService, PresetsService
 from .api import register_api_routes
@@ -235,6 +238,26 @@ def create_racelink_web_blueprint(
     )
 
     sse = SSEBridge(logger=runtime.logger)
+    # Stage 2 Part 4: bind the per-network ``MasterStateMap`` to the
+    # controller so the ``/api/master`` snapshot iterates the
+    # operator's persisted networks and ``EV_STATE_CHANGED`` events
+    # can route via ``gateway_id → network_id``.
+    try:
+        sse.attach_controller(runtime.rl_instance)
+    except Exception:
+        logger.exception("SSE attach_controller raised; multi-network routing degraded")
+    # Stage 3 Part D: feed the gateway-bind state machine's
+    # ``gateway_bound`` / ``gateway_conflict`` / ``gateway_unbound``
+    # events into the SSE broadcaster. The bind service buffers
+    # events emitted before this point and discards them silently —
+    # the WebUI re-fetches ``/api/gateways`` on connect so any
+    # pre-bridge state is recoverable.
+    bind_service = getattr(runtime.rl_instance, "gateway_bind_service", None)
+    if bind_service is not None:
+        try:
+            bind_service.attach_broadcast(sse.broadcast)
+        except Exception:
+            logger.exception("gateway_bind_service.attach_broadcast raised")
     tasks = TaskManager(broadcaster=sse.broadcast, master_state=sse.master, logger=runtime.logger)
     sse.attach_task_manager(tasks)
     attach_task_manager = getattr(runtime.rl_instance, "attach_task_manager", None)

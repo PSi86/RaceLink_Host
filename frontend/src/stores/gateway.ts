@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { apiGet, apiPost } from '@/api/client'
 import type {
   GatewayStatus,
+  MasterMapSnapshot,
   MasterResponse,
   MasterSnapshot,
   TaskSnapshot,
@@ -81,9 +82,36 @@ export const useGatewayStore = defineStore('gateway', () => {
     return Boolean(res?.ok)
   }
 
-  function applyMaster(snapshot: Partial<MasterSnapshot> | null | undefined) {
+  /** Stage 2 Part 4: the SSE ``master`` payload and ``/api/master``
+   *  both carry the multi-network shape. The single-master UI reads
+   *  ``networks[0]`` for backwards compatibility — Stage 4 builds a
+   *  proper multi-network UI. This helper accepts both the new
+   *  ``MasterMapSnapshot`` and the pre-Part-4 ``Partial<MasterSnapshot>``
+   *  for defensive parsing during the rollout. */
+  function applyMaster(
+    snapshot:
+      | Partial<MasterSnapshot>
+      | MasterMapSnapshot
+      | null
+      | undefined,
+  ) {
     if (!snapshot) return
-    master.value = { ...master.value, ...snapshot }
+    // Multi-network shape: pick the default network (or networks[0]).
+    if (
+      typeof snapshot === 'object'
+      && Array.isArray((snapshot as MasterMapSnapshot).networks)
+    ) {
+      const map = snapshot as MasterMapSnapshot
+      if (!map.networks.length) return
+      const defaultId = map.default_network_id
+      const primary
+        = (defaultId
+          ? map.networks.find((n) => n.network_id === defaultId)
+          : undefined) ?? map.networks[0]
+      master.value = { ...master.value, ...primary }
+      return
+    }
+    master.value = { ...master.value, ...(snapshot as Partial<MasterSnapshot>) }
   }
 
   function applyTask(snapshot: Partial<TaskSnapshot> | null | undefined) {
@@ -117,7 +145,7 @@ export const useGatewayStore = defineStore('gateway', () => {
     const res = (await apiGet('/api/master')) as Partial<MasterResponse> & {
       ok?: boolean
     }
-    if (res?.master) applyMaster(res.master as MasterSnapshot)
+    if (res?.master) applyMaster(res.master)
     if (res?.task) applyTask(res.task as TaskSnapshot)
     if (res?.gateway) applyGateway(res.gateway as GatewayStatus)
   }

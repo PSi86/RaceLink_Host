@@ -477,6 +477,15 @@ class GatewaySerialTransport:
             pass
 
     def _emit_tx(self, ev: dict):
+        # Stage 2 Part 3: tag every outgoing event with this transport's
+        # identity so the GatewayService / PendingMatcher can route across
+        # multiple attached gateways. ``ident_mac`` may be ``None`` until
+        # the IDENTIFY handshake completes — in that case downstream
+        # gateway_id=None filters (single-transport legacy path) still
+        # match. ``setdefault`` so a caller that has already tagged the
+        # event keeps its value.
+        if self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         for cb in list(self._tx_listeners):
             try:
                 cb(ev)
@@ -943,6 +952,15 @@ class GatewaySerialTransport:
                         )
 
     def _emit(self, ev: dict):
+        # Stage 2 Part 3: tag every emitted RX event with the transport's
+        # identity. PendingMatcher's ``gateway_id`` filter uses this to
+        # reject events from sibling transports. ``setdefault`` keeps any
+        # pre-tagged value (e.g. tests that craft synthetic events).
+        # ``ident_mac`` is ``None`` until the discover/identify handshake
+        # completes — events emitted before that point stay untagged
+        # and are still matched by the legacy wildcard path.
+        if self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         if len(self._q) < self._qmax:
             self._q.append(ev)
 

@@ -29,7 +29,7 @@ from racelink.transport.gateway_events import (
     GATEWAY_STATE_TX,
     TX_REJECT_TXPENDING,
 )
-from racelink.web.sse import MasterState, SSEBridge
+from racelink.web.sse import SSEBridge
 
 
 def _new_bridge() -> SSEBridge:
@@ -38,13 +38,21 @@ def _new_bridge() -> SSEBridge:
     The default bridge would try to fan out to the live SSE client set;
     the tests don't care about the broadcasted payload, only about the
     snapshot side-effect.
+
+    Stage 2 Part 4 note: ``bridge.master`` is the default-network slot
+    of the per-network :class:`MasterStateMap`. Replacing it with a
+    fresh :class:`MasterState` (as the pre-Part-4 helper did) would
+    desync it from the slot ``on_transport_event`` writes into.
     """
     bridge = SSEBridge()
     # Override the broadcast so test code can inspect it without
     # going through the gevent queue. Replace with a no-op to keep tests
     # fast — the snapshot read is the assertion target.
     bridge.broadcast = lambda *a, **kw: None  # type: ignore[assignment]
-    bridge.master = MasterState(bridge.broadcast)
+    # Re-wire the default slot's broadcaster to the no-op as well so
+    # the per-state ``set`` doesn't crash inside MasterStateMap's
+    # broadcaster trying to call the swallowed broadcast.
+    bridge.masters._broadcast = bridge.broadcast  # type: ignore[attr-defined]
     return bridge
 
 

@@ -84,10 +84,17 @@ class PendingMatcher:
     expected_ack_of: Optional[int] = None
     discriminator_field: Optional[str] = None
     discriminator_value: Optional[Any] = None
-    # Optional Stage-2 multi-network filter. ``None`` means "wildcard"
-    # — keeps Stage-2 fully backwards-compatible with the single-
-    # gateway code paths that don't yet know about gateway_id. Stage 3
-    # makes this required for every unicast expectation.
+    # Multi-network filter. ``None`` means "wildcard — accept events
+    # from any transport". Stage 3 promotes ``gateway_id`` to a hard
+    # requirement at registration time for *concrete-sender* matchers
+    # (i.e. ``sender_filter`` is not ``None``): every unicast or
+    # multi-sender N-reply wait must name the transport whose RX
+    # feed is authorised to satisfy it, so that cross-transport
+    # replies cannot accidentally clear an in-flight unicast. Pure
+    # wildcard matchers (discovery / fleet-wide broadcasts where
+    # ``sender_filter is None``) may still omit it — they collect
+    # from any transport by design. The enforcement happens in
+    # :meth:`PendingMatcherRegistry.register`.
     gateway_id: Optional[str] = None
 
     # --- collection semantics ---
@@ -231,7 +238,26 @@ class PendingMatcherRegistry:
         return (sender, int(key) & 0x7F)
 
     def register(self, m: PendingMatcher) -> PendingMatcher:
-        """Insert ``m`` into the appropriate bucket. Returns ``m`` for chaining."""
+        """Insert ``m`` into the appropriate bucket. Returns ``m`` for chaining.
+
+        Stage 3 contract: a matcher with a concrete ``sender_filter``
+        (unicast or multi-sender N-reply) MUST carry a concrete
+        ``gateway_id`` so a sibling transport's RX feed cannot
+        accidentally satisfy it. Wildcard matchers
+        (``sender_filter is None`` — discovery / fleet broadcasts)
+        may still omit ``gateway_id``. Violations are a programming
+        error, not an operator-visible failure mode, so we raise
+        :class:`ValueError` at the registration call rather than
+        silently miss-routing.
+        """
+        if m.sender_filter is not None and m.gateway_id is None:
+            raise ValueError(
+                "PendingMatcher with a concrete sender_filter must carry "
+                "gateway_id (Stage 3 requirement). Pass the transport's "
+                "ident_mac into the matcher constructor, or send through "
+                "GatewayService.send_and_wait_with_retries / send_and_match "
+                "which stamp it automatically from the routed transport."
+            )
         with self._lock:
             uk = self._unicast_key(m)
             if uk is not None:

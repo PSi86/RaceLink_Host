@@ -6,8 +6,11 @@ import json
 import logging
 import threading
 import time
+from typing import Optional
 
 from flask import Response, stream_with_context
+
+from ..state.migrations import DEFAULT_NETWORK_ID
 
 logger = logging.getLogger(__name__)
 
@@ -118,17 +121,231 @@ class MasterState:
         self.set(**updates)
 
 
+class MasterStateMap:
+    """Per-network :class:`MasterState` container (Stage 2 Part 4).
+
+    Single source of pill truth in the multi-USB-gateway deployment.
+    Each ``RL_Network`` holds its own ``MasterState`` snapshot; the
+    EV_STATE_CHANGED handler routes to the slot owned by the source
+    transport (via ``ev["gateway_id"]`` → ``RL_Network.gateway_mac``
+    → ``RL_Network.id``).
+
+    At N=1 attached gateway the map has exactly one entry — the
+    default network from the v1→v2 migration. Wire format is
+    ``{networks: [...], default_network_id: "..."}`` regardless of
+    N; the WebUI's legacy single-master path reads ``networks[0]``.
+
+    Threading: a single :class:`threading.RLock` (reentrant — a
+    per-state ``set()`` calls back here through the per-network
+    broadcaster, which then emits the composite snapshot under the
+    same lock).
+    """
+
+    def __init__(self, broadcaster, *, default_network_id: str = DEFAULT_NETWORK_ID):
+        self._broadcast = broadcaster
+        self._lock = threading.RLock()
+        self._states: dict[str, MasterState] = {}
+        self._default_network_id = str(default_network_id)
+        self._controller = None
+        # Eagerly create the default slot so legacy callers (TaskManager
+        # diagnostic ``set(last_event=...)`` from before the controller
+        # is attached) always have a target.
+        self._ensure_state_locked(self._default_network_id)
+
+    def attach_controller(self, controller) -> None:
+        """Bind to a controller for ``gateway_id → network_id`` lookups
+        and to surface every persisted network in :meth:`snapshot` even
+        if no event has touched its slot yet."""
+        with self._lock:
+            self._controller = controller
+            # If the operator has renamed / replaced the default network
+            # since v1→v2 ran, follow the first persisted entry. The
+            # Stage-2 contract guarantees at least one network is
+            # present after ``load_from_db``.
+            try:
+                if controller is not None:
+                    nets = list(controller.network_repository.list())
+                    if nets:
+                        first_id = str(getattr(nets[0], "id", "") or "")
+                        if first_id:
+                            prev_default = self._default_network_id
+                            self._default_network_id = first_id
+                            self._ensure_state_locked(first_id)
+                            # Drop the bootstrap default slot we
+                            # created in ``__init__`` if the controller
+                            # doesn't actually carry that network — the
+                            # orphan would otherwise show up as a
+                            # phantom "Default" row in the snapshot.
+                            if (
+                                prev_default
+                                and prev_default != first_id
+                                and prev_default in self._states
+                                and not any(
+                                    str(getattr(n, "id", "") or "") == prev_default
+                                    for n in nets
+                                )
+                            ):
+                                prev_state = self._states.get(prev_default)
+                                if prev_state is not None and prev_state.snapshot().get("state") == "UNKNOWN":
+                                    # Only drop if the slot is untouched —
+                                    # never silently destroy a slot that
+                                    # already accumulated diagnostic state.
+                                    self._states.pop(prev_default, None)
+            except Exception:
+                logger.debug(
+                    "MasterStateMap.attach_controller: default lookup raised",
+                    exc_info=True,
+                )
+
+    @property
+    def default_network_id(self) -> str:
+        return self._default_network_id
+
+    @property
+    def default(self) -> MasterState:
+        """The default-network ``MasterState`` — handle used by every
+        non-network-aware caller (TaskManager diagnostics,
+        ``api.py`` ``last_event`` updates)."""
+        with self._lock:
+            return self._ensure_state_locked(self._default_network_id)
+
+    def for_network(self, network_id: Optional[str]) -> MasterState:
+        if not network_id:
+            return self.default
+        with self._lock:
+            return self._ensure_state_locked(str(network_id))
+
+    def for_gateway(self, gateway_id: Optional[str]) -> MasterState:
+        """Resolve the slot for the transport identified by ``gateway_id``.
+
+        Falls back to :meth:`default` when no controller is attached,
+        the gateway is unbound (no ``RL_Network`` carries this MAC), or
+        the controller lookup raises. This is the routing front door
+        for EV_STATE_CHANGED.
+        """
+        if not gateway_id or self._controller is None:
+            return self.default
+        try:
+            net = self._controller.network_repository.get_by_gateway_mac(gateway_id)
+        except Exception:
+            logger.debug(
+                "MasterStateMap.for_gateway: repo lookup raised", exc_info=True,
+            )
+            return self.default
+        net_id = str(getattr(net, "id", "") or "") if net is not None else ""
+        if not net_id:
+            return self.default
+        return self.for_network(net_id)
+
+    def _ensure_state_locked(self, network_id: str) -> MasterState:
+        state = self._states.get(network_id)
+        if state is None:
+            state = MasterState(self._make_state_broadcaster())
+            self._states[network_id] = state
+        return state
+
+    def _make_state_broadcaster(self):
+        """Return a broadcaster for an individual :class:`MasterState`.
+
+        Every per-network ``set()`` produces the *unified* multi-network
+        payload — the WebUI receives the full ``{networks, default_id}``
+        shape on every change, mirroring the JSON contract of
+        ``/api/master``. The wrapper ignores the per-state event/payload
+        the inner class supplies.
+        """
+        def _bcast(_event_name: str, _payload) -> None:
+            try:
+                self._broadcast("master", self.snapshot())
+            except Exception:
+                logger.exception("MasterStateMap broadcast raised")
+        return _bcast
+
+    def snapshot(self) -> dict:
+        """Return ``{networks: [...], default_network_id: "..."}``.
+
+        Iterates the controller's network repository first so every
+        persisted network gets a row (even if untouched by events); any
+        state slot that exists in the map but is missing from the repo
+        is appended afterwards. Each row carries the regular
+        :class:`MasterState` fields plus ``network_id`` and ``name``.
+        """
+        with self._lock:
+            networks_meta: list[tuple[str, str]] = []
+            seen_ids: set[str] = set()
+            if self._controller is not None:
+                try:
+                    for net in self._controller.network_repository.list():
+                        nid = str(getattr(net, "id", "") or "")
+                        if not nid or nid in seen_ids:
+                            continue
+                        name = str(getattr(net, "name", "") or "") or "Network"
+                        networks_meta.append((nid, name))
+                        seen_ids.add(nid)
+                except Exception:
+                    logger.debug(
+                        "MasterStateMap.snapshot: repo iteration raised",
+                        exc_info=True,
+                    )
+            # Add any networks the map already tracks but the repo
+            # doesn't yet know about (e.g. controller not attached, or
+            # an EV arrived before the repo learned about the gateway).
+            for nid in list(self._states.keys()):
+                if nid not in seen_ids:
+                    networks_meta.append((nid, "Network"))
+                    seen_ids.add(nid)
+            # And the default — guaranteed present even before
+            # ``attach_controller`` runs.
+            if self._default_network_id not in seen_ids:
+                networks_meta.append((self._default_network_id, "Default"))
+                seen_ids.add(self._default_network_id)
+
+            rows = []
+            for nid, name in networks_meta:
+                state = self._ensure_state_locked(nid)
+                snap = state.snapshot()
+                snap["network_id"] = nid
+                snap["name"] = name
+                rows.append(snap)
+            return {
+                "default_network_id": self._default_network_id,
+                "networks": rows,
+            }
+
+
 class SSEBridge:
     def __init__(self, *, logger=None):
         self._logger = logger
         self._clients_lock = _DefaultLock()
         self._clients = set()
-        self.master = MasterState(self.broadcast)
+        # Stage 2 Part 4: per-network ``MasterState`` map. ``self.master``
+        # remains the default-network handle so the TaskManager and the
+        # /api/*-route diagnostic ``last_event`` updates do not need to
+        # know about networks. ``self.masters`` is the new multi-network
+        # container that ``/api/master`` and the broadcast pipeline read.
+        self.masters = MasterStateMap(self.broadcast)
+        # ``master`` keeps its pre-Part-4 contract: external callers
+        # treat it like a single :class:`MasterState`. It is literally
+        # the default-network slot, so per-state mutations flow through
+        # the map's broadcaster (which emits the multi-network shape).
+        self.master = self.masters.default
         self._task_manager = None
-        self._hooked_transport = {"ok": False}
+        # Stage 2 Part 4: track hooked transports by ``id(transport)``
+        # rather than a single bool. With multiple attached gateways
+        # every transport's RX listener must reach this bridge so all
+        # of them feed the SSE broadcast pipeline.
+        self._hooked_transports: set[int] = set()
 
     def attach_task_manager(self, task_manager):
         self._task_manager = task_manager
+
+    def attach_controller(self, controller) -> None:
+        """Bind the per-network map to a controller so future
+        ``EV_STATE_CHANGED`` events can be routed via
+        ``gateway_id → network_id``. Safe to call multiple times."""
+        try:
+            self.masters.attach_controller(controller)
+        except Exception:
+            logger.exception("SSEBridge.attach_controller failed")
 
     def log(self, msg):
         try:
@@ -177,37 +394,63 @@ class SSEBridge:
                 self._clients.discard(q)
 
     def rebind_transport(self, rl_instance) -> None:
-        """Drop the cached transport-hook state and re-install on the
-        current ``rl_instance.transport``.
+        """Drop the cached transport-hook state and re-install on every
+        currently-attached transport.
 
         Called by the controller after every successful gateway
         (re)connect so events from a freshly-opened transport reach
         the SSE broadcast pipeline. Without this, ``ensure_transport_hooked``
-        would short-circuit on its ``_hooked_transport["ok"]`` guard
-        and leave the SSE-mux pointing at the closed pre-reconnect
-        transport — unsolicited events (e.g. a powered-on node's
-        ``IDENTIFY_REPLY``) would update the device repo but never
-        broadcast the ``refresh`` SSE event the WebUI needs to flash
-        the device row.
+        would short-circuit on its hook tracking and leave the SSE-mux
+        pointing at the closed pre-reconnect transport — unsolicited
+        events (e.g. a powered-on node's ``IDENTIFY_REPLY``) would
+        update the device repo but never broadcast the ``refresh``
+        SSE event the WebUI needs to flash the device row.
+
+        Stage 2 Part 4: with multiple attached gateways the bridge
+        must hook each one individually, so the tracking moved from
+        a single bool to a per-transport identity set.
         """
-        self._hooked_transport = {"ok": False}
+        self._hooked_transports.clear()
         self.ensure_transport_hooked(rl_instance)
-        if self._hooked_transport["ok"]:
-            self.log("RaceLink: SSE transport rebound on (re)connect")
+        if self._hooked_transports:
+            self.log(
+                f"RaceLink: SSE transport rebound on (re)connect "
+                f"(transports={len(self._hooked_transports)})"
+            )
 
     def ensure_transport_hooked(self, rl_instance):
-        if self._hooked_transport["ok"]:
-            return
+        # Stage 2 Part 4: keep the per-network map in sync with the
+        # controller's network repository on every hook attempt. Cheap
+        # — ``attach_controller`` is idempotent and only refreshes the
+        # default network id reference.
+        self.attach_controller(rl_instance)
 
-        transport = getattr(rl_instance, "transport", None)
-        if not transport:
+        # Iterate every attached transport. ``rl_instance.transports``
+        # is the Stage-2 list-backed accessor; older code paths fall
+        # back to the singleton ``rl_instance.transport``.
+        transports = getattr(rl_instance, "transports", None)
+        if not transports:
+            single = getattr(rl_instance, "transport", None)
+            transports = [single] if single is not None else []
+
+        for transport in transports:
+            self._hook_single_transport(transport)
+
+    def _hook_single_transport(self, transport) -> None:
+        if transport is None:
+            return
+        key = id(transport)
+        if key in self._hooked_transports:
             return
 
         if hasattr(transport, "add_listener"):
             try:
                 transport.add_listener(self.on_transport_event)  # type: ignore[attr-defined]
-                self._hooked_transport["ok"] = True
-                self.log("RaceLink: transport event listener installed (add_listener)")
+                self._hooked_transports.add(key)
+                self.log(
+                    f"RaceLink: transport event listener installed (add_listener) "
+                    f"ident_mac={getattr(transport, 'ident_mac', None)!r}"
+                )
                 return
             except Exception as ex:
                 # swallow-ok: fall through to the on_event hook below.
@@ -238,8 +481,11 @@ class SSEBridge:
 
         try:
             transport.on_event = _mux
-            self._hooked_transport["ok"] = True
-            self.log("RaceLink: transport event hook installed")
+            self._hooked_transports.add(key)
+            self.log(
+                f"RaceLink: transport event hook installed "
+                f"ident_mac={getattr(transport, 'ident_mac', None)!r}"
+            )
         except Exception as ex:
             # swallow-ok: SSE will operate without the transport hook
             # — events from the gateway just won't fan out to clients.
@@ -270,7 +516,13 @@ class SSEBridge:
             state_byte = int(ev.get("state_byte", GATEWAY_STATE_UNKNOWN))
             metadata_ms = int(ev.get("state_metadata_ms", 0) or 0)
             source = "STATE_REPORT" if event_type == EV_STATE_REPORT else "STATE_CHANGED"
-            self.master.apply_gateway_state(state_byte, metadata_ms, source_event=source)
+            # Stage 2 Part 4: route the state update to the network slot
+            # owned by the source transport. Untagged events (legacy
+            # single-gateway path) hit ``default`` which is the same
+            # slot ``self.master`` returns — behaviour at N=1 is
+            # unchanged.
+            target = self.masters.for_gateway(ev.get("gateway_id"))
+            target.apply_gateway_state(state_byte, metadata_ms, source_event=source)
             if self._task_is_running() and state_byte == GATEWAY_STATE_RX_WINDOW:
                 snap = self._task_snapshot() or {}
                 self._task_update(rx_window_events=int(snap.get("rx_window_events", 0)) + 1)
@@ -347,7 +599,11 @@ class SSEBridge:
                 self._clients.add(q)
 
             try:
-                q.put(("master", self.master.snapshot()), timeout=0.01)
+                # Stage 2 Part 4: the ``master`` SSE event carries the
+                # multi-network payload (``{networks, default_network_id}``)
+                # so a freshly-connected client sees every network's
+                # state in one frame.
+                q.put(("master", self.masters.snapshot()), timeout=0.01)
                 q.put(("task", task_manager.snapshot()), timeout=0.01)
             except Exception:
                 logger.debug("SSE: unable to seed initial client snapshots", exc_info=True)

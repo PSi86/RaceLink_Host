@@ -17,6 +17,22 @@ export interface MasterSnapshot {
   last_event?: string | null
   last_event_ts?: number
   last_error?: string | null
+  // Stage 2 Part 4: per-network identifying fields. Optional so
+  // legacy single-master callsites still type-check during the
+  // transition to the multi-network UI (Stage 4).
+  network_id?: string
+  name?: string
+}
+
+/** Multi-network ``master`` payload (Stage 2 Part 4). Emitted by
+ *  ``GET /api/master`` and on every ``master`` SSE event. The
+ *  pre-Part-4 single-master clients read ``networks[0]`` as their
+ *  legacy ``MasterSnapshot`` — preserves the N=1 UX until Stage 4
+ *  ships the multi-network UI.
+ */
+export interface MasterMapSnapshot {
+  default_network_id: string
+  networks: MasterSnapshot[]
 }
 
 export type TaskState = 'idle' | 'running' | 'done' | 'error' | string
@@ -160,9 +176,32 @@ export interface GroupsResponse {
 
 export interface MasterResponse {
   ok: boolean
-  master: MasterSnapshot
+  // Stage 2 Part 4: ``master`` is now the multi-network payload.
+  // Legacy callsites that need the single-master shape read
+  // ``master.networks[0]`` (see ``stores/gateway.ts``).
+  master: MasterMapSnapshot
   task: TaskSnapshot
   gateway: GatewayStatus
+}
+
+/** Stage 2 Part 4 — ``GET /api/networks`` read-only listing. Stage 3
+ *  introduces CRUD; for now this surfaces the operator's persisted
+ *  networks plus their live :class:`MasterSnapshot`. */
+export interface NetworkSummary {
+  id: string
+  name: string
+  gateway_mac: string | null
+  region: string | null
+  channel_id: number | string | null
+  rf_config: Record<string, unknown> | null
+  created_ts: number | null
+  live?: MasterSnapshot | null
+}
+
+export interface NetworksResponse {
+  ok: boolean
+  default_network_id: string | null
+  networks: NetworkSummary[]
 }
 
 export interface GatewayResponse {

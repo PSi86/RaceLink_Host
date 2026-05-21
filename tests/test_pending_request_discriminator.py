@@ -23,6 +23,11 @@ from racelink.services.pending_requests import (
 )
 
 
+# Stage 3 Part C: concrete-sender matchers must carry a ``gateway_id``
+# and the events they consume must be tagged with the matching id.
+_TEST_GATEWAY_ID = "test-gw"
+
+
 def _reply_event(sender3: bytes, opc: int, *, option: int) -> dict:
     """Build a minimal GET_CONFIG_REPLY-shaped event the registry can match."""
     return {
@@ -36,6 +41,8 @@ def _reply_event(sender3: bytes, opc: int, *, option: int) -> dict:
         "data1": 0,
         "data2": 0,
         "data3": 0,
+        # Stage 3: the transport stamps every event with this on _emit.
+        "gateway_id": _TEST_GATEWAY_ID,
     }
 
 
@@ -51,6 +58,7 @@ class PendingMatcherDiscriminatorTests(unittest.TestCase):
         # bug). With the discriminator each reply lands at its own waiter.
         m_fps = PendingMatcher(
             sender_filter=frozenset({self.SENDER}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_opcode=self.OPC_GET_CONFIG,
             discriminator_field="option",
             discriminator_value=0x05,  # FPS
@@ -59,6 +67,7 @@ class PendingMatcherDiscriminatorTests(unittest.TestCase):
         )
         m_abl = PendingMatcher(
             sender_filter=frozenset({self.SENDER}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_opcode=self.OPC_GET_CONFIG,
             discriminator_field="option",
             discriminator_value=0x08,  # ABL
@@ -85,6 +94,7 @@ class PendingMatcherDiscriminatorTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m = PendingMatcher(
             sender_filter=frozenset({self.SENDER}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_opcode=self.OPC_GET_CONFIG,
             discriminator_field="option",
             discriminator_value=0x05,
@@ -106,6 +116,7 @@ class PendingMatcherDiscriminatorTests(unittest.TestCase):
         reg = PendingMatcherRegistry()
         m = PendingMatcher(
             sender_filter=frozenset({self.SENDER}),
+            gateway_id=_TEST_GATEWAY_ID,
             expected_opcode=self.OPC_GET_CONFIG,
             expected_count=1,
             max_timeout_s=1.0,
