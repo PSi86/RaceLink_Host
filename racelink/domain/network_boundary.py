@@ -32,7 +32,7 @@ Out of scope for Stage 3:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Any, Iterable, List, Mapping, Optional
 
 
 # Group id 0 is the system-defined "Unconfigured" pseudo-group.
@@ -83,6 +83,23 @@ class NetworkBoundaryViolation(ValueError):
     Carries the operator-readable ``reason`` and a structured
     ``detail`` dict so the HTTP layer can surface both a toast
     string and a JSON shape the WebUI can consume.
+    """
+
+    def __init__(self, reason: str, detail: dict):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
+class SceneScopeViolation(ValueError):
+    """Raised when a scene's explicit ``network_scope`` is inconsistent
+    with its actions — either the scope references unknown networks,
+    or an action targets a network outside the scope.
+
+    Sibling to :class:`NetworkBoundaryViolation` (sharing the same
+    operator-error shape) but kept distinct so the HTTP layer can
+    route scope-related diagnostics to the scene editor without
+    confusing them with bulk-regroup boundary checks.
     """
 
     def __init__(self, reason: str, detail: dict):
@@ -176,3 +193,137 @@ def validate_group_membership(
                 "group_name": _group_name(target_group),
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-scene network_scope consistency
+# ---------------------------------------------------------------------------
+#
+# Sibling to :func:`validate_group_membership`. The structural shape of
+# ``scene["network_scope"]`` is validated in
+# :func:`racelink.services.scenes_service._canonical_network_scope`
+# (repository-free); the cross-action subset check lives here because it
+# needs the controller's device + group repositories. The web layer
+# invokes this validator after the scenes_service has accepted the
+# canonical shape, so any failure is operator-visible as HTTP 400.
+
+def validate_scene_scope_consistency(
+    scene: Mapping[str, Any],
+    *,
+    controller: Any,
+) -> None:
+    """Refuse a scene whose explicit ``network_scope`` is internally
+    inconsistent.
+
+    Two conflict shapes (both :class:`SceneScopeViolation`):
+
+      * **unknown_network_id** — the scope references a network that
+        is not in the controller's network_repository. Save would
+        succeed but the next operator who edits this scene would see
+        a degraded "stale id" indicator.
+      * **scope_violation** — an action's resolved target lies on a
+        network not in the explicit scope. The save would otherwise
+        produce a scene whose runtime behaviour silently drops the
+        offending action (no transport routes to a non-scope group/
+        device).
+
+    Returns ``None`` (auto-mode scenes always pass) on success.
+
+    ``scene`` is the canonicalised scene dict (post-``create()`` /
+    ``update()`` shape). ``controller`` must expose
+    ``network_repository``, ``device_repository``, and
+    ``group_repository`` — production paths always satisfy this; tests
+    can stub.
+    """
+    scope = scene.get("network_scope")
+    if not isinstance(scope, Mapping) or scope.get("mode") != "explicit":
+        return  # auto mode (or missing) — nothing to enforce here
+
+    explicit_ids = [str(n) for n in (scope.get("network_ids") or ())]
+    if not explicit_ids:
+        # Should be unreachable post-canonicalization (the canonicalizer
+        # rejects empty explicit lists), but the validator is defensive.
+        raise SceneScopeViolation(
+            reason="Explicit network scope is empty.",
+            detail={"code": "scope_empty"},
+        )
+
+    # Check 1: every id in the explicit scope must currently exist in
+    # the network repository. Unknown ids → hard reject. The reasoning
+    # is documented in the plan: the editor has full repo visibility,
+    # so operators should never reach Save with a stale id. If they do,
+    # surface clearly. (Runtime degradation only kicks in for files
+    # already on disk via :func:`scene_network_ids`'s soft-filter.)
+    net_repo = getattr(controller, "network_repository", None)
+    if net_repo is not None:
+        known: set = set()
+        try:
+            for n in net_repo.list() or ():
+                nid = getattr(n, "id", None)
+                if nid:
+                    known.add(str(nid))
+        except Exception:
+            # swallow-ok: a malformed repo must not crash save; treat
+            # as "everything unknown" → all ids reject below.
+            known = set()
+        unknown = [nid for nid in explicit_ids if nid not in known]
+        if unknown:
+            raise SceneScopeViolation(
+                reason=(
+                    f"Scope references {len(unknown)} unknown network "
+                    f"id(s): {', '.join(unknown)}."
+                ),
+                detail={
+                    "code": "unknown_network_id",
+                    "unknown_ids": unknown,
+                    "scope": list(explicit_ids),
+                },
+            )
+
+    # Check 2: every action's resolved network membership must be a
+    # subset of the explicit scope. Lazy import to avoid a circular
+    # dependency: scene_network_scope imports from this module's
+    # sibling services, and the import order during package init
+    # could fail if we eagerly imported it at module load.
+    from racelink.services.scene_network_scope import (
+        _network_ids_for_target,
+    )
+    scope_set = set(explicit_ids)
+    actions = scene.get("actions") or ()
+
+    def _check_action(action: Mapping[str, Any], index: int) -> None:
+        if not isinstance(action, Mapping):
+            return
+        target = action.get("target")
+        if isinstance(target, Mapping):
+            kind = target.get("kind")
+            # Broadcast target (group 255) is always in-scope by
+            # construction: at runtime the scene's explicit scope is
+            # the fan-out target. No subset check needed.
+            if kind != "broadcast":
+                resolved = list(_network_ids_for_target(controller, target))
+                if resolved:
+                    offending = [nid for nid in resolved if nid not in scope_set]
+                    if offending:
+                        raise SceneScopeViolation(
+                            reason=(
+                                f"Action #{index} targets network(s) "
+                                f"outside the scene's scope: "
+                                f"{', '.join(offending)}."
+                            ),
+                            detail={
+                                "code": "scope_violation",
+                                "offending_action_index": index,
+                                "action_network_ids": resolved,
+                                "scope": list(explicit_ids),
+                            },
+                        )
+        # Recurse into offset_group / future container children.
+        for child_index, child in enumerate(action.get("actions") or ()):
+            _check_action(child, index)  # reuse parent index so the
+            # operator sees one row to fix even on nested violations
+            # (the child position is opaque in the action list).
+            del child_index  # silence the unused-var hint
+
+    for idx, action in enumerate(actions):
+        _check_action(action, idx)

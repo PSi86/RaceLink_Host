@@ -8,14 +8,31 @@ import { computed } from 'vue'
 
 import { Button } from '@/components/ui/button'
 import { useScenesStore } from '@/stores/scenes'
+import { useNetworksStore } from '@/stores/networks'
 import { useUiBus } from '@/composables/useUiBus'
 import { cn } from '@/lib/utils'
+import type { Scene } from '@/api/types'
 
 const scenes = useScenesStore()
+const networks = useNetworksStore()
 const ui = useUiBus()
 
 const items = computed(() => scenes.items)
 const selectedKey = computed(() => scenes.selectedKey)
+
+/** Scope badge for the sidebar row:
+ *   - Auto mode → no badge (zero clutter for the common case).
+ *   - Explicit, in-sync → small "N nets" pill.
+ *   - Explicit, at least one stale id → amber dot indicator. */
+function scopeBadge(scene: Scene): { text: string; stale: boolean } | null {
+  const s = scene.network_scope
+  if (!s || s.mode !== 'explicit') return null
+  const ids = s.network_ids ?? []
+  if (ids.length === 0) return null
+  const stale = ids.some((id) => !networks.byId[id])
+  const n = ids.length
+  return { text: `${n} net${n === 1 ? '' : 's'}`, stale }
+}
 
 async function onSelect(key: string) {
   // Guard: a single-click on another scene used to silently discard
@@ -50,7 +67,7 @@ function onOpenRlPresets() {
         :key="s.key"
         :class="
           cn(
-            'cursor-pointer truncate rounded-lg px-2.5 py-2 text-[13px] transition-colors hover:bg-[#1f1f28]',
+            'flex cursor-pointer items-center gap-2 truncate rounded-lg px-2.5 py-2 text-[13px] transition-colors hover:bg-[#1f1f28]',
             s.key === selectedKey
               ? 'bg-[#2a2d40] text-[#cfe0ff] shadow-[inset_2px_0_0_var(--color-accent)]'
               : '',
@@ -59,7 +76,21 @@ function onOpenRlPresets() {
         :title="s.label"
         @click="onSelect(s.key)"
       >
-        {{ s.label || s.key }}
+        <span class="flex-1 truncate">{{ s.label || s.key }}</span>
+        <span
+          v-if="scopeBadge(s)"
+          class="shrink-0 rounded-md border border-border bg-background/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+          :title="scopeBadge(s)!.stale
+            ? 'Explicit scope — one or more networks no longer exist'
+            : 'Explicit broadcast scope'"
+        >
+          {{ scopeBadge(s)!.text }}
+          <span
+            v-if="scopeBadge(s)!.stale"
+            class="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-400"
+            aria-label="stale"
+          />
+        </span>
       </li>
     </ul>
     <p v-else class="shrink-0 px-1 py-3 text-center text-xs text-muted-foreground">

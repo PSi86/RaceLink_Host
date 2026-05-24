@@ -35,6 +35,13 @@ const props = defineProps<{
   cost?: SceneCostPerAction
   /** Measured wall-clock duration from the last run, in ms. */
   actualMs?: number | null
+  /** Scene's explicit broadcast scope. Forwarded to the target
+   * picker so the group/device dropdowns can filter to in-scope
+   * networks. ``null`` (auto mode) → no filter. */
+  scopeNetworkIds?: string[] | null
+  /** When the parent flagged this action's target as out-of-scope,
+   * render a warning chip + red border on the target picker. */
+  scopeWarning?: boolean
 }>()
 
 const scenes = useScenesStore()
@@ -119,11 +126,23 @@ const rowClass = computed(() =>
         <template v-else>
           <SceneActionBody :action="action" />
           <div v-if="supportsTarget" class="flex flex-col gap-1">
-            <span class="text-xs text-muted-foreground">Target</span>
-            <SceneTargetPicker
-              :model-value="action.target"
-              @update:model-value="setTarget"
-            />
+            <span class="text-xs text-muted-foreground">
+              Target
+              <span
+                v-if="scopeWarning"
+                class="ml-1 rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rose-300"
+                title="This action targets a network outside the scene's explicit scope. The server will reject Save with a 400 — adjust the target or widen the scope."
+              >
+                out of scope
+              </span>
+            </span>
+            <div :class="scopeWarning ? 'rounded-md ring-1 ring-rose-500/40' : ''">
+              <SceneTargetPicker
+                :model-value="action.target"
+                :scope-network-ids="scopeNetworkIds"
+                @update:model-value="setTarget"
+              />
+            </div>
           </div>
           <SceneFlagsOverride v-if="supportsFlags" :action="action" />
         </template>

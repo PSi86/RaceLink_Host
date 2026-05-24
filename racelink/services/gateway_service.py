@@ -39,6 +39,8 @@ from typing import Optional
 from ..domain import create_device, default_device_name, get_dev_type_info
 from ..protocol import opcode_name as protocol_opcode_name
 from ..protocol import request_direction, response_opcode, response_policy, rules as protocol_rules
+from ..transport.broadcast_fanout import broadcast_fanout, resolve_broadcast_transports
+from ..transport.broadcast_target import BroadcastTarget
 from ..transport.framing import mac_last3_from_hex
 from ..transport.gateway_events import (
     EV_ERROR,
@@ -628,17 +630,35 @@ class GatewayService:
         _send()
         return True
 
-    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed: bool = False):
+    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *,
+                  trigger_armed: bool = False,
+                  target: Optional[BroadcastTarget] = None):
         """Send an ``OPC_SYNC`` clock-tick packet.
 
-        Stage 3 Part G: a broadcast sync (``recv3 == FFFFFF``) fans
-        out across *every* attached transport so each network's
-        devices receive a tick on their own radio. Unicast syncs
-        (``recv3 != FFFFFF``) route through the device's bound
-        transport via ``transport_for_device`` so the tick lands on
-        the right radio. At N=1 attached gateway the fan-out
-        collapses to a single send and behaviour is byte-identical
-        to the pre-Part-G path.
+        Unicast (``recv3 != FFFFFF``) routes via ``transport_for_device``
+        and the ``target`` kwarg is ignored — the receiver's network
+        membership determines the radio.
+
+        Broadcast (``recv3 == FFFFFF``):
+
+        * ``target`` is the explicit set of networks the broadcast
+          addresses. Scene-driven sync passes
+          ``BroadcastTarget.from_ids(scene_network_set)``; manual /
+          fleet-wide callers pass ``BroadcastTarget.all_attached(controller)``.
+        * Each addressed network's frame is sent on its bound
+          transport. Workers dispatch in parallel via
+          :func:`broadcast_fanout` — the wall-clock cost is bounded
+          by the slowest single-radio airtime, not by N × airtime.
+        * Cross-network ``arm_on_sync`` coordination works because all
+          ``setTx`` calls land within a few ms of each other (Thread
+          start latency dominates over USB write).
+
+        Back-compat fallback: when ``target`` is None, the call
+        defaults to "all attached transports" with a deprecation
+        warning. Callers should be migrated to set ``target``
+        explicitly so unintended cross-network sync ticks (and the
+        ``arm_on_sync`` fires they could trigger on uninvolved
+        networks) are eliminated.
 
         ``trigger_armed`` adds ``SYNC_FLAG_TRIGGER_ARMED`` to the
         wire body (operator-driven sync that materialises pending
@@ -671,30 +691,23 @@ class GatewayService:
                              brightness=brightness_int, flags=flags)
             return
 
-        # Broadcast: fan out across every attached transport. Each
-        # transport's TX-barrier serialises sends per-radio; the
-        # cross-transport calls run sequentially on the caller
-        # thread, but each USB-CDC write is sub-millisecond so the
-        # whole fan-out is well under the LoRa airtime budget.
-        transports = list(getattr(self.controller, "transports", None) or [])
+        # Broadcast: resolve target → transports, then fan out in parallel.
+        transports = resolve_broadcast_transports(
+            self.controller, target,
+            label="send_sync",
+            fallback_transport=self.transport,
+        )
         if not transports:
-            primary = self.transport
-            if primary is None:
-                logger.warning("sendSync: communicator not ready")
-                return
-            transports = [primary]
-        for t in transports:
-            try:
-                t.send_sync(recv3=recv3_b, ts24=ts24_int,
-                            brightness=brightness_int, flags=flags)
-            except Exception:
-                # swallow-ok: one misbehaving transport must not abort
-                # the sync fan-out on its siblings. The next OPC_SYNC
-                # tick (autosync runs every few hundred ms) re-tries.
-                logger.exception(
-                    "RaceLink: send_sync failed on transport %r",
-                    getattr(t, "ident_mac", None),
-                )
+            return
+
+        broadcast_fanout(
+            transports,
+            lambda t: t.send_sync(
+                recv3=recv3_b, ts24=ts24_int,
+                brightness=brightness_int, flags=flags,
+            ),
+            label="send_sync",
+        )
 
     def send_stream(
         self,

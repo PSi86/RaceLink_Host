@@ -30,6 +30,12 @@ const props = defineProps<{
   /** When ``true``, exclude ``device`` (offset_group containers can't
    *  pin to a single device — the formula is per-group). */
   containerScope?: boolean
+  /** Scene's explicit network scope (the editor passes this when the
+   * scene's ``network_scope.mode === 'explicit'``). Restricts the
+   * group / device dropdowns to entries whose ``network_id`` is in
+   * this list. ``null`` / ``undefined`` (auto mode) → no extra
+   * filter, status-quo behaviour. */
+  scopeNetworkIds?: string[] | null
 }>()
 
 const emit = defineEmits<{ (e: 'update:modelValue', v: SceneTarget): void }>()
@@ -63,15 +69,41 @@ const allowedKinds = computed<SceneTargetKindOption[]>(() => {
     : FALLBACK_TARGET_KINDS
 })
 
-const groupOptions = computed(() =>
-  groups.selectableGroups.map((g) => ({ value: g.id, label: `${g.id}: ${g.name}` })),
-)
+/** Filter helper: when scope is set, restrict to in-scope networks.
+ * Group id 0 (Unconfigured) is always visible — it's the
+ * cross-network sink, same exception the server's boundary validator
+ * makes. Devices/groups without a ``network_id`` (legacy data) pass
+ * through unfiltered so legacy scenes don't disappear from the
+ * dropdown when the operator switches to explicit mode. */
+const groupOptions = computed(() => {
+  const scope = props.scopeNetworkIds
+  const eligible = scope == null
+    ? groups.selectableGroups
+    : groups.selectableGroups.filter((g) => {
+        if (g.id === 0) return true
+        const nid = g.network_id ?? null
+        if (!nid) return true
+        return scope.includes(nid)
+      })
+  return eligible.map((g) => ({ value: g.id, label: `${g.id}: ${g.name}` }))
+})
 
-const deviceOptions = computed(() =>
-  devices.devices
-    .filter((d) => Boolean(d.addr))
-    .map((d) => ({ value: d.addr, label: d.name ? `${d.name} (${d.addr})` : d.addr })),
-)
+const deviceOptions = computed(() => {
+  const scope = props.scopeNetworkIds
+  const eligible = scope == null
+    ? devices.devices.filter((d) => Boolean(d.addr))
+    : devices.devices
+        .filter((d) => Boolean(d.addr))
+        .filter((d) => {
+          const nid = d.network_id ?? null
+          if (!nid) return true
+          return scope.includes(nid)
+        })
+  return eligible.map((d) => ({
+    value: d.addr,
+    label: d.name ? `${d.name} (${d.addr})` : d.addr,
+  }))
+})
 
 const groupValue = computed<number | null>(() => {
   const t = target.value
@@ -187,6 +219,7 @@ function setGroupList(ids: number[]) {
     <MultiGroupPickerDialog
       v-model:open="multiOpen"
       :model-value="currentGroupIds"
+      :scope-network-ids="scopeNetworkIds"
       @update:model-value="setGroupList"
     />
   </div>

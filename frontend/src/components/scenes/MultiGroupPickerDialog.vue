@@ -29,6 +29,10 @@ const props = defineProps<{
   open: boolean
   /** Currently-selected group ids (canonical target.value). */
   modelValue: number[]
+  /** Scene-level explicit broadcast scope. Filters the visible
+   * groups to those whose ``network_id`` is in the scope. ``null`` /
+   * ``undefined`` (auto mode) → no extra filter. */
+  scopeNetworkIds?: string[] | null
 }>()
 
 const emit = defineEmits<{
@@ -57,7 +61,26 @@ watch(
   },
 )
 
-const allGroups = computed(() => groups.selectableGroups)
+/** Base list of selectable groups, optionally pre-filtered by the
+ * scene's explicit scope. Group id 0 (Unconfigured) always passes
+ * — same exception the server's boundary validator makes.
+ *
+ * Note: the anchor-network rule (`isCrossNetwork` below) stays in
+ * effect on top of this filter. The scope says "which networks the
+ * scene reaches"; the anchor says "within one action you can only
+ * pick groups from ONE network". Both compose cleanly. */
+const scopedGroups = computed(() => {
+  const scope = props.scopeNetworkIds
+  if (scope == null) return groups.selectableGroups
+  return groups.selectableGroups.filter((g) => {
+    if (g.id === 0) return true
+    const nid = g.network_id ?? null
+    if (!nid) return true
+    return scope.includes(nid)
+  })
+})
+
+const allGroups = computed(() => scopedGroups.value)
 
 const filteredGroups = computed(() => {
   const q = search.value.trim().toLowerCase()

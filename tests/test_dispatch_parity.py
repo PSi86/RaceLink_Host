@@ -82,31 +82,37 @@ class _RecordingControlService:
     def __init__(self):
         self.calls: List[Dict[str, Any]] = []
 
-    def send_offset(self, *, targetDevice=None, targetGroup=None, mode="none", **mode_params):
+    def send_offset(self, *, targetDevice=None, targetGroup=None, mode="none",
+                    target=None, **mode_params):
         self.calls.append({
             "sender": "send_offset",
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "mode": mode,
             "params": dict(mode_params),
+            "target": target,
         })
         return True
 
-    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_control(self, *, targetDevice=None, targetGroup=None,
+                     params=None, target=None):
         self.calls.append({
             "sender": "send_control",
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
+            "target": target,
         })
         return True
 
-    def send_wled_preset(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_wled_preset(self, *, targetDevice=None, targetGroup=None,
+                         params=None, target=None):
         self.calls.append({
             "sender": "send_wled_preset",
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
+            "target": target,
         })
         return True
 
@@ -115,11 +121,13 @@ class _RecordingSyncService:
     def __init__(self):
         self.calls: List[Dict[str, Any]] = []
 
-    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed=False):
+    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *,
+                  trigger_armed=False, target=None):
         self.calls.append({
             "sender": "send_sync",
             "ts24": ts24, "brightness": brightness,
             "trigger_armed": trigger_armed,
+            "target": target,
         })
 
 

@@ -15,16 +15,84 @@ import draggable from 'vuedraggable'
 import { Button } from '@/components/ui/button'
 import SceneActionRow from './SceneActionRow.vue'
 import SceneCostBadge from './SceneCostBadge.vue'
+import SceneNetworkScopeWidget from './SceneNetworkScopeWidget.vue'
 import SceneRunPipStrip from './SceneRunPipStrip.vue'
 import { useScenesStore } from '@/stores/scenes'
+import { useNetworksStore } from '@/stores/networks'
+import { useGroupsStore } from '@/stores/groups'
+import { useDevicesStore } from '@/stores/devices'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useBeforeUnloadGuard } from '@/composables/useBeforeUnloadGuard'
-import type { SceneAction, SceneActionKind } from '@/api/types'
+import type { SceneAction, SceneActionKind, SceneNetworkScope } from '@/api/types'
 
 const scenes = useScenesStore()
+const networks = useNetworksStore()
+const groups = useGroupsStore()
+const devices = useDevicesStore()
 const toast = useToast()
 const confirm = useConfirm()
+
+// Per-action scope warning + scope-prop wiring. Derived from
+// ``draft.network_scope`` and the cost estimator's per-action
+// resolution. The scopeIds passed to per-action target pickers is
+// either ``null`` (auto mode → no extra filter, status quo) or the
+// frozen list of explicit network ids (filter group/device dropdowns).
+const scopeIds = computed<string[] | null>(() => {
+  const s = scenes.draft?.network_scope
+  if (!s || s.mode !== 'explicit') return null
+  return s.network_ids ?? []
+})
+
+// Per-action "is this row's resolved network outside the explicit
+// scope?" — server's validate_scene_scope_consistency is the
+// authoritative gate; the frontend check is purely a UX heads-up so
+// the operator sees the conflict before they hit Save.
+function scopeWarningForAction(action: SceneAction): boolean {
+  const ids = scopeIds.value
+  if (!ids) return false
+  const target = action.target
+  if (!target || target.kind === 'broadcast') return false
+  if (target.kind === 'groups') {
+    const gids = (target.value as number[]) ?? []
+    if (gids.length === 0) return false
+    return gids.some((gid) => {
+      if (gid === 0) return false  // Unconfigured is network-agnostic.
+      const g = groups.groups.find((row) => row.id === gid)
+      const nid = g?.network_id ?? null
+      if (!nid) return false  // unbound group can't violate
+      return !ids.includes(nid)
+    })
+  }
+  if (target.kind === 'device') {
+    const addr = String(target.value ?? '')
+    if (!addr) return false
+    const dev = devices.devices.find((d) => d.addr === addr)
+    const nid = dev?.network_id ?? null
+    if (!nid) return false  // unknown device → runtime degrades it
+    return !ids.includes(nid)
+  }
+  return false
+}
+
+function onScopeChange(next: SceneNetworkScope) {
+  if (!scenes.draft) return
+  scenes.draft.network_scope = next
+}
+
+// Fan-out pill: ``true`` when the resolved scope crosses 2+ networks.
+const fanoutCount = computed<number>(() => {
+  const resolved = scenes.cost?.resolved_network_ids ?? []
+  return resolved.length
+})
+const fanoutPillLabel = computed<string>(() => {
+  const ids = scenes.cost?.resolved_network_ids ?? []
+  if (ids.length <= 1) return ''
+  const names = ids
+    .map((id) => networks.byId[id]?.name ?? id)
+    .join(', ')
+  return `Fan-out: ${ids.length} gateways (${names})`
+})
 
 const submitting = ref(false)
 const newKindToAdd = ref<SceneActionKind>('rl_preset')
@@ -63,18 +131,36 @@ const actionsList = computed<SceneAction[]>({
 // Live cost estimate. Debounce so a slider drag (which fires many
 // updates) doesn't hammer the estimator endpoint. 350ms is short
 // enough to feel responsive, long enough to coalesce drag bursts.
+//
+// Watched keys (concatenated into one source string):
+//   1. Action content (order-invariant) — primary trigger; packet
+//      counts and per-action bytes change only when an action's
+//      kind / params / target are edited.
+//   2. ``network_scope`` — changing Auto↔Explicit or editing the
+//      explicit network_ids changes which networks the broadcasts
+//      reach, so ``resolved_network_ids`` in the cost response
+//      changes too. Without this dep the Scope chip's Auto preview
+//      and the Fan-out pill go stale until the operator switches
+//      scenes (which clears the cost cache).
+//   3. ``networks.networks.length`` — attaching/detaching a gateway
+//      changes the auto-resolved set for ``broadcast``-target
+//      actions. Cheap to watch (one int) and catches NetworkManager
+//      mutations made while the editor is open.
 watchDebounced(
-  // Watch the *content* of the actions, not their order. The runner
-  // optimises only within an individual action; reordering the list
-  // never changes per-action packets/bytes/airtime nor the scene
-  // total. Sorting the per-action JSON before joining makes pure
+  // Sorting the per-action JSON before joining makes pure
   // reorders a no-op for this watcher (no estimate refetch, no
   // transient stale-positional flash on the per-row badge — the
   // store's ``costByAction`` Map keeps every action ref's figures
   // attached even when the array is rearranged in place).
-  () => (draft.value
-    ? draft.value.actions.map((a) => JSON.stringify(a)).sort().join('|')
-    : ''),
+  () => {
+    const d = draft.value
+    if (!d) return ''
+    return [
+      d.actions.map((a) => JSON.stringify(a)).sort().join('|'),
+      JSON.stringify(d.network_scope),
+      String(networks.networks.length),
+    ].join('::')
+  },
   () => {
     void scenes.loadCost()
   },
@@ -162,11 +248,21 @@ async function onRun() {
   toast.show(`Run complete in ${Math.round(Number(result?.total_duration_ms ?? 0))} ms.`)
 }
 
+// Set by onSave when the server returns a scope_violation so the UI
+// can highlight the offending action row. Cleared on next save attempt.
+const lastScopeViolationIndex = ref<number | null>(null)
+
 async function onSave() {
   submitting.value = true
+  lastScopeViolationIndex.value = null
   try {
     const r = await scenes.save()
     if (!r.ok) {
+      // Scope-violation path: highlight the offending row + scroll
+      // it into view, then surface the structured error in the toast.
+      if (r.violation && typeof r.violation.offendingActionIndex === 'number') {
+        lastScopeViolationIndex.value = r.violation.offendingActionIndex
+      }
       toast.error(r.error || 'Save failed.')
       return
     }
@@ -217,8 +313,8 @@ function onAddAction() {
     </p>
 
     <template v-else>
-      <!-- Header: label + stop_on_error -->
-      <div class="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+      <!-- Header: label + scope widget + stop_on_error -->
+      <div class="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
         <label class="grid gap-1.5 text-sm">
           <span class="font-medium">Label</span>
           <input
@@ -229,10 +325,28 @@ function onAddAction() {
             class="h-9 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
         </label>
+        <div class="self-end pb-1.5">
+          <SceneNetworkScopeWidget
+            :model-value="draft.network_scope"
+            :resolved-network-ids="scenes.cost?.resolved_network_ids"
+            @update:model-value="onScopeChange"
+          />
+        </div>
         <label class="inline-flex items-center gap-2 self-end pb-1.5 text-xs text-muted-foreground">
           <input v-model="draft.stop_on_error" type="checkbox" class="h-4 w-4 accent-primary" />
           <span>Stop on first error</span>
         </label>
+      </div>
+
+      <!-- Fan-out pill — only renders when the scene's broadcasts
+           reach 2+ gateways. Tooltip lists the network names. -->
+      <div v-if="fanoutCount > 1" class="-mt-1">
+        <span
+          class="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-200"
+          :title="fanoutPillLabel"
+        >
+          Fan-out: {{ fanoutCount }} gateways
+        </span>
       </div>
 
       <!-- Actions -->
@@ -265,6 +379,11 @@ function onAddAction() {
               :status="statusForAction(element)"
               :cost="costForAction(element)"
               :actual-ms="actualMsForAction(element)"
+              :scope-network-ids="scopeIds"
+              :scope-warning="
+                scopeWarningForAction(element)
+                || lastScopeViolationIndex === index
+              "
             />
           </template>
         </draggable>

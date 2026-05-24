@@ -17,9 +17,15 @@ Method naming mirrors the protocol opcodes:
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from ..domain import USER_FLAG_KEYS, build_flags_byte
 from ..transport import mac_last3_from_hex
+from ..transport.broadcast_fanout import (
+    broadcast_fanout,
+    resolve_broadcast_transports,
+)
+from ..transport.broadcast_target import BroadcastTarget
 
 logger = logging.getLogger(__name__)
 
@@ -257,31 +263,68 @@ class ControlService:
         )
         return True
 
-    def send_group_preset(self, group_id, flags, preset_id, brightness) -> bool:
+    def send_group_preset(self, group_id, flags, preset_id, brightness,
+                          *, target: Optional[BroadcastTarget] = None) -> bool:
         """Broadcast OPC_PRESET to a group; update local cache for matching devices.
 
-        Returns ``True`` if a frame was queued, ``False`` when the
-        transport is not ready. Same B2 contract as
+        Routing model:
+
+        * ``target=None`` (default, scene-runner case): route via
+          ``transport_for_group(group_id)``. A group exists on exactly
+          one network in the schema, so this lands the broadcast on
+          that network's gateway and nowhere else — byte-identical to
+          the pre-target-kwarg behaviour.
+        * ``target=BroadcastTarget(...)``: cross-network broadcast.
+          Each listed network receives ``recv3=FFFFFF + group_id``
+          frames in parallel via :func:`broadcast_fanout`. Used for
+          operational fleet-wide commands (e.g. broadcast group=255
+          power-off) where the same group_id meaning is replicated
+          across networks.
+
+        Returns ``True`` if at least one frame was queued, ``False``
+        when no transport could be addressed. Same B2 contract as
         :meth:`send_device_preset`.
         """
         group_b = int(group_id) & 0xFF
-        transport = self._transport_for_group_send(group_b, "sendGroupPreset")
-        if transport is None:
-            return False
-
         flags_b, preset_b, brightness_b = self._coerce_preset_values(flags, preset_id, brightness)
         self._update_group_preset_cache(group_b, flags_b, preset_b, brightness_b)
 
-        transport.send_preset(
-            recv3=b"\xFF\xFF\xFF",
-            group_id=group_b,
-            flags=flags_b,
-            preset_id=preset_b,
-            brightness=brightness_b,
+        if target is None:
+            transport = self._transport_for_group_send(group_b, "sendGroupPreset")
+            if transport is None:
+                return False
+            transport.send_preset(
+                recv3=b"\xFF\xFF\xFF",
+                group_id=group_b,
+                flags=flags_b,
+                preset_id=preset_b,
+                brightness=brightness_b,
+            )
+            return True
+
+        # Explicit target: cross-network broadcast.
+        transports = resolve_broadcast_transports(
+            self.controller, target,
+            label="sendGroupPreset",
+            fallback_transport=self.transport,
+        )
+        if not transports:
+            return False
+        broadcast_fanout(
+            transports,
+            lambda t: t.send_preset(
+                recv3=b"\xFF\xFF\xFF",
+                group_id=group_b,
+                flags=flags_b,
+                preset_id=preset_b,
+                brightness=brightness_b,
+            ),
+            label="sendGroupPreset",
         )
         return True
 
-    def send_wled_preset(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_wled_preset(self, *, targetDevice=None, targetGroup=None, params=None,
+                         target: Optional[BroadcastTarget] = None):
         """Apply a classical WLED preset (OPC_PRESET) to a device or group.
 
         Accepts numeric ``presetId`` only. RaceLink-native RL-presets follow a
@@ -292,6 +335,11 @@ class ControlService:
         four user-intent flags from ``params``: ``arm_on_sync``, ``force_tt0``,
         ``force_reapply``, ``offset_mode``. ``POWER_ON``/``HAS_BRI`` are
         derived from brightness and never passed through from the caller.
+
+        ``target``: forwarded to :meth:`send_group_preset` for cross-network
+        broadcast fan-out (only meaningful with ``targetGroup``). Device-
+        targeted preset routes via the device's bound transport and ignores
+        ``target``.
         """
         if params is None:
             params = {}
@@ -312,13 +360,17 @@ class ControlService:
         # so a route or scene-runner caller saw success even though no
         # frame went out.
         if targetGroup is not None:
-            return self.send_group_preset(int(targetGroup), flags, preset_id, brightness)
+            return self.send_group_preset(
+                int(targetGroup), flags, preset_id, brightness, target=target,
+            )
         if targetDevice is not None:
             return self.send_device_preset(targetDevice, flags, preset_id, brightness)
         return False
 
     def send_offset(self, *, targetDevice=None, targetGroup=None,
-                    mode="none", **mode_params) -> bool:
+                    mode="none",
+                    target: Optional[BroadcastTarget] = None,
+                    **mode_params) -> bool:
         """Send OPC_OFFSET (variable-length, 2..7 B body).
 
         ``mode`` selects the formula stored on the receiver and accepts
@@ -335,17 +387,43 @@ class ControlService:
         — every device picks it up. The acceptance gate on subsequent
         OPC_CONTROL packets selects the participating subset.
 
-        Returns ``True`` if a frame was queued, ``False`` if the transport is
-        not ready or no target was provided.
+        ``target`` (only meaningful with ``targetGroup``): when set,
+        the broadcast fans out across the listed networks in parallel
+        via :func:`broadcast_fanout`. When omitted, routing uses
+        ``transport_for_group(targetGroup)`` — single-network send,
+        matching the pre-target-kwarg behaviour. ``targetDevice``
+        sends are always unicast-routed and ignore ``target``.
+
+        Returns ``True`` if at least one frame was queued, ``False`` if no
+        transport could be addressed or no target was provided.
         """
         if targetGroup is not None:
             group_b = int(targetGroup) & 0xFF
-            transport = self._transport_for_group_send(group_b, "sendOffset")
-            if transport is None:
+            if target is None:
+                transport = self._transport_for_group_send(group_b, "sendOffset")
+                if transport is None:
+                    return False
+                transport.send_offset(
+                    recv3=b"\xFF\xFF\xFF", group_id=group_b,
+                    mode=mode, **mode_params,
+                )
+                return True
+
+            # Explicit cross-network broadcast.
+            transports = resolve_broadcast_transports(
+                self.controller, target,
+                label="sendOffset",
+                fallback_transport=self.transport,
+            )
+            if not transports:
                 return False
-            transport.send_offset(
-                recv3=b"\xFF\xFF\xFF", group_id=group_b,
-                mode=mode, **mode_params,
+            broadcast_fanout(
+                transports,
+                lambda t: t.send_offset(
+                    recv3=b"\xFF\xFF\xFF", group_id=group_b,
+                    mode=mode, **mode_params,
+                ),
+                label="sendOffset",
             )
             return True
         if targetDevice is not None:
@@ -444,7 +522,8 @@ class ControlService:
                         )
         return ok
 
-    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_control(self, *, targetDevice=None, targetGroup=None, params=None,
+                     target: Optional[BroadcastTarget] = None):
         """Send OPC_CONTROL with the effect parameters from ``params``.
 
         Full-state semantics: every field present in ``params`` is included in
@@ -454,6 +533,13 @@ class ControlService:
 
         Flag handling matches :meth:`send_wled_preset`: ``POWER_ON`` derived
         from brightness, ``HAS_BRI`` always set when brightness is provided.
+
+        ``target`` (only meaningful with ``targetGroup``): when set, the
+        broadcast fans out across the listed networks in parallel via
+        :func:`broadcast_fanout`. When omitted, routing uses
+        ``transport_for_group(targetGroup)`` — single-network send,
+        matching the pre-target-kwarg behaviour. ``targetDevice``
+        sends are always unicast-routed and ignore ``target``.
         """
         # Stage 3 Part G: transport selection moves *after* the
         # target check below so the group-vs-device path can pick the
@@ -501,26 +587,44 @@ class ControlService:
 
         if targetGroup is not None:
             group_b = int(targetGroup) & 0xFF
-            transport = self._transport_for_group_send(group_b, "sendControl")
-            if transport is None:
-                return False
-            transport.send_control(
-                recv3=b"\xFF\xFF\xFF",
-                group_id=group_b,
-                flags=flags,
-                **ctrl_kwargs,
-            )
-            # Iteration 9: OPC_CONTROL is RESP_NONE — mirror onto every
-            # group member's DTO so the device-table reflects the new
-            # state immediately (no need to wait for a manual Get
-            # Status). The route handler's SSE refresh propagates the
-            # change to the frontend.
+            # Local DTO mirror runs regardless of routing path so the
+            # frontend sees the new state immediately (RESP_NONE opcode).
             self._update_group_control_cache(
                 group_b,
                 flags=flags,
                 params=params,
                 brightness_val=brightness_val,
                 brightness_present=brightness_present,
+            )
+            if target is None:
+                transport = self._transport_for_group_send(group_b, "sendControl")
+                if transport is None:
+                    return False
+                transport.send_control(
+                    recv3=b"\xFF\xFF\xFF",
+                    group_id=group_b,
+                    flags=flags,
+                    **ctrl_kwargs,
+                )
+                return True
+
+            # Explicit cross-network broadcast.
+            transports = resolve_broadcast_transports(
+                self.controller, target,
+                label="sendControl",
+                fallback_transport=self.transport,
+            )
+            if not transports:
+                return False
+            broadcast_fanout(
+                transports,
+                lambda t: t.send_control(
+                    recv3=b"\xFF\xFF\xFF",
+                    group_id=group_b,
+                    flags=flags,
+                    **ctrl_kwargs,
+                ),
+                label="sendControl",
             )
             return True
         if targetDevice is not None:

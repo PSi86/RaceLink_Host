@@ -812,6 +812,81 @@ def _canonical_actions(raw: Any) -> List[Dict[str, Any]]:
     return [_canonical_action(item) for item in raw]
 
 
+# ---------------------------------------------------------------------------
+# Per-scene network scope (Stage 4 follow-up — scope-aware broadcasts)
+# ---------------------------------------------------------------------------
+#
+# Scenes may carry an optional top-level ``network_scope`` field that
+# constrains which networks broadcast actions reach at runtime. Two modes:
+#
+#   * ``{"mode": "auto"}`` — default, back-compat. Runtime derives the
+#     scope from the union of action targets via
+#     :func:`racelink.services.scene_network_scope.scene_network_ids`.
+#   * ``{"mode": "explicit", "network_ids": [...]}`` — operator-pinned
+#     set. Runtime returns this list (filtered against currently
+#     persisted networks). Per-action target pickers in the editor
+#     restrict to these networks.
+#
+# Validation here is STRUCTURAL only — does the field have the right
+# shape. The cross-action consistency check (every action's resolved
+# target must be a subset of the scope) lives in
+# :func:`racelink.domain.network_boundary.validate_scene_scope_consistency`
+# because it needs the device + group repositories, and ``scenes_service``
+# deliberately stays repository-free for testability.
+def _canonical_network_scope(raw: Any) -> Dict[str, Any]:
+    """Validate + normalise the scene-level ``network_scope`` field.
+
+    Returns:
+        ``{"mode": "auto"}`` for None/missing input — the back-compat
+        default. ``{"mode": "explicit", "network_ids": [...]}`` for a
+        valid explicit-mode payload.
+
+    Raises:
+        ValueError on any malformed shape: unknown mode, non-list
+        network_ids, non-string entries, empty list after coercion.
+
+    Normalisation:
+        * String coercion + whitespace strip for each network_id.
+        * Empty entries dropped.
+        * Order-preserving dedupe.
+    """
+    if raw is None:
+        return {"mode": "auto"}
+    if not isinstance(raw, dict):
+        raise ValueError("network_scope must be an object")
+    mode = raw.get("mode")
+    if mode == "auto":
+        # Strip stray network_ids on auto-mode payloads so the persisted
+        # shape is clean. A common round-trip from the frontend keeps the
+        # previously-set explicit list when switching to auto; we drop it
+        # at the boundary.
+        return {"mode": "auto"}
+    if mode == "explicit":
+        raw_ids = raw.get("network_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError(
+                "network_scope.network_ids must be a list when mode='explicit'"
+            )
+        seen: set = set()
+        out: List[str] = []
+        for entry in raw_ids:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    "network_scope.network_ids entries must be strings"
+                )
+            nid = entry.strip()
+            if not nid or nid in seen:
+                continue
+            seen.add(nid)
+            out.append(nid)
+        if not out:
+            raise ValueError(
+                "network_scope.network_ids must be non-empty when mode='explicit'"
+            )
+        return {"mode": "explicit", "network_ids": out}
+    raise ValueError(f"network_scope.mode must be 'auto' or 'explicit', got {mode!r}")
+
+
 def _collapse_groups_target(target: Dict[str, Any],
                             known_set: set) -> Dict[str, Any]:
     """If ``target.kind == "groups"`` and the value covers every currently
@@ -1007,6 +1082,13 @@ class SceneService:
                 # uncheck the editor checkbox per scene. Existing scenes
                 # without the field default to True on load.
                 "stop_on_error": _coerce_bool(entry.get("stop_on_error"), default=True),
+                # Scope follow-up (broadcast-target branch): operator-set
+                # network scope for the scene's broadcast actions. Missing
+                # field on load defaults to ``{"mode": "auto"}`` via the
+                # canonicalizer; no schema bump needed because the field
+                # is purely additive and old hosts silently drop unknown
+                # keys.
+                "network_scope": _canonical_network_scope(entry.get("network_scope")),
             })
 
         persisted_next = data.get("next_id")
@@ -1107,7 +1189,8 @@ class SceneService:
 
     def create(self, *, label: str, actions: Optional[list] = None,
                key: Optional[str] = None,
-               stop_on_error: Optional[bool] = None) -> dict:
+               stop_on_error: Optional[bool] = None,
+               network_scope: Optional[dict] = None) -> dict:
         label_clean = (label or "").strip()
         if not label_clean:
             raise ValueError("label is required")
@@ -1119,6 +1202,10 @@ class SceneService:
         stop_on_error_resolved = (
             True if stop_on_error is None else _coerce_bool(stop_on_error, default=True)
         )
+        # Scope: canonicalize. None / missing -> {"mode": "auto"}; explicit
+        # payloads validated for shape (cross-action subset check happens
+        # at the API layer where the repositories are available).
+        canonical_scope = _canonical_network_scope(network_scope)
         with self._lock:
             items = self._items()
             existing_keys = {s["key"] for s in items}
@@ -1135,6 +1222,7 @@ class SceneService:
                 "updated": now,
                 "actions": canonical_actions,
                 "stop_on_error": stop_on_error_resolved,
+                "network_scope": canonical_scope,
             }
             items.append(scene)
             self._write_atomic(items)
@@ -1144,13 +1232,20 @@ class SceneService:
 
     def update(self, key: str, *, label: Optional[str] = None,
                actions: Optional[list] = None,
-               stop_on_error: Optional[bool] = None) -> Optional[dict]:
+               stop_on_error: Optional[bool] = None,
+               network_scope: Optional[dict] = None) -> Optional[dict]:
         if actions is not None:
             canonical_actions = self._apply_broadcast_collapse(
                 _canonical_actions(actions)
             )
         else:
             canonical_actions = None
+        # Canonicalize scope on the way in — same None-means-don't-change
+        # convention as the other kwargs. A persisted scope can be replaced
+        # by passing the new dict; auto-mode is the default for new scenes.
+        canonical_scope = (
+            _canonical_network_scope(network_scope) if network_scope is not None else None
+        )
         updated: Optional[dict] = None
         with self._lock:
             items = list(self._items())
@@ -1169,6 +1264,8 @@ class SceneService:
                     new_entry["stop_on_error"] = _coerce_bool(
                         stop_on_error, default=True,
                     )
+                if canonical_scope is not None:
+                    new_entry["network_scope"] = canonical_scope
                 new_entry["updated"] = _now_iso()
                 items[idx] = new_entry
                 self._write_atomic(items)
@@ -1199,6 +1296,10 @@ class SceneService:
             label=label,
             actions=src["actions"],
             stop_on_error=src.get("stop_on_error", True),
+            # Copy scope verbatim — operator-resolved decision: duplicating
+            # a scene with explicit scope should keep that scope. They can
+            # change it via the editor after the clone if they want.
+            network_scope=src.get("network_scope"),
         )
 
     def remap_group_ids(self, mapping: Dict[int, int]) -> int:
@@ -1624,6 +1725,13 @@ def _remap_actions_for_mapping(
 def _clone_scene(scene: dict) -> dict:
     """Return a defensive shallow-deep copy: scene dict + nested actions list
     + per-action shallow copies. Callers can iterate / mutate freely."""
+    raw_scope = scene.get("network_scope")
+    if isinstance(raw_scope, dict):
+        scope_clone: dict = {"mode": raw_scope.get("mode", "auto")}
+        if scope_clone["mode"] == "explicit":
+            scope_clone["network_ids"] = list(raw_scope.get("network_ids") or [])
+    else:
+        scope_clone = {"mode": "auto"}
     return {
         "id": scene["id"],
         "key": scene["key"],
@@ -1634,6 +1742,10 @@ def _clone_scene(scene: dict) -> dict:
         # Default True so a clone of a legacy scene (loaded before the
         # field existed) carries the safer abort-on-error behaviour.
         "stop_on_error": bool(scene.get("stop_on_error", True)),
+        # Default {"mode": "auto"} for legacy scenes loaded before the
+        # scope field existed. The clone is independent of the persisted
+        # dict so callers can mutate without aliasing.
+        "network_scope": scope_clone,
     }
 
 

@@ -681,10 +681,30 @@ export interface SceneAction {
   offset?: SceneOffsetConfig
 }
 
+/**
+ * Scene-level broadcast scope (network targeting override).
+ *
+ * - ``mode: 'auto'`` (default) — runtime derives scope from action targets.
+ * - ``mode: 'explicit'`` — operator-pinned set of network ids; per-action
+ *   target pickers in the editor restrict to in-scope networks.
+ *
+ * Missing field is treated as ``{mode: 'auto'}`` for back-compat with
+ * pre-scope-feature scenes.
+ */
+export type SceneNetworkScopeMode = 'auto' | 'explicit'
+
+export interface SceneNetworkScope {
+  mode: SceneNetworkScopeMode
+  /** Present only when ``mode === 'explicit'``. Non-empty, deduplicated. */
+  network_ids?: string[]
+}
+
 export interface Scene {
   key: string
   label: string
   stop_on_error?: boolean
+  /** Operator-pinned broadcast scope. Defaults to ``{mode: 'auto'}``. */
+  network_scope?: SceneNetworkScope
   actions: SceneAction[]
   created_ts?: number
   updated_ts?: number
@@ -802,4 +822,12 @@ export interface SceneCostResponse {
   per_action: SceneCostPerAction[]
   lora?: Record<string, unknown>
   error?: string
+  /** Scope-feature: networks the scene's broadcasts will actually reach.
+   * Auto-mode scenes derive this from action targets; explicit-mode
+   * scenes return the operator-pinned list (filtered for stale ids).
+   * Empty array means no resolvable broadcast scope (sync-only scene or
+   * all-stale explicit scope). */
+  resolved_network_ids?: string[]
+  /** Scope-feature: matches ``scene.network_scope.mode``. */
+  network_scope_mode?: SceneNetworkScopeMode
 }

@@ -562,6 +562,83 @@ class WebApiScenesRouteTests(unittest.TestCase):
         self.assertEqual(result[1], 400)
         self.assertEqual(self.ctx.sse.broadcasts, [])
 
+    # ---- network_scope ------------------------------------------------
+
+    def test_create_with_explicit_scope_persists(self):
+        self._set_body({
+            "label": "Scoped",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": ["net-a"]},
+        })
+        result = self._route("/api/scenes", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-a"]},
+        )
+
+    def test_create_without_scope_defaults_to_auto(self):
+        self._set_body({"label": "AutoMode", "actions": [{"kind": "sync"}]})
+        result = self._route("/api/scenes", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["scene"]["network_scope"], {"mode": "auto"})
+
+    def test_create_malformed_scope_returns_400(self):
+        self._set_body({
+            "label": "Bad",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": []},
+        })
+        result = self._route("/api/scenes", "POST")()
+        self.assertEqual(result[1], 400)
+
+    def test_update_can_set_explicit_scope(self):
+        self._set_body({"label": "X", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        self._set_body({
+            "network_scope": {"mode": "explicit", "network_ids": ["net-x"]},
+        })
+        result = self._route("/api/scenes/<key>", "PUT")("x")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-x"]},
+        )
+
+    def test_duplicate_copies_scope(self):
+        self._set_body({
+            "label": "Src",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": ["net-a"]},
+        })
+        self._route("/api/scenes", "POST")()
+        self._set_body({"label": "Copy"})
+        result = self._route("/api/scenes/<key>/duplicate", "POST")("src")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-a"]},
+        )
+
+    def test_estimate_includes_resolved_network_ids(self):
+        self._set_body({"label": "E", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        result = self._route("/api/scenes/<key>/estimate", "GET")("e")
+        self.assertTrue(result["ok"])
+        self.assertIn("resolved_network_ids", result)
+        self.assertIn("network_scope_mode", result)
+        self.assertEqual(result["network_scope_mode"], "auto")
+
+    def test_draft_estimate_accepts_scope_field(self):
+        self._set_body({
+            "label": "draft",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "auto"},
+        })
+        result = self._route("/api/scenes/estimate", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["network_scope_mode"], "auto")
+
     # ---- estimate -----------------------------------------------------
 
     def test_editor_schema_includes_offset_group_and_lora_params(self):

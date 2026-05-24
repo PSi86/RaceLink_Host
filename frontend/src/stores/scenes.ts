@@ -17,6 +17,7 @@ import type {
   SceneProgressEvent,
   SceneRunResult,
   ScenesListResponse,
+  SceneNetworkScope,
   SceneSchemaResponse,
   SceneSingleResponse,
   SceneTargetKindOption,
@@ -27,6 +28,10 @@ export interface SceneDraft {
   key: string | null
   label: string
   stop_on_error: boolean
+  /** Operator-pinned broadcast scope. Always present in the draft
+   * (defaults to ``{mode: 'auto'}``); persists round-trip through
+   * save/load. */
+  network_scope: SceneNetworkScope
   actions: SceneAction[]
 }
 
@@ -206,6 +211,10 @@ function sceneToDraft(scene: Scene): SceneDraft {
     key: scene.key,
     label: scene.label || '',
     stop_on_error: Boolean(scene.stop_on_error),
+    // Default missing scope to auto for legacy / pre-feature scenes.
+    // Explicit-mode scope deep-copies its network_ids so editor edits
+    // never mutate the persisted store entry.
+    network_scope: normalizeScopeForDraft(scene.network_scope),
     // Adapt each action from the wire shape to the editor's uniform
     // ``params``-everywhere shape. ``adoptAction`` clones each action
     // (including children) so the editor can mutate freely without
@@ -215,7 +224,24 @@ function sceneToDraft(scene: Scene): SceneDraft {
 }
 
 function emptyDraft(): SceneDraft {
-  return { key: null, label: '', stop_on_error: false, actions: [] }
+  return {
+    key: null,
+    label: '',
+    stop_on_error: false,
+    network_scope: { mode: 'auto' },
+    actions: [],
+  }
+}
+
+/** Normalise a scope from the wire shape into the editor's draft shape.
+ *
+ * ``undefined`` / missing → ``{mode: 'auto'}`` (pre-feature back-compat).
+ * Explicit mode deep-copies ``network_ids`` so editor mutations don't
+ * leak back into the store's persisted Scene record.
+ */
+function normalizeScopeForDraft(raw: SceneNetworkScope | undefined): SceneNetworkScope {
+  if (!raw || raw.mode !== 'explicit') return { mode: 'auto' }
+  return { mode: 'explicit', network_ids: [...(raw.network_ids ?? [])] }
 }
 
 export const useScenesStore = defineStore('scenes', () => {
@@ -329,6 +355,11 @@ export const useScenesStore = defineStore('scenes', () => {
   const cost = ref<{
     total: SceneCostResponse['total']
     per_action: SceneCostPerAction[]
+    /** Networks the scene's broadcasts will actually reach
+     * (resolved server-side via ``scene_network_ids``). Powers the
+     * editor's "Fan-out: N gateways" pill. */
+    resolved_network_ids?: string[]
+    network_scope_mode?: SceneCostResponse['network_scope_mode']
   } | null>(null)
   const costByAction = ref<Map<SceneAction, SceneCostPerAction>>(new Map())
   const costError = ref<string | null>(null)
@@ -573,7 +604,14 @@ export const useScenesStore = defineStore('scenes', () => {
 
   // ---- CRUD ---------------------------------------------------------
 
-  async function save(): Promise<{ ok: boolean; error?: string; scene?: Scene }> {
+  async function save(): Promise<{
+    ok: boolean
+    error?: string
+    scene?: Scene
+    /** Set when the server rejects with code: 'scope_violation' so the
+     * editor can scroll the offending row into view. */
+    violation?: { code: string; offendingActionIndex?: number; detail?: unknown }
+  }> {
     if (!draft.value) return { ok: false, error: 'no draft' }
     const label = draft.value.label.trim()
     if (!label) return { ok: false, error: 'Label is required.' }
@@ -583,14 +621,36 @@ export const useScenesStore = defineStore('scenes', () => {
     const body = {
       label,
       stop_on_error: draft.value.stop_on_error,
+      // Always emit the scope. Server's canonicalizer normalises auto
+      // → ``{mode: 'auto'}`` regardless, so emitting it explicitly
+      // keeps the wire shape uniform across update + create.
+      network_scope: draft.value.network_scope,
       actions: draft.value.actions.map(emitAction),
     }
     const isUpdate = Boolean(draft.value.key)
     const res = (isUpdate
       ? await apiPut(`/api/scenes/${draft.value.key}`, body)
-      : await apiPost('/api/scenes', body)) as Partial<SceneSingleResponse> & { error?: string }
+      : await apiPost('/api/scenes', body)) as Partial<SceneSingleResponse> & {
+        error?: string
+        detail?: { code?: string; offending_action_index?: number; [k: string]: unknown }
+      }
     if (!res?.ok || !res.scene) {
-      return { ok: false, error: typeof res?.error === 'string' ? res.error : 'Save failed.' }
+      const out: { ok: false; error: string; violation?: { code: string; offendingActionIndex?: number; detail?: unknown } } = {
+        ok: false,
+        error: typeof res?.error === 'string' ? res.error : 'Save failed.',
+      }
+      // Scope-feature: surface the structured violation so the editor
+      // can highlight + scroll to the offending action row.
+      if (res?.detail && typeof res.detail === 'object' && typeof res.detail.code === 'string') {
+        out.violation = {
+          code: res.detail.code,
+          offendingActionIndex: typeof res.detail.offending_action_index === 'number'
+            ? res.detail.offending_action_index
+            : undefined,
+          detail: res.detail,
+        }
+      }
+      return out
     }
     await load()
     select(res.scene.key)
@@ -686,12 +746,21 @@ export const useScenesStore = defineStore('scenes', () => {
       const res = (await apiPost('/api/scenes/estimate', {
         label: d.label || 'draft',
         actions: actionsAtCall.map(emitAction),
+        // Send the scope so the server's estimate response carries
+        // the right ``resolved_network_ids`` + ``network_scope_mode``
+        // for the editor's Fan-out pill.
+        network_scope: d.network_scope,
       })) as Partial<SceneCostResponse> & { error?: string }
       if (!res?.ok || !res.total || !res.per_action) {
         costError.value = typeof res?.error === 'string' ? res.error : 'Estimate failed.'
         return
       }
-      cost.value = { total: res.total, per_action: res.per_action }
+      cost.value = {
+        total: res.total,
+        per_action: res.per_action,
+        resolved_network_ids: res.resolved_network_ids,
+        network_scope_mode: res.network_scope_mode,
+      }
       // Build the ref-keyed lookup so reorder-only mutations don't
       // produce a stale-positional flash on the per-row cost badge.
       const m = new Map<SceneAction, SceneCostPerAction>()

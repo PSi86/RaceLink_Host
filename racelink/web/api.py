@@ -27,7 +27,9 @@ from ..domain.flags import USER_FLAG_DEFS
 from ..domain.indicators import DEFAULT_INDICATE_DURATION_SEC, IndicatorType
 from ..domain.network_boundary import (
     NetworkBoundaryViolation,
+    SceneScopeViolation,
     validate_group_membership,
+    validate_scene_scope_consistency,
 )
 from ..domain.node_config import serialize_node_config_schema
 from ..services import OTAWorkflowService, SpecialsService
@@ -2591,6 +2593,19 @@ def register_api_routes(bp, ctx):
     def _runner_unavailable():
         return jsonify({"ok": False, "error": "scene runner not available"}), 503
 
+    def _enforce_scene_scope(scene: dict) -> None:
+        """Cross-action subset check for explicit ``network_scope``.
+
+        Re-raises :class:`SceneScopeViolation` when the canonicalized
+        scene's explicit scope references unknown networks OR an
+        action's target resolves to a network outside the scope.
+        Auto-mode scenes always pass. No-op (silent return) when the
+        controller is not wired (e.g. unit test bypassing the route).
+        """
+        if ctx.rl_instance is None:
+            return
+        validate_scene_scope_consistency(scene, controller=ctx.rl_instance)
+
     @bp.route("/api/scenes", methods=["GET"])
     def api_scenes_list():
         if scenes_service is None:
@@ -2726,9 +2741,26 @@ def register_api_routes(bp, ctx):
                 actions=body.get("actions"),
                 key=body.get("key"),
                 stop_on_error=body.get("stop_on_error"),
+                network_scope=body.get("network_scope"),
             )
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
+        # Cross-action scope consistency check happens AFTER service
+        # canonicalization so the structural shape is already valid.
+        # Repository access lives at this layer (the service is
+        # repository-free for testability).
+        try:
+            _enforce_scene_scope(scene)
+        except SceneScopeViolation as ex:
+            # Roll back the just-created scene so the operator can
+            # retry with corrected payload without leaving an
+            # invalid record behind.
+            scenes_service.delete(scene["key"])
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
         _sse_refresh(ctx, {state_scope.SCENES})
         return jsonify({"ok": True, "scene": scene})
 
@@ -2737,17 +2769,41 @@ def register_api_routes(bp, ctx):
         if scenes_service is None:
             return _scenes_unavailable()
         body = request.get_json(silent=True) or {}
+        # Snapshot the pre-update scene so we can roll back if scope
+        # validation rejects the post-update shape. update() returns
+        # the new shape; the previous shape lives in the service cache
+        # which we can re-fetch via get().
+        prev_scene = scenes_service.get(key)
         try:
             scene = scenes_service.update(
                 key,
                 label=body.get("label"),
                 actions=body.get("actions"),
                 stop_on_error=body.get("stop_on_error"),
+                network_scope=body.get("network_scope"),
             )
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
         if scene is None:
             return jsonify({"ok": False, "error": "scene not found"}), 404
+        try:
+            _enforce_scene_scope(scene)
+        except SceneScopeViolation as ex:
+            # Restore the previous scene shape so the rejected update
+            # doesn't leave a partially-applied scope on disk.
+            if prev_scene is not None:
+                scenes_service.update(
+                    key,
+                    label=prev_scene.get("label"),
+                    actions=prev_scene.get("actions"),
+                    stop_on_error=prev_scene.get("stop_on_error"),
+                    network_scope=prev_scene.get("network_scope"),
+                )
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
         _sse_refresh(ctx, {state_scope.SCENES})
         return jsonify({"ok": True, "scene": scene})
 
@@ -2858,6 +2914,25 @@ def register_api_routes(bp, ctx):
                               known_group_ids=_known_group_ids_from_ctx(),
                               rl_preset_lookup=_rl_preset_lookup_for_estimator(),
                               device_lookup=_device_lookup_for_estimator())
+        # Surface the scene's resolved broadcast scope so the editor
+        # can render the "Fan-out: N gateways" pill and the operator
+        # sees which networks an Auto-mode scene would actually reach.
+        # ``scene_network_ids`` honours explicit scope (filtered against
+        # current network repo) or falls back to the action walk.
+        try:
+            from ..services.scene_network_scope import scene_network_ids
+            resolved_ids = list(
+                scene_network_ids(scene_dict, controller=ctx.rl_instance)
+            )
+        except Exception:
+            # swallow-ok: scope resolution is purely additive for the
+            # cost payload; a malformed scene must not break the
+            # primary cost numbers.
+            resolved_ids = []
+        scope_mode = "auto"
+        scope_field = scene_dict.get("network_scope") if isinstance(scene_dict, dict) else None
+        if isinstance(scope_field, dict) and scope_field.get("mode") == "explicit":
+            scope_mode = "explicit"
         return {
             "ok": True,
             "total": {
@@ -2877,6 +2952,8 @@ def register_api_routes(bp, ctx):
                 for a in cost.per_action
             ],
             "lora": lora_parameters(),
+            "resolved_network_ids": resolved_ids,
+            "network_scope_mode": scope_mode,
         }
 
     @bp.route("/api/scenes/<key>/estimate", methods=["GET"])
@@ -2904,13 +2981,18 @@ def register_api_routes(bp, ctx):
             # Round-trip the actions through the validator without touching
             # storage. ``replace_all`` is too heavy; we only need canonical
             # actions, so we build a fake scene dict.
-            from ..services.scenes_service import _canonical_actions  # local import
+            from ..services.scenes_service import (
+                _canonical_actions,
+                _canonical_network_scope,
+            )  # local imports
             canonical_actions = _canonical_actions(body.get("actions") or [])
+            canonical_scope = _canonical_network_scope(body.get("network_scope"))
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
         scene_dict = {
             "label": (body.get("label") or "").strip() or "draft",
             "actions": canonical_actions,
+            "network_scope": canonical_scope,
         }
         return jsonify(_scene_cost_payload(scene_dict))
 
