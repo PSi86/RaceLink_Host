@@ -1365,5 +1365,255 @@ class WebApiStaticGuardTests(unittest.TestCase):
         self.assertNotIn("get_specials_config", free_names)
 
 
+# ---------------------------------------------------------------------
+# Per-device / per-group network-migration routes
+# (POST /api/devices/migrate-network, POST /api/groups/<id>/migrate-network)
+# ---------------------------------------------------------------------
+
+class _MigrationRouteContext(_FakeContext):
+    """Extends ``_FakeContext`` with the migration_service + group/
+    network repositories + a TaskManager that records but does not
+    actually run jobs (the body-validation paths return BEFORE the
+    runner fires, and the happy-path tests assert on the task meta
+    only — the service-level tests in test_rf_migration_service.py
+    cover the actual migration outcomes)."""
+
+    def __init__(self, *, devices=None, groups=None):
+        super().__init__()
+        self._fake_devs = list(devices or [])
+        self._fake_groups = list(groups or [])
+
+        # Tasks: record start + meta, never actually run the runner.
+        started: list = []
+
+        class _Tasks:
+            @staticmethod
+            def is_running():
+                return False
+
+            @staticmethod
+            def busy_response():
+                return ({"ok": False, "error": "busy"}, 409)
+
+            @staticmethod
+            def start(name, runner, *, meta=None):
+                started.append({"name": name, "meta": dict(meta or {})})
+                return {"id": f"task-{len(started)}", "name": name}
+
+            @staticmethod
+            def update(meta=None):
+                pass
+
+            @staticmethod
+            def snapshot():
+                return {}
+
+        self.tasks = _Tasks()
+        self.tasks_started = started
+
+        # SSE stub that records refreshes for assertions.
+        broadcasts: list = []
+
+        class _Sse:
+            @staticmethod
+            def ensure_transport_hooked(_rl):
+                pass
+
+            broadcasts_list = broadcasts
+
+            master = type("Master", (), {"snapshot": staticmethod(lambda: {})})()
+
+        # Provide both ``ctx.sse`` (object) and a recording helper.
+        self.sse = _Sse()
+        self.sse_broadcasts = broadcasts
+
+        # Migration service stub: records calls but returns immediately.
+        class _MigrationService:
+            calls: list = []
+
+            @staticmethod
+            def migrate_devices_to(**kw):
+                _MigrationService.calls.append({"fn": "devices", **kw})
+                return {"ok": True, "summary": {}, "per_device": [], "stranded": []}
+
+            @staticmethod
+            def migrate_group_to(**kw):
+                _MigrationService.calls.append({"fn": "group", **kw})
+                return {"ok": True, "summary": {}, "per_device": [], "stranded": [], "group_id": kw.get("group_id")}
+
+        # Network + group + device repos used by the block-mode pre-check
+        # and the group-route's member lookup.
+        class _Repo:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def list(self):
+                return list(self._items)
+
+        ctx_devs = self._fake_devs
+        ctx_groups = self._fake_groups
+
+        class _RL:
+            rf_migration_service = _MigrationService
+            device_repository = _Repo(ctx_devs)
+            group_repository = _Repo(ctx_groups)
+            uiPresetList = []
+
+            @staticmethod
+            def getDeviceFromAddress(mac):
+                target = str(mac or "").upper()
+                for d in ctx_devs:
+                    if str(getattr(d, "addr", "") or "").upper() == target:
+                        return d
+                return None
+
+        self.rl_instance = _RL()
+        self.migration_service = _MigrationService
+
+
+class MigrateNetworkRouteTests(unittest.TestCase):
+    """Tests for POST /api/groups/migrate-network — the single
+    consolidated entry point for moving one or more groups (with
+    their members) onto a target network. The previous per-device
+    + per-group endpoints were removed in favour of this bulk path,
+    matching the operator-facing UI consolidation (one
+    ManageGroupsDialog for both reorder + move)."""
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+
+    def _make(self, *, devices=None, groups=None):
+        bp = _FakeBlueprint()
+        ctx = _MigrationRouteContext(devices=devices or [], groups=groups or [])
+        self.api_module.register_api_routes(bp, ctx)
+        return bp, ctx
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    def _route(self, bp):
+        return bp.routes[("/api/groups/migrate-network", ("POST",))]
+
+    def test_missing_group_ids_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"target_network_id": "net-b"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("group_ids required", result[0]["error"])
+
+    def test_empty_group_ids_list_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"group_ids": [], "target_network_id": "net-b"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+
+    def test_missing_target_network_returns_400(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        bp, _ctx = self._make(groups=groups)
+        self._set_body({"group_ids": [0]})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("target_network_id required", result[0]["error"])
+
+    def test_bad_offline_mode_returns_400(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        bp, _ctx = self._make(groups=groups)
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "weird",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("offline_mode must be", result[0]["error"])
+
+    def test_unknown_group_id_returns_404(self):
+        bp, _ctx = self._make(groups=[])
+        self._set_body({
+            "group_ids": [99],
+            "target_network_id": "net-b",
+            "offline_mode": "skip",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 404)
+        self.assertIn("unknown group_id", result[0]["error"])
+
+    def test_block_mode_rejects_offline_member_with_structured_detail(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        offline = RL_Device("AABBCC112233", RL_Dev_Type.NODE_WLED_REV5,
+                             "x", groupId=0)
+        offline.link_online = False
+        bp, _ctx = self._make(groups=groups, devices=[offline])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertEqual(result[0]["detail"]["code"], "offline_block")
+        self.assertEqual(result[0]["detail"]["offline_macs"], ["AABBCC112233"])
+
+    def test_block_mode_passes_when_all_members_online(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        member = RL_Device("AABBCC112233", RL_Dev_Type.NODE_WLED_REV5,
+                            "x", groupId=0)
+        member.link_online = True
+        bp, ctx = self._make(groups=groups, devices=[member])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(ctx.tasks_started), 1)
+        # block-mode promotes to skip internally when no actual
+        # offline member is present.
+        self.assertEqual(ctx.tasks_started[0]["meta"]["offline_mode"], "skip")
+        self.assertEqual(ctx.tasks_started[0]["meta"]["group_ids"], [0])
+
+    def test_multiple_groups_in_single_call_starts_one_task(self):
+        groups = [
+            RL_DeviceGroup("A", static_group=0, dev_type=0),
+            RL_DeviceGroup("B", static_group=0, dev_type=0),
+        ]
+        a1 = RL_Device("AABBCC111111", RL_Dev_Type.NODE_WLED_REV5, "a1", groupId=0)
+        b1 = RL_Device("AABBCC222222", RL_Dev_Type.NODE_WLED_REV5, "b1", groupId=1)
+        a1.link_online = True
+        b1.link_online = True
+        bp, ctx = self._make(groups=groups, devices=[a1, b1])
+        self._set_body({
+            "group_ids": [0, 1],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        # Single TaskManager job for the multi-group case — one
+        # progress stream covering all groups.
+        self.assertEqual(len(ctx.tasks_started), 1)
+        self.assertEqual(ctx.tasks_started[0]["meta"]["group_ids"], [0, 1])
+        self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 2)
+
+    def test_empty_group_membership_still_starts_task(self):
+        """Operator can flip an empty group's network_id (e.g. to
+        pre-stage a group before populating it on the target)."""
+        groups = [RL_DeviceGroup("Empty", static_group=0, dev_type=0)]
+        bp, ctx = self._make(groups=groups, devices=[])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

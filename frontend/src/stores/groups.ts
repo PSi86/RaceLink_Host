@@ -77,6 +77,36 @@ export const useGroupsStore = defineStore('groups', () => {
     return { ok: true }
   }
 
+  /** Move one or more groups (with all their members) to a different
+   * network in a single TaskManager job.
+   *
+   * Server flips both each ``group.network_id`` and every member
+   * device's ``device.network_id``. Offline members handled per
+   * ``mode``:
+   *   - ``block`` (default): HTTP 400 with ``detail.offline_macs``
+   *     if any member is offline (the caller dialog offers
+   *     skip/force).
+   *   - ``skip``: metadata flip only for offline members; no wire
+   *     push. Channel Scan recovers them later.
+   *   - ``force``: try the wire push anyway (longer timeouts).
+   *
+   * Returns the raw API payload — typically ``{ok, task}`` on
+   * success or ``{ok: false, error, detail}`` on rejection.
+   *
+   * Single-group migration = a list with one id; the backend
+   * validates an empty list as 400. */
+  async function setGroupsNetwork(
+    groupIds: number[],
+    targetNetworkId: string,
+    mode: 'block' | 'skip' | 'force' = 'block',
+  ) {
+    return apiPost('/api/groups/migrate-network', {
+      group_ids: groupIds,
+      target_network_id: targetNetworkId,
+      offline_mode: mode,
+    })
+  }
+
   return {
     groups,
     selGroupId,
@@ -86,5 +116,6 @@ export const useGroupsStore = defineStore('groups', () => {
     createGroup,
     deleteGroup,
     renameGroup,
+    setGroupsNetwork,
   }
 })

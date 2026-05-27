@@ -307,12 +307,20 @@ function onAddAction() {
 </script>
 
 <template>
-  <section class="flex h-full min-h-0 flex-col gap-4 overflow-auto rounded-[10px] border border-border bg-card p-2.5">
-    <p v-if="!draft" class="text-sm text-muted-foreground">
+  <!-- Editor shell. Two-row flex column: a scrolling content area
+       above a non-scrolling footer. Splitting the scroll viewport
+       from the footer keeps the footer truly fixed at the bottom of
+       the editor pane — a sticky-bottom child would leak the
+       section's padding-bottom beneath itself once the operator
+       scrolled all the way down. -->
+  <section class="flex h-full min-h-0 flex-col overflow-hidden rounded-[10px] border border-border bg-card">
+    <p v-if="!draft" class="p-2.5 text-sm text-muted-foreground">
       Pick a scene on the left, or click <strong>+ New</strong> to create one.
     </p>
 
     <template v-else>
+      <!-- Scrolling content area: header + action list + add-action row -->
+      <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-2.5">
       <!-- Header: label + scope widget + stop_on_error -->
       <div class="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
         <label class="grid gap-1.5 text-sm">
@@ -400,60 +408,71 @@ function onAddAction() {
         </select>
         <Button type="button" size="sm" variant="secondary" @click="onAddAction">+ Add</Button>
       </div>
-
-      <!-- Run pip strip + scene-total cost badge. Sits above the
-           action bar so the post-run summary is visible while the
-           action buttons stay anchored at the bottom. The badge is
-           rendered unconditionally (the chip reserves its own slot
-           when no estimate is available yet) so the row keeps a
-           stable height across loading / loaded / error states — no
-           vertical layout shift when ``loadCost`` resolves. -->
-      <div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">
-        <SceneRunPipStrip />
-        <!-- Right-aligned cost group: keeps the loading hint / error
-             text and the badge as siblings so ``ml-auto`` lives on the
-             wrapper, not on whichever child happens to be in the DOM
-             this render. ``costError`` keeps the previous figures on
-             validation failure so the operator still sees the last
-             good estimate next to the new error; the badge slot stays
-             reserved either way. -->
-        <div class="ml-auto flex items-center gap-3">
-          <span v-if="scenes.costError" class="text-xs text-destructive">
-            {{ scenes.costError }}
-          </span>
-          <span
-            v-else-if="scenes.costLoading && !scenes.cost?.total"
-            class="text-xs text-muted-foreground"
-          >
-            Estimating…
-          </span>
-          <SceneCostBadge
-            :cost="scenes.cost?.total ?? null"
-            :actual-ms="totalActualMs"
-            total
-          />
-        </div>
       </div>
+      <!-- /scrolling content area -->
 
-      <!-- Action bar -->
-      <div class="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
-        <span v-if="isDirty" class="mr-auto text-xs text-muted-foreground">Unsaved changes.</span>
-        <template v-if="isExisting">
-          <Button type="button" variant="destructive" :disabled="submitting" @click="onDelete">Delete</Button>
-          <Button type="button" variant="secondary" :disabled="submitting" @click="onDuplicate">
-            Duplicate
+      <!-- Non-scrolling bottom footer: Run pip strip + cost-total badge
+           + action buttons (Delete / Duplicate / Save / Run). Lives as
+           a sibling of the scroll area, NOT inside it — that way the
+           section's bottom edge is always covered by the footer and
+           no scrollable content can peek through beneath it. Inherits
+           the section's ``bg-card`` background so the glass-plate
+           look stays consistent across the editor pane. -->
+      <div
+        class="flex flex-col gap-3 border-t border-border p-2.5"
+      >
+        <!-- Run pip strip + scene-total cost badge. The badge is
+             rendered unconditionally (the chip reserves its own slot
+             when no estimate is available yet) so the row keeps a
+             stable height across loading / loaded / error states — no
+             vertical layout shift when ``loadCost`` resolves. -->
+        <div class="flex flex-wrap items-center gap-3">
+          <SceneRunPipStrip />
+          <!-- Right-aligned cost group: keeps the loading hint / error
+               text and the badge as siblings so ``ml-auto`` lives on
+               the wrapper, not on whichever child happens to be in the
+               DOM this render. ``costError`` keeps the previous
+               figures on validation failure so the operator still sees
+               the last good estimate next to the new error; the badge
+               slot stays reserved either way. -->
+          <div class="ml-auto flex items-center gap-3">
+            <span v-if="scenes.costError" class="text-xs text-destructive">
+              {{ scenes.costError }}
+            </span>
+            <span
+              v-else-if="scenes.costLoading && !scenes.cost?.total"
+              class="text-xs text-muted-foreground"
+            >
+              Estimating…
+            </span>
+            <SceneCostBadge
+              :cost="scenes.cost?.total ?? null"
+              :actual-ms="totalActualMs"
+              total
+            />
+          </div>
+        </div>
+
+        <!-- Action bar -->
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <span v-if="isDirty" class="mr-auto text-xs text-muted-foreground">Unsaved changes.</span>
+          <template v-if="isExisting">
+            <Button type="button" variant="destructive" :disabled="submitting" @click="onDelete">Delete</Button>
+            <Button type="button" variant="secondary" :disabled="submitting" @click="onDuplicate">
+              Duplicate
+            </Button>
+          </template>
+          <Button variant="brand" type="button" :disabled="submitting" @click="onSave">{{ submitLabel }}</Button>
+          <Button
+            variant="run"
+            type="button"
+            :disabled="runDisabled"
+            :title="runHint || 'Run the scene synchronously'"
+            @click="onRun"
+          >
+            {{ running ? 'Running…' : 'Run' }}
           </Button>
-        </template>
-        <Button variant="brand" type="button" :disabled="submitting" @click="onSave">{{ submitLabel }}</Button>
-        <Button
-          variant="run"
-          type="button"
-          :disabled="runDisabled"
-          :title="runHint || 'Run the scene synchronously'"
-          @click="onRun"
-        >
-          {{ running ? 'Running…' : 'Run' }}
-        </Button>
+        </div>
       </div>
     </template>
   </section>

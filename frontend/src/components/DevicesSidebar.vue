@@ -19,11 +19,43 @@ const ui = useUiBus()
 
 // Stage 4 Block 1: per-network filter dropdown. ``null`` ↔ ``"all"``
 // represents "All Networks" (no filter applied). The store applies
-// the filter inside ``devices.filteredDevices``; the dropdown just
-// drives the store's ``selectedNetworkId`` slot.
+// the filter inside ``devices.filteredDevices`` (right pane) and
+// the sidebar mirrors it on the groups list via ``visibleGroups``
+// below. The dropdown just drives the store's ``selectedNetworkId``
+// slot — both filter sites read from it.
 const networkFilter = computed<string>({
   get: () => networks.selectedNetworkId ?? 'all',
   set: (value: string) => networks.setNetworkFilter(value === 'all' ? null : value),
+})
+
+/** Operator-visible groups list, scoped to the active network
+ *  filter. ``All Networks`` (the dropdown default) returns every
+ *  group unchanged. Otherwise: static groups (``Unconfigured`` /
+ *  ``All WLED Nodes``) stay visible under every filter because
+ *  they are network-agnostic by design — the remaining
+ *  user-created groups are matched by ``network_id`` against the
+ *  filter, with the same ``null → defaultNetworkId`` fallback the
+ *  device-store filter uses so legacy / unmigrated groups stay
+ *  consistent with their devices.
+ *
+ *  Order is preserved (``filter`` keeps insertion order) so a
+ *  reorder applied via the Manage-groups dialog still shows the
+ *  same sequence under any filter.
+ *
+ *  Selection (``groups.selGroupId``) is left alone on purpose: if
+ *  the operator filters away the currently-selected group, the
+ *  sidebar simply renders no highlighted row and the right pane
+ *  shows the (intersection-empty) device list. Clicking another
+ *  visible group or switching back to ``All Networks`` restores
+ *  the view without us having to second-guess intent. */
+const visibleGroups = computed<Group[]>(() => {
+  const nid = networks.selectedNetworkId
+  if (nid === null) return groups.groups
+  return groups.groups.filter((g) => {
+    if (g.static || g.id === 0) return true
+    const gnid = g.network_id ?? networks.defaultNetworkId
+    return gnid === nid
+  })
 })
 
 interface GroupAggregate {
@@ -120,8 +152,28 @@ function onNewGroup() {
   ui.requestNewGroup()
 }
 
-function onReorderGroups() {
-  ui.requestResortGroups()
+function onManageGroups() {
+  ui.requestManageGroups()
+}
+
+/** Network badge class for a group row. ``null`` / unbound → the
+ * "Default" placeholder badge from the networks store; this keeps
+ * legacy groups (loaded pre-Stage-2) visually consistent with bound
+ * ones. */
+function groupNetworkBadgeClass(g: Group): string {
+  return networks.colorOf(g.network_id ?? networks.defaultNetworkId)
+}
+
+function groupNetworkLabel(g: Group): string {
+  return networks.nameOf(g.network_id ?? networks.defaultNetworkId)
+}
+
+/** Static groups ("Unconfigured", "All WLED Nodes") are network-
+ * agnostic by design — they should NOT render a network badge. The
+ * sidebar row hides the badge for them; the ManageGroupsDialog also
+ * excludes them from the movable set. */
+function hasNetworkBadge(g: Group): boolean {
+  return !g.static && Number(g.id) !== 0
 }
 
 // Inline-rename for group names. Same hover-pencil pattern the
@@ -223,9 +275,9 @@ function onEditGroupInputMount(el: unknown) {
       <div class="flex items-center gap-1">
         <button
           type="button"
-          title="Reorder groups"
-          aria-label="Reorder groups"
-          @click="onReorderGroups"
+          title="Manage groups (reorder + move to network)"
+          aria-label="Manage groups"
+          @click="onManageGroups"
         >
           <ArrowUpDown class="h-4 w-4" />
         </button>
@@ -234,7 +286,7 @@ function onEditGroupInputMount(el: unknown) {
     </div>
     <ul class="m-0 min-h-0 flex-1 list-none overflow-auto p-0">
       <li
-        v-for="g in groups.groups"
+        v-for="g in visibleGroups"
         :key="g.id"
         :class="[
           'group flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-2 text-[13px] hover:bg-[#1f1f28]',
@@ -245,6 +297,20 @@ function onEditGroupInputMount(el: unknown) {
         ]"
         @click="selectGroup(g)"
       >
+        <!-- Network badge LEFT of the group name. Operator-movable
+             groups only — static groups + Unconfigured stay
+             network-agnostic by design and have no badge. The badge
+             is read-only here; moving the group to a different
+             network goes through the ManageGroupsDialog (header
+             "Reorder groups" button → opens the unified dialog). -->
+        <span
+          v-if="hasNetworkBadge(g) && editingGroupId !== g.id"
+          class="flex-none rounded px-1.5 py-0.5 text-[10px] font-medium"
+          :class="groupNetworkBadgeClass(g)"
+          :title="`Network: ${groupNetworkLabel(g)}`"
+        >
+          {{ groupNetworkLabel(g) }}
+        </span>
         <!-- Edit mode: input replaces name + pencil. ``@click.stop`` on
              the input keeps a stray click from re-selecting the group
              row (which would not be a bug per se, but feels jittery). -->

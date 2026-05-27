@@ -35,24 +35,25 @@ interface ChannelsResponse {
 
 /**
  * A stable, deterministic colour assignment per network id so the
- * device-table badge stays visually consistent across reloads.
- * Picks one of nine high-contrast hues based on a tiny FNV-1a hash
- * of the id — operators see "Track A is always green" without us
- * having to persist a colour choice.
+ * sidebar / dialog badges stay visually consistent across reloads.
+ * Curated 2026-05-25: dropped loud Tailwind 200/900 hues
+ * (amber/rose/orange/fuchsia/lime) in favour of a cooler, more
+ * cohesive set that reads as a quiet tag against the dark theme.
+ * All entries use a tinted dark-mode fill at ~50 % alpha plus a
+ * 300-weight foreground for contrast — softer than the previous
+ * solid-200 light-mode pairs without sacrificing legibility.
  *
- * Returns Tailwind classes (background + text) rather than raw
- * colour values so the WebUI's existing dark-mode tokens apply.
+ * Picks one of six hues based on a tiny FNV-1a hash of the id, so
+ * operators see "this network is always cyan" without us having
+ * to persist a colour choice.
  */
 const _PALETTE = [
-  'bg-emerald-200 text-emerald-900 dark:bg-emerald-900/60 dark:text-emerald-200',
-  'bg-sky-200 text-sky-900 dark:bg-sky-900/60 dark:text-sky-200',
-  'bg-amber-200 text-amber-900 dark:bg-amber-900/60 dark:text-amber-200',
-  'bg-rose-200 text-rose-900 dark:bg-rose-900/60 dark:text-rose-200',
-  'bg-violet-200 text-violet-900 dark:bg-violet-900/60 dark:text-violet-200',
-  'bg-teal-200 text-teal-900 dark:bg-teal-900/60 dark:text-teal-200',
-  'bg-orange-200 text-orange-900 dark:bg-orange-900/60 dark:text-orange-200',
-  'bg-fuchsia-200 text-fuchsia-900 dark:bg-fuchsia-900/60 dark:text-fuchsia-200',
-  'bg-lime-200 text-lime-900 dark:bg-lime-900/60 dark:text-lime-200',
+  'bg-teal-900/55 text-teal-200 dark:bg-teal-900/55 dark:text-teal-200',
+  'bg-sky-900/55 text-sky-200 dark:bg-sky-900/55 dark:text-sky-200',
+  'bg-indigo-900/55 text-indigo-200 dark:bg-indigo-900/55 dark:text-indigo-200',
+  'bg-violet-900/55 text-violet-200 dark:bg-violet-900/55 dark:text-violet-200',
+  'bg-emerald-900/55 text-emerald-200 dark:bg-emerald-900/55 dark:text-emerald-200',
+  'bg-slate-700/70 text-slate-200 dark:bg-slate-700/70 dark:text-slate-200',
 ] as const
 
 function _hashId(id: string): number {
@@ -68,9 +69,9 @@ function _hashId(id: string): number {
 
 export function networkBadgeClasses(networkId: string | null | undefined): string {
   if (!networkId) {
-    // Unbound / Unconfigured: neutral palette so the cell stays
-    // readable without screaming "you forgot to configure something".
-    return 'bg-slate-200 text-slate-700 dark:bg-slate-700/60 dark:text-slate-200'
+    // Unbound / Unconfigured: muted neutral so the cell reads as
+    // "no network" without competing with the real badges.
+    return 'bg-slate-800/60 text-slate-400 dark:bg-slate-800/60 dark:text-slate-400'
   }
   return _PALETTE[_hashId(networkId) % _PALETTE.length] ?? _PALETTE[0]
 }

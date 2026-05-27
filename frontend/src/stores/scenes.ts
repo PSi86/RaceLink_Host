@@ -810,6 +810,12 @@ export const useScenesStore = defineStore('scenes', () => {
         actions: d.actions.map(emitAction),
         stop_on_error: d.stop_on_error,
         label: d.label,
+        // Include the draft's network_scope so the runner's broadcast
+        // fan-out honours it on a draft Run, not just a saved-scene Run.
+        // Without this the backend's draft path falls through to the
+        // persisted scope (or auto-mode), silently widening to every
+        // network on broadcast actions.
+        network_scope: d.network_scope,
       })) as { ok?: boolean; result?: SceneRunResult; error?: string }
       if (!res?.ok) {
         return { ok: false, error: typeof res?.error === 'string' ? res.error : 'Run failed.' }

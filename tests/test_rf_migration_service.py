@@ -158,6 +158,11 @@ class _FakeController:
                 return t
         return None
 
+    def transport_for_device(self, mac):
+        dev = self.getDeviceFromAddress(mac) if mac else None
+        net_id = getattr(dev, "network_id", None) if dev is not None else None
+        return self.transport_for_network(net_id)
+
     def getDeviceFromAddress(self, mac):
         target = str(mac or "").upper()
         for d in self.device_repository.list():
@@ -486,6 +491,463 @@ class _no_sleep:
 
     def __exit__(self, *_a):
         self._mod.time = self._orig_time
+
+
+# ---- Per-device / per-group migration (Stage 4 follow-up) -----------
+#
+# Pins:
+#   * migrate_devices_to flips device.network_id +
+#     last_known_rf_config on success (wire push) AND on metadata-only
+#     paths (offline skip / force-failure).
+#   * migrate_group_to flips group.network_id regardless of partial
+#     member-migration failure (operator intent).
+#   * Already-on-target devices are detected by network_id match
+#     (not last_known_rf_config — these moves are membership changes,
+#     not RF changes).
+#   * The service does NOT reboot the source gateway (unlike
+#     migrate_network_to). Only set_node_rf_config is called per
+#     online device; set_gateway_rf_config is never invoked.
+
+from racelink.domain.models import RL_DeviceGroup
+
+
+class _FakeGroupRepo:
+    """Group-id is the positional index in the list — mirrors the
+    production GroupRepository's convention."""
+
+    def __init__(self, groups):
+        self._items = list(groups)
+
+    def list(self):
+        return list(self._items)
+
+
+def _make_membership_service(
+    *, networks, groups, devices, gateway_service=None, node_results=None,
+):
+    """Same shape as :func:`_make_service` but builds a controller
+    with both network + device + group repos (the per-device
+    migration path needs all three)."""
+    gw = gateway_service or _FakeGatewayService(node_results=node_results)
+    ctrl = _FakeController(
+        networks=networks,
+        devices=devices,
+        transports=[_FakeTransport(getattr(n, "gateway_mac", "") or "") for n in networks if getattr(n, "gateway_mac", "")],
+        gateway_service=gw,
+        discovery_service=_FakeDiscovery([]),
+    )
+    ctrl.group_repository = _FakeGroupRepo(groups)
+    svc = RfMigrationService(controller=ctrl, bind_service=_FakeBindService())
+    return ctrl, gw, svc
+
+
+_TARGET_CFG = dict(_OLD_CFG, freq_hz=869_525_000)
+
+
+class MigrateDevicesToTests(unittest.TestCase):
+
+    def test_online_devices_push_and_flip_metadata(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        dev_1 = _device("AABBCC111111", network_id="net-a", link_online=True)
+        dev_2 = _device("AABBCC222222", network_id="net-a", link_online=True)
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[dev_1, dev_2],
+        )
+
+        res = svc.migrate_devices_to("net-b", ["AABBCC111111", "AABBCC222222"])
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["summary"]["push_count"], 2)
+        self.assertEqual(res["summary"]["pushed_ok"], 2)
+        self.assertEqual(res["summary"]["pushed_fail"], 0)
+        self.assertEqual(res["summary"]["metadata_flipped"], 2)
+        self.assertEqual(len(gw.node_calls), 2)
+        # Metadata flipped on each device.
+        self.assertEqual(dev_1.network_id, "net-b")
+        self.assertEqual(dev_2.network_id, "net-b")
+        self.assertEqual(dev_1.last_known_rf_config, _TARGET_CFG)
+        self.assertEqual(dev_2.last_known_rf_config, _TARGET_CFG)
+
+    def test_offline_skip_mode_flips_metadata_without_wire(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        offline_dev = _device("AABBCC111111", network_id="net-a", link_online=False)
+        online_dev = _device("AABBCC222222", network_id="net-a", link_online=True)
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[],
+            devices=[offline_dev, online_dev],
+        )
+
+        res = svc.migrate_devices_to(
+            "net-b", ["AABBCC111111", "AABBCC222222"],
+            offline_mode="skip",
+        )
+
+        # Online: wire push fired. Offline: NO wire push.
+        self.assertEqual(len(gw.node_calls), 1)
+        self.assertEqual(gw.node_calls[0]["mac"], "AABBCC222222")
+        # Both have metadata flipped — operator-intent semantics.
+        self.assertEqual(offline_dev.network_id, "net-b")
+        self.assertEqual(online_dev.network_id, "net-b")
+        self.assertEqual(res["summary"]["offline_skipped"], ["AABBCC111111"])
+        self.assertEqual(res["summary"]["pushed_ok"], 1)
+        # ok = True because offline-skip is a successful outcome here.
+        self.assertTrue(res["ok"])
+
+    def test_offline_force_mode_attempts_wire_push(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        offline_dev = _device("AABBCC111111", network_id="net-a", link_online=False)
+        # Force-mode push fails (offline device times out).
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[offline_dev],
+            node_results={"AABBCC111111": {"ok": False, "error": "timeout"}},
+        )
+
+        res = svc.migrate_devices_to(
+            "net-b", ["AABBCC111111"], offline_mode="force",
+        )
+
+        # Wire push was attempted (force mode).
+        self.assertEqual(len(gw.node_calls), 1)
+        # Metadata flipped despite the wire failure (operator intent
+        # + Channel-Scan recovery contract).
+        self.assertEqual(offline_dev.network_id, "net-b")
+        # Reported as stranded since the wire failed.
+        self.assertIn("AABBCC111111", res["stranded"])
+        self.assertEqual(res["summary"]["pushed_fail"], 1)
+        self.assertFalse(res["ok"])
+
+    def test_devices_already_on_target_skipped(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        already_dev = _device("AABBCC111111", network_id="net-b", link_online=True)
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[already_dev],
+        )
+
+        res = svc.migrate_devices_to("net-b", ["AABBCC111111"])
+
+        # Already on target — no wire push, no metadata flip needed.
+        self.assertEqual(gw.node_calls, [])
+        self.assertEqual(res["summary"]["already_on_target"], ["AABBCC111111"])
+        self.assertTrue(res["ok"])
+
+    def test_unknown_target_network_rejected(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a], groups=[],
+            devices=[_device("AABBCC111111", network_id="net-a")],
+        )
+
+        res = svc.migrate_devices_to("ghost-net", ["AABBCC111111"])
+        self.assertFalse(res["ok"])
+        self.assertIn("unknown target network_id", res["error"])
+
+    def test_target_network_without_rf_config_rejected(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=None)  # type: ignore
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[],
+            devices=[_device("AABBCC111111", network_id="net-a")],
+        )
+
+        res = svc.migrate_devices_to("net-b", ["AABBCC111111"])
+        self.assertFalse(res["ok"])
+        self.assertIn("no rf_config", res["error"])
+
+    def test_does_not_invoke_gateway_rf_config_switch(self):
+        """migrate_devices_to is a MEMBERSHIP migration, not a network
+        RF change. The source/target gateways stay on their persisted
+        configs — set_gateway_rf_config must NEVER fire."""
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[],
+            devices=[_device("AABBCC111111", network_id="net-a")],
+        )
+
+        svc.migrate_devices_to("net-b", ["AABBCC111111"])
+        self.assertEqual(gw.gateway_calls, [],
+                          "migrate_devices_to must not reboot any gateway")
+
+    def test_progress_callback_fires_per_device(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[],
+            devices=[
+                _device("AABBCC111111", network_id="net-a"),
+                _device("AABBCC222222", network_id="net-a"),
+            ],
+        )
+        events: list = []
+        # _emit_progress passes a single dict positional arg (matches
+        # the existing migrate_network_to contract).
+        svc.migrate_devices_to(
+            "net-b", ["AABBCC111111", "AABBCC222222"],
+            progress_cb=lambda payload: events.append(payload),
+        )
+        stages = {e.get("stage") for e in events}
+        self.assertIn("pre-check", stages)
+        self.assertIn("device-migration", stages)
+
+    def test_metadata_flipped_before_wire_push_and_source_transport_used(self):
+        """Bug 4 fix (2026-05-26): the per-device wire push must see
+        dev.network_id already flipped to target AND must route via
+        the SOURCE network's transport. Otherwise the post-reboot
+        IDENTIFY arriving on the target gateway routes its SET_GROUP
+        through the old gateway, racing the metadata flip.
+        """
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        dev = _device("AABBCC111111", network_id="net-a", link_online=True)
+
+        captured: dict = {}
+
+        class _CapturingGateway(_FakeGatewayService):
+            def set_node_rf_config(self, mac, rf_config, *,
+                                   transport=None, timeout_s=None):
+                # Freeze the call-site values so the assertions below
+                # see what the wire-push observed, not what the
+                # subsequent code paths set up.
+                captured["network_id_at_call"] = dev.network_id
+                captured["transport_ident"] = getattr(
+                    transport, "ident_mac", None,
+                )
+                return super().set_node_rf_config(
+                    mac, rf_config,
+                    transport=transport, timeout_s=timeout_s,
+                )
+
+        gw = _CapturingGateway()
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[dev],
+            gateway_service=gw,
+        )
+
+        svc.migrate_devices_to("net-b", ["AABBCC111111"])
+
+        # network_id was flipped BEFORE the wire push fired.
+        self.assertEqual(captured["network_id_at_call"], "net-b")
+        # The wire push went via GW-A (source) even though
+        # dev.network_id already points at GW-B (target). The migration
+        # engine pre-resolves source_transport and threads it through
+        # explicitly so the routing helper can't pick the wrong radio.
+        self.assertEqual(captured["transport_ident"], "GW-A")
+
+    def test_push_failure_keeps_metadata_flipped_and_marks_stranded(self):
+        """Bug 4 fix: a wire-push timeout is the EXPECTED outcome
+        (node reboots faster than the ACK can drain). The metadata
+        flip must survive — the IDENTIFY-driven SET_GROUP on the new
+        gateway resolves the stranded state automatically."""
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        dev = _device("AABBCC111111", network_id="net-a", link_online=True)
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[dev],
+            node_results={"AABBCC111111": {"ok": False, "error": "timeout"}},
+        )
+
+        res = svc.migrate_devices_to("net-b", ["AABBCC111111"])
+
+        self.assertEqual(dev.network_id, "net-b")
+        self.assertEqual(dev.last_known_rf_config, _TARGET_CFG)
+        self.assertIn("AABBCC111111", res["stranded"])
+        self.assertEqual(res["summary"]["pushed_fail"], 1)
+        # Metadata-flipped accounting reflects the up-front flip — one
+        # per push attempt, not one per success + one per failure.
+        self.assertEqual(res["summary"]["metadata_flipped"], 1)
+
+
+class MigrateGroupsToTests(unittest.TestCase):
+
+    def test_single_group_members_migrated_and_group_network_id_flipped(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-a")
+        groups = [
+            RL_DeviceGroup(name="Unconfigured", static_group=1, dev_type=0,
+                           network_id="net-a"),
+            team_a,
+        ]
+        dev_1 = _device("AABBCC111111", network_id="net-a", link_online=True)
+        dev_2 = _device("AABBCC222222", network_id="net-a", link_online=True)
+        dev_1.groupId = 1
+        dev_2.groupId = 1
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=groups,
+            devices=[dev_1, dev_2],
+        )
+
+        res = svc.migrate_groups_to("net-b", [1])
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["group_ids"], [1])
+        self.assertEqual(res["groups_flipped"], [1])
+        self.assertEqual(dev_1.network_id, "net-b")
+        self.assertEqual(dev_2.network_id, "net-b")
+        self.assertEqual(team_a.network_id, "net-b")
+
+    def test_multiple_groups_migrated_in_one_call(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        team_x = RL_DeviceGroup(name="Team X", static_group=0, dev_type=0,
+                                network_id="net-a")
+        team_y = RL_DeviceGroup(name="Team Y", static_group=0, dev_type=0,
+                                network_id="net-a")
+        groups = [
+            RL_DeviceGroup(name="Unconfigured", static_group=1, dev_type=0),
+            team_x,
+            team_y,
+        ]
+        dev_x1 = _device("AABBCC111111", network_id="net-a", link_online=True)
+        dev_y1 = _device("AABBCC222222", network_id="net-a", link_online=True)
+        dev_y2 = _device("AABBCC333333", network_id="net-a", link_online=True)
+        dev_x1.groupId = 1
+        dev_y1.groupId = 2
+        dev_y2.groupId = 2
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=groups,
+            devices=[dev_x1, dev_y1, dev_y2],
+        )
+
+        res = svc.migrate_groups_to("net-b", [1, 2])
+
+        self.assertTrue(res["ok"])
+        # All three members got wire pushes — across both groups.
+        self.assertEqual(len(gw.node_calls), 3)
+        # Both groups flipped.
+        self.assertEqual(team_x.network_id, "net-b")
+        self.assertEqual(team_y.network_id, "net-b")
+        # All member devices' metadata flipped.
+        self.assertEqual(dev_x1.network_id, "net-b")
+        self.assertEqual(dev_y1.network_id, "net-b")
+        self.assertEqual(dev_y2.network_id, "net-b")
+
+    def test_groups_flip_even_when_some_members_fail(self):
+        """Operator intent: 'these groups belong to network B now'.
+        Partial member-migration failure does NOT rollback the group
+        flips — stragglers surface in res['stranded']."""
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-a")
+        groups = [
+            RL_DeviceGroup(name="Unconfigured", static_group=1, dev_type=0),
+            team_a,
+        ]
+        dev_1 = _device("AABBCC111111", network_id="net-a", link_online=True)
+        dev_2 = _device("AABBCC222222", network_id="net-a", link_online=True)
+        dev_1.groupId = 1
+        dev_2.groupId = 1
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=groups, devices=[dev_1, dev_2],
+            node_results={"AABBCC222222": {"ok": False, "error": "timeout"}},
+        )
+
+        res = svc.migrate_groups_to("net-b", [1])
+
+        self.assertFalse(res["ok"])
+        self.assertIn("AABBCC222222", res["stranded"])
+        self.assertEqual(res["groups_flipped"], [1])
+        self.assertEqual(team_a.network_id, "net-b")
+
+    def test_unknown_group_id_rejects_whole_batch(self):
+        """Hard pre-check: if any requested group_id is unknown the
+        whole call fails — operator's intent for the OTHER groups
+        in the batch may have depended on the failed one (e.g. the
+        operator intended an atomic move). Fail-fast is safer than
+        partial success here."""
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        groups = [
+            RL_DeviceGroup(name="Unconfigured", static_group=1, dev_type=0),
+            RL_DeviceGroup(name="Team", static_group=0, dev_type=0,
+                           network_id="net-a"),
+        ]
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=groups, devices=[],
+        )
+
+        res = svc.migrate_groups_to("net-b", [1, 99])
+        self.assertFalse(res["ok"])
+        self.assertIn("unknown group_id", res["error"])
+        # Group 1 must NOT have been pre-emptively flipped before
+        # the validate stage failed.
+        self.assertEqual(groups[1].network_id, "net-a")
+
+    def test_empty_group_no_members_no_op_but_flips_group_id(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-a")
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[team_a], devices=[],
+        )
+
+        res = svc.migrate_groups_to("net-b", [0])
+        self.assertTrue(res["ok"])
+        self.assertEqual(gw.node_calls, [])
+        self.assertEqual(team_a.network_id, "net-b")
+
+    def test_empty_group_ids_list_rejected(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[], devices=[],
+        )
+        res = svc.migrate_groups_to("net-b", [])
+        self.assertFalse(res["ok"])
+        self.assertIn("non-empty list", res["error"])
+
+    def test_duplicate_group_ids_deduped(self):
+        net_a = RL_Network(id="net-a", name="A", gateway_mac="GW-A",
+                           rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", gateway_mac="GW-B",
+                           rf_config=dict(_TARGET_CFG))
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-a")
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[team_a], devices=[],
+        )
+        res = svc.migrate_groups_to("net-b", [0, 0, 0])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["group_ids"], [0])
+        self.assertEqual(res["groups_flipped"], [0])
 
 
 if __name__ == "__main__":  # pragma: no cover

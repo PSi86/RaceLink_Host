@@ -15,6 +15,11 @@
 //
 // Trigger is manual via the 🔧 button in the AppHeader; no auto-popup
 // per operator decision 2026-05-20.
+//
+// 2026-05-26: Cases B + C use the region+channel picker (same shipped
+// channel-table as NetworkManager / Channel-Scan) instead of raw RF
+// number inputs. The API still receives the full RfConfig — the channel
+// → RfConfig lookup happens here in the frontend.
 
 import { computed, ref, watch } from 'vue'
 
@@ -29,23 +34,21 @@ import {
 import { Button } from '@/components/ui/button'
 import { apiGet, apiPost } from '@/api/client'
 import { useToast } from '@/composables/useToast'
-
-interface RfConfig {
-  freq_hz: number
-  bw_khz_x10: number
-  sf: number
-  cr_den: number
-  sync_word: number
-  tx_power_dbm: number
-  preamble: number
-}
+import { useNetworksStore } from '@/stores/networks'
+import type { Channel, RfConfig } from '@/api/types'
 
 type CaseKey = 'A' | 'B' | 'C' | 'D'
+
+interface ChannelPick {
+  region: string
+  channelId: number | null
+}
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
 
 const toast = useToast()
+const networks = useNetworksStore()
 
 const step = ref<1 | 2>(1)
 const selectedCase = ref<CaseKey | null>(null)
@@ -53,24 +56,64 @@ const submitting = ref(false)
 const gatewayLoaded = ref(false)
 const currentGatewayCfg = ref<RfConfig | null>(null)
 
-// Case B form state — two configs (old / new).
-const oldCfg = ref<RfConfig>(_blankConfig())
-const newCfg = ref<RfConfig>(_blankConfig())
+// Case B picks — two channels (old / new).
+const oldPick = ref<ChannelPick>({ region: 'EU868', channelId: null })
+const newPick = ref<ChannelPick>({ region: 'EU868', channelId: null })
 
-// Case C form state — single config the gateway should adopt.
-const deviceCfg = ref<RfConfig>(_blankConfig())
+// Case C pick — single channel the gateway should adopt.
+const devicePick = ref<ChannelPick>({ region: 'EU868', channelId: null })
 
-function _blankConfig(): RfConfig {
-  return {
-    freq_hz: 867_700_000,
-    bw_khz_x10: 1250,
-    sf: 7,
-    cr_den: 5,
-    sync_word: 0x12,
-    tx_power_dbm: 14,
-    preamble: 8,
+const RF_FIELDS = [
+  'freq_hz', 'bw_khz_x10', 'sf', 'cr_den', 'sync_word',
+  'tx_power_dbm', 'preamble',
+] as const
+
+function rfConfigFromChannel(pick: ChannelPick): RfConfig | null {
+  if (pick.channelId == null) return null
+  const ch = networks.findChannel(pick.region, pick.channelId)
+  if (!ch) return null
+  // Strip the channel meta fields; the API expects the bare RfConfig.
+  const out: Partial<RfConfig> = {}
+  for (const f of RF_FIELDS) {
+    const value = (ch as unknown as Record<string, unknown>)[f]
+    if (value == null) return null
+    ;(out as Record<string, unknown>)[f] = Number(value)
   }
+  return out as RfConfig
 }
+
+/** Reverse lookup: given an RfConfig, find the first matching
+ *  region + channel id. Used to pre-fill picks from the gateway's
+ *  currently-active config so the operator doesn't have to re-pick
+ *  the obvious target. Returns null when no shipped channel matches
+ *  (custom / non-shipped config). */
+function reverseFindChannel(cfg: RfConfig | null): ChannelPick | null {
+  if (!cfg) return null
+  for (const [region, channels] of Object.entries(networks.channelsByRegion)) {
+    for (const ch of channels as Channel[]) {
+      let allMatch = true
+      for (const f of RF_FIELDS) {
+        const av = (ch as unknown as Record<string, unknown>)[f]
+        const bv = (cfg as unknown as Record<string, unknown>)[f]
+        if (av == null || bv == null || Number(av) !== Number(bv)) {
+          allMatch = false
+          break
+        }
+      }
+      if (allMatch) return { region, channelId: ch.id }
+    }
+  }
+  return null
+}
+
+function channelsForRegion(region: string): Channel[] {
+  return networks.channelsByRegion[region] ?? []
+}
+
+const availableRegions = computed<string[]>(() => {
+  const keys = Object.keys(networks.channelsByRegion)
+  return keys.length ? keys : ['EU868']
+})
 
 watch(
   () => props.open,
@@ -80,14 +123,26 @@ watch(
     selectedCase.value = null
     submitting.value = false
     gatewayLoaded.value = false
-    // Pre-load the gateway's current config so Case B/C forms default
+    // Channel table is shipped/compile-time on the server; cached after
+    // first fetch (see networks.loadChannels). Always await so the
+    // pre-fill below sees the populated map.
+    try {
+      await networks.loadChannels()
+    } catch {
+      // swallow — pre-fill falls back to defaults.
+    }
+    // Pre-load the gateway's current config so Case B/C picks default
     // to "what the gateway has right now" — that's almost always the
     // operator's intended NEW config.
     try {
       const r = await apiGet('/api/gateway/rf_config') as { ok?: boolean; rf_config?: RfConfig }
       if (r?.ok && r.rf_config) {
         currentGatewayCfg.value = r.rf_config
-        newCfg.value = { ...r.rf_config }
+        const found = reverseFindChannel(r.rf_config)
+        if (found) {
+          newPick.value = { ...found }
+          devicePick.value = { ...found }
+        }
         gatewayLoaded.value = true
       }
     } catch {
@@ -103,12 +158,6 @@ function close() {
 function pickCase(k: CaseKey) {
   selectedCase.value = k
   step.value = 2
-  // Case-specific form pre-fill on second visit.
-  if (k === 'C' && currentGatewayCfg.value) {
-    // Default device-side config = what we'd push to the gateway. The
-    // operator overrides with the device's actual settings.
-    deviceCfg.value = { ...currentGatewayCfg.value }
-  }
 }
 
 function backToStep1() {
@@ -141,13 +190,19 @@ async function runCaseA() {
 }
 
 async function runCaseB() {
+  const oldCfg = rfConfigFromChannel(oldPick.value)
+  const newCfg = rfConfigFromChannel(newPick.value)
+  if (!oldCfg || !newCfg) {
+    toast.error('Pick a region + channel for both OLD and NEW settings.')
+    return
+  }
   submitting.value = true
   try {
     const r = await apiPost('/api/onboarding/repair', {
       case: 'B',
       params: {
-        old_rf_config: oldCfg.value,
-        new_rf_config: newCfg.value,
+        old_rf_config: oldCfg,
+        new_rf_config: newCfg,
         target_macs: null,
       },
     }) as { ok?: boolean; task?: { id: number; name: string }; error?: string }
@@ -163,11 +218,16 @@ async function runCaseB() {
 }
 
 async function runCaseC() {
+  const deviceCfg = rfConfigFromChannel(devicePick.value)
+  if (!deviceCfg) {
+    toast.error('Pick a region + channel for the device-side settings.')
+    return
+  }
   submitting.value = true
   try {
     const r = await apiPost('/api/onboarding/repair', {
       case: 'C',
-      params: { device_rf_config: deviceCfg.value },
+      params: { device_rf_config: deviceCfg },
     }) as { ok?: boolean; task?: unknown; error?: string }
     if (r?.ok) {
       toast.show('Gateway-align started — gateway will reboot, then re-discover.')
@@ -181,14 +241,26 @@ async function runCaseC() {
 }
 
 const canSubmitB = computed(() =>
-  oldCfg.value.freq_hz > 0 && newCfg.value.freq_hz > 0,
+  oldPick.value.channelId != null && newPick.value.channelId != null,
 )
-const canSubmitC = computed(() => deviceCfg.value.freq_hz > 0)
+const canSubmitC = computed(() => devicePick.value.channelId != null)
+
+function formatPickSummary(pick: ChannelPick): string {
+  if (pick.channelId == null) return '— no channel selected —'
+  const ch = networks.findChannel(pick.region, pick.channelId)
+  if (!ch) return '— unknown channel —'
+  return [
+    `${ch.name}`,
+    `${(ch.freq_hz / 1_000_000).toFixed(3)} MHz`,
+    `SF${ch.sf}`,
+    `BW${ch.bw_khz_x10 / 10}`,
+  ].join(' · ')
+}
 </script>
 
 <template>
   <Dialog :open="open" @update:open="(v) => emit('update:open', v)">
-    <DialogContent class="max-w-2xl">
+    <DialogContent class="w-[min(900px,96vw)] max-w-[900px]">
       <DialogHeader>
         <DialogTitle>Pair Assistant</DialogTitle>
         <DialogDescription>
@@ -276,64 +348,77 @@ const canSubmitC = computed(() => deviceCfg.value.freq_hz > 0)
           <h4 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Old RF settings (currently on devices)
           </h4>
-          <div class="grid gap-2 sm:grid-cols-3">
+          <div class="grid gap-2 sm:grid-cols-2">
             <label class="grid gap-1 text-xs">
-              <span>Freq (Hz)</span>
-              <input v-model.number="oldCfg.freq_hz" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Region</span>
+              <select
+                v-model="oldPick.region"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+                @change="oldPick.channelId = null"
+              >
+                <option v-for="r in availableRegions" :key="r" :value="r">{{ r }}</option>
+              </select>
             </label>
             <label class="grid gap-1 text-xs">
-              <span>BW (×10 kHz)</span>
-              <input v-model.number="oldCfg.bw_khz_x10" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>SF</span>
-              <input v-model.number="oldCfg.sf" type="number" min="5" max="12" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>CR (4/N)</span>
-              <input v-model.number="oldCfg.cr_den" type="number" min="5" max="8" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>Sync Word</span>
-              <input v-model.number="oldCfg.sync_word" type="number" min="0" max="255" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>TX Power (dBm)</span>
-              <input v-model.number="oldCfg.tx_power_dbm" type="number" min="-9" max="22" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Channel</span>
+              <select
+                v-model.number="oldPick.channelId"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+              >
+                <option :value="null">— pick a channel —</option>
+                <option
+                  v-for="ch in channelsForRegion(oldPick.region)"
+                  :key="ch.id"
+                  :value="ch.id"
+                >
+                  {{ ch.name }} ({{ (ch.freq_hz / 1_000_000).toFixed(3) }} MHz · SF{{ ch.sf }} · BW{{ ch.bw_khz_x10 / 10 }})
+                </option>
+              </select>
             </label>
           </div>
+          <p class="mt-2 text-[10px] text-muted-foreground">
+            {{ formatPickSummary(oldPick) }}
+          </p>
         </section>
 
         <section class="rounded-md border border-border bg-card/40 p-3">
           <h4 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            New RF settings (target) <span v-if="gatewayLoaded" class="text-[10px] font-normal normal-case">pre-filled from current gateway</span>
+            New RF settings (target)
+            <span v-if="gatewayLoaded" class="text-[10px] font-normal normal-case">
+              pre-filled from current gateway
+            </span>
           </h4>
-          <div class="grid gap-2 sm:grid-cols-3">
+          <div class="grid gap-2 sm:grid-cols-2">
             <label class="grid gap-1 text-xs">
-              <span>Freq (Hz)</span>
-              <input v-model.number="newCfg.freq_hz" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Region</span>
+              <select
+                v-model="newPick.region"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+                @change="newPick.channelId = null"
+              >
+                <option v-for="r in availableRegions" :key="r" :value="r">{{ r }}</option>
+              </select>
             </label>
             <label class="grid gap-1 text-xs">
-              <span>BW (×10 kHz)</span>
-              <input v-model.number="newCfg.bw_khz_x10" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>SF</span>
-              <input v-model.number="newCfg.sf" type="number" min="5" max="12" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>CR (4/N)</span>
-              <input v-model.number="newCfg.cr_den" type="number" min="5" max="8" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>Sync Word</span>
-              <input v-model.number="newCfg.sync_word" type="number" min="0" max="255" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>TX Power (dBm)</span>
-              <input v-model.number="newCfg.tx_power_dbm" type="number" min="-9" max="22" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Channel</span>
+              <select
+                v-model.number="newPick.channelId"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+              >
+                <option :value="null">— pick a channel —</option>
+                <option
+                  v-for="ch in channelsForRegion(newPick.region)"
+                  :key="ch.id"
+                  :value="ch.id"
+                >
+                  {{ ch.name }} ({{ (ch.freq_hz / 1_000_000).toFixed(3) }} MHz · SF{{ ch.sf }} · BW{{ ch.bw_khz_x10 / 10 }})
+                </option>
+              </select>
             </label>
           </div>
+          <p class="mt-2 text-[10px] text-muted-foreground">
+            {{ formatPickSummary(newPick) }}
+          </p>
         </section>
 
         <DialogFooter>
@@ -353,33 +438,41 @@ const canSubmitC = computed(() => deviceCfg.value.freq_hz > 0)
         <section class="rounded-md border border-border bg-card/40 p-3">
           <h4 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Device RF settings (target for the gateway)
+            <span v-if="gatewayLoaded" class="text-[10px] font-normal normal-case">
+              pre-filled from current gateway
+            </span>
           </h4>
-          <div class="grid gap-2 sm:grid-cols-3">
+          <div class="grid gap-2 sm:grid-cols-2">
             <label class="grid gap-1 text-xs">
-              <span>Freq (Hz)</span>
-              <input v-model.number="deviceCfg.freq_hz" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Region</span>
+              <select
+                v-model="devicePick.region"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+                @change="devicePick.channelId = null"
+              >
+                <option v-for="r in availableRegions" :key="r" :value="r">{{ r }}</option>
+              </select>
             </label>
             <label class="grid gap-1 text-xs">
-              <span>BW (×10 kHz)</span>
-              <input v-model.number="deviceCfg.bw_khz_x10" type="number" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>SF</span>
-              <input v-model.number="deviceCfg.sf" type="number" min="5" max="12" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>CR (4/N)</span>
-              <input v-model.number="deviceCfg.cr_den" type="number" min="5" max="8" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>Sync Word</span>
-              <input v-model.number="deviceCfg.sync_word" type="number" min="0" max="255" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
-            </label>
-            <label class="grid gap-1 text-xs">
-              <span>TX Power (dBm)</span>
-              <input v-model.number="deviceCfg.tx_power_dbm" type="number" min="-9" max="22" class="h-8 rounded-md border border-input bg-background px-2 text-sm" />
+              <span>Channel</span>
+              <select
+                v-model.number="devicePick.channelId"
+                class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+              >
+                <option :value="null">— pick a channel —</option>
+                <option
+                  v-for="ch in channelsForRegion(devicePick.region)"
+                  :key="ch.id"
+                  :value="ch.id"
+                >
+                  {{ ch.name }} ({{ (ch.freq_hz / 1_000_000).toFixed(3) }} MHz · SF{{ ch.sf }} · BW{{ ch.bw_khz_x10 / 10 }})
+                </option>
+              </select>
             </label>
           </div>
+          <p class="mt-2 text-[10px] text-muted-foreground">
+            {{ formatPickSummary(devicePick) }}
+          </p>
         </section>
         <DialogFooter>
           <Button type="button" variant="secondary" @click="backToStep1">Back</Button>

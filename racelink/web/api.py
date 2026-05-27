@@ -805,6 +805,174 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
+    @bp.route("/api/groups/migrate-network", methods=["POST"])
+    def api_groups_migrate_network():
+        """Move one or more groups (with all their members) onto a
+        target network. Single TaskManager job; one combined progress
+        stream for the multi-group case.
+
+        Body shape::
+
+            {
+              "group_ids": [int, int, ...],
+              "target_network_id": "net-uuid",
+              "offline_mode": "block" | "skip" | "force"
+            }
+
+        Offline-mode semantics (mirrors the existing group-move
+        ``_apply_device_meta_updates`` pattern):
+
+        * ``block`` (default) — synchronous pre-check across every
+          requested group's members; HTTP 400 with structured
+          ``detail.offline_macs`` if any are offline.
+        * ``skip`` — metadata flip only for offline devices; wire
+          push for online ones. Channel Scan recovers offline
+          devices later.
+        * ``force`` — attempt the wire push for offline devices too;
+          metadata flips regardless of wire outcome.
+
+        Per-device + per-group metadata flips happen regardless of
+        partial wire failure — operator intent ("these groups now
+        belong to network B") governs. Stragglers surface in
+        ``result["stranded"]``.
+
+        Single-group move = list with one id; the body validation
+        rejects an empty list with HTTP 400.
+        """
+        migration = getattr(ctx.rl_instance, "rf_migration_service", None)
+        if migration is None:
+            return jsonify({"ok": False, "error": "migration service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        raw_gids = body.get("group_ids")
+        if not isinstance(raw_gids, list) or not raw_gids:
+            return jsonify({
+                "ok": False,
+                "error": "group_ids required (non-empty list of group ids)",
+            }), 400
+        target_network_id = body.get("target_network_id")
+        if not isinstance(target_network_id, str) or not target_network_id.strip():
+            return jsonify({
+                "ok": False,
+                "error": "target_network_id required",
+            }), 400
+        offline_mode = str(body.get("offline_mode") or "block").lower().strip()
+        if offline_mode not in {"block", "skip", "force"}:
+            return jsonify({
+                "ok": False,
+                "error": "offline_mode must be 'block', 'skip' or 'force'",
+            }), 400
+
+        # Dedupe + coerce the group_ids list early so the block-check
+        # and the runner see the same set.
+        clean_gids: list = []
+        seen_gids: set = set()
+        for raw in raw_gids:
+            try:
+                gid = int(raw) & 0xFF
+            except (TypeError, ValueError):
+                continue
+            if gid in seen_gids:
+                continue
+            seen_gids.add(gid)
+            clean_gids.append(gid)
+        if not clean_gids:
+            return jsonify({
+                "ok": False,
+                "error": "group_ids must contain at least one integer",
+            }), 400
+
+        # Resolve members across every requested group + offline
+        # pre-check. Unknown ids → 404 fast (mirrors the service's
+        # validate stage).
+        member_macs: list = []
+        offline_macs: list = []
+        seen_macs: set = set()
+        with ctx.rl_lock:
+            groups_list = list(ctx.rl_instance.group_repository.list() or ())
+            unknown: list = [
+                gid for gid in clean_gids
+                if not (0 <= gid < len(groups_list))
+            ]
+            if unknown:
+                return jsonify({
+                    "ok": False,
+                    "error": f"unknown group_id(s): {unknown}",
+                }), 404
+            gid_set = set(clean_gids)
+            for dev in (ctx.rl_instance.device_repository.list() or ()):
+                if int(getattr(dev, "groupId", 0) or 0) not in gid_set:
+                    continue
+                mac = str(getattr(dev, "addr", "") or "").upper()
+                if not mac or mac in seen_macs:
+                    continue
+                seen_macs.add(mac)
+                member_macs.append(mac)
+                if not bool(getattr(dev, "link_online", False)):
+                    offline_macs.append(mac)
+
+        # Empty-membership case is allowed (single-group migration of
+        # an empty group still flips group.network_id so the operator
+        # can populate it on the target). Block-mode with offline
+        # members still rejects.
+        if offline_mode == "block" and offline_macs:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"{len(offline_macs)} of {len(member_macs)} group member(s) "
+                    "offline — bring them online first, or pass "
+                    "offline_mode='skip' / 'force'."
+                ),
+                "detail": {
+                    "code": "offline_block",
+                    "offline_macs": offline_macs,
+                },
+            }), 400
+        if offline_mode == "block":
+            offline_mode = "skip"
+
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            meta = dict(payload)
+            meta["group_ids"] = list(clean_gids)
+            ctx.tasks.update(meta=meta)
+
+        def _runner():
+            outcome = migration.migrate_groups_to(
+                target_network_id=target_network_id,
+                group_ids=clean_gids,
+                offline_mode=offline_mode,
+                progress_cb=_progress,
+            )
+            _sse_refresh(
+                ctx,
+                {state_scope.DEVICES, state_scope.DEVICE_MEMBERSHIP, state_scope.GROUPS},
+            )
+            return outcome
+
+        task = ctx.tasks.start(
+            "migrate_groups_to_network", _runner,
+            meta={
+                "stage": "INIT",
+                "group_ids": list(clean_gids),
+                "total": len(member_macs),
+                "target_network_id": target_network_id,
+                "offline_mode": offline_mode,
+                "message": (
+                    f"Migrating {len(clean_gids)} group"
+                    f"{'s' if len(clean_gids) != 1 else ''} "
+                    f"({len(member_macs)} device"
+                    f"{'s' if len(member_macs) != 1 else ''}) "
+                    f"→ network {target_network_id}…"
+                ),
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
     @bp.route("/api/gateways/<ident_mac>/channel-scan", methods=["POST"])
     def api_gateway_channel_scan(ident_mac: str):
         """Stage 3 Part F: walk a region's channel table on this
@@ -3036,25 +3204,48 @@ def register_api_routes(bp, ctx):
 
         if draft_actions is not None:
             try:
-                from ..services.scenes_service import _canonical_actions  # local import
+                from ..services.scenes_service import (
+                    _canonical_actions,
+                    _canonical_network_scope,
+                )  # local import
                 canonical_actions = _canonical_actions(draft_actions)
             except ValueError as ex:
                 return jsonify({"ok": False, "error": str(ex)}), 400
-            # stop_on_error resolution: explicit body value wins; otherwise
-            # fall back to the persisted scene's setting (so toggling the
-            # checkbox on the saved scene still influences a draft run when
-            # the operator hasn't touched the box). Default True if neither
-            # exists — matches the saved-scene default.
+            # stop_on_error + network_scope resolution: explicit body
+            # value wins; otherwise fall back to the persisted scene
+            # so the saved settings still apply to a draft run when
+            # the editor hasn't touched them. Fetch the saved scene
+            # once and reuse for both fields. Default True / auto-mode
+            # if neither exists — matches the saved-scene defaults.
+            saved = None
             if "stop_on_error" in body:
                 stop_on_error = bool(body.get("stop_on_error"))
             else:
                 saved = scenes_service.get(key)
                 stop_on_error = bool(saved.get("stop_on_error", True)) if saved else True
+            if "network_scope" in body:
+                try:
+                    scope = _canonical_network_scope(body.get("network_scope"))
+                except ValueError as ex:
+                    return jsonify({"ok": False, "error": str(ex)}), 400
+            else:
+                if saved is None:
+                    saved = scenes_service.get(key)
+                scope = (
+                    (saved.get("network_scope") if saved else None)
+                    or {"mode": "auto"}
+                )
             scene_dict = {
                 "key": key,
                 "label": (body.get("label") or "draft").strip() or "draft",
                 "actions": canonical_actions,
                 "stop_on_error": stop_on_error,
+                # Pin the scope so the runner's broadcast fan-out
+                # respects the operator's choice on a draft Run too —
+                # not just on a saved-scene Run. Without this the
+                # runner falls through to auto-mode, which on a
+                # broadcast action resolves to every known network.
+                "network_scope": scope,
             }
             result = scene_runner_service.run(
                 key, progress_cb=_emit_progress, scene=scene_dict,

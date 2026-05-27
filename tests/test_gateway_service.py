@@ -160,6 +160,13 @@ class FakeController:
     def is_discovery_active(self):
         return bool(self.discovery_active)
 
+    def transport_for_device(self, addr):
+        # Default: route via the single test transport so the Stage-3
+        # cross-net guard in on_transport_event always validates ev_gw
+        # against this transport's ident_mac. Tests that need a different
+        # answer can monkey-patch this method on the instance.
+        return self.transport
+
 
 class GatewayServiceTests(unittest.TestCase):
     def test_send_and_wait_for_ack_marks_device_online(self):
@@ -818,6 +825,62 @@ class SendAndWaitWithRetriesTests(unittest.TestCase):
         controller = FakeController()
         service = GatewayService(controller)
         self.assertTrue(service.wait_for_auto_restore("123456789ABC", timeout_s=0.1))
+
+    def test_status_reply_from_correct_gateway_marks_online(self):
+        """STATUS_REPLY whose ``gateway_id`` matches the device's bound
+        transport ident_mac promotes link_online — baseline for the
+        cross-net guard below."""
+        controller = FakeController()
+        service = GatewayService(controller)
+        controller.dev.link_online = False
+
+        service.on_transport_event({
+            "opc": LP.OPC_STATUS,
+            "reply": "STATUS_REPLY",
+            "sender3": bytes.fromhex("DDEEFF"),
+            "gateway_id": controller.transport.ident_mac,
+            "flags": 0,
+            "configByte": 0,
+            "effectId": 0,
+            "brightness": 0,
+            "vbat_mV": 0,
+            "node_rssi": -60,
+            "node_snr": 7,
+            "host_rssi": -60,
+            "host_snr": 7,
+        })
+
+        self.assertTrue(controller.dev.link_online)
+
+    def test_status_reply_from_foreign_gateway_marks_offline(self):
+        """STATUS_REPLY whose ``gateway_id`` differs from the device's
+        bound transport ident_mac is a cross-network heartbeat —
+        typically a node still on its old radio mid-migration. Promote
+        offline instead of online so the UI tells the truth."""
+        controller = FakeController()
+        service = GatewayService(controller)
+        # Bind the device to a transport whose ident_mac is GW-A; the
+        # incoming STATUS_REPLY claims gateway_id GW-B.
+        controller.transport.ident_mac = "GW-A"
+        controller.dev.link_online = True  # pretend a previous frame promoted us
+
+        service.on_transport_event({
+            "opc": LP.OPC_STATUS,
+            "reply": "STATUS_REPLY",
+            "sender3": bytes.fromhex("DDEEFF"),
+            "gateway_id": "GW-B",
+            "flags": 0,
+            "configByte": 0,
+            "effectId": 0,
+            "brightness": 0,
+            "vbat_mV": 0,
+            "node_rssi": -60,
+            "node_snr": 7,
+            "host_rssi": -60,
+            "host_snr": 7,
+        })
+
+        self.assertFalse(controller.dev.link_online)
 
 
 if __name__ == "__main__":

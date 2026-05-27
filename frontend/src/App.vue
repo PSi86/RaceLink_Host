@@ -19,12 +19,12 @@ import GatewayBindWizard from '@/components/modals/GatewayBindWizard.vue'
 import ChannelScanDialog from '@/components/modals/ChannelScanDialog.vue'
 import NetworkManagerDialog from '@/components/modals/NetworkManagerDialog.vue'
 import SetupChangeAssistant from '@/components/modals/SetupChangeAssistant.vue'
-// Resort dialog imports ``vuedraggable`` (~100 kB through Sortable.js).
-// Lazy-load so we only pay that cost when the operator actually opens
-// the dialog — otherwise it would land in the main bundle on every
-// page load.
-const ResortGroupsDialog = defineAsyncComponent(
-  () => import('@/components/modals/ResortGroupsDialog.vue'),
+// Manage-groups dialog imports ``vuedraggable`` (~100 kB through
+// Sortable.js). Lazy-load so we only pay that cost when the operator
+// actually opens the dialog — otherwise it would land in the main
+// bundle on every page load.
+const ManageGroupsDialog = defineAsyncComponent(
+  () => import('@/components/modals/ManageGroupsDialog.vue'),
 )
 import { useUiBus } from '@/composables/useUiBus'
 
@@ -93,9 +93,9 @@ watch(ui.batteryDevicesRequest, () => {
   batteryDevicesOpen.value = true
 })
 
-const resortGroupsOpen = ref(false)
-watch(ui.resortGroupsRequest, () => {
-  resortGroupsOpen.value = true
+const manageGroupsOpen = ref(false)
+watch(ui.manageGroupsRequest, () => {
+  manageGroupsOpen.value = true
 })
 
 // Stage 4 Block 2: Channel-Scan wizard. The bind wizard manages its
@@ -190,7 +190,7 @@ onMounted(async () => {
   <HostSettingsDialog v-model:open="hostSettingsOpen" />
   <OnboardingWizardDialog v-model:open="onboardingOpen" />
   <BatteryDevicesDialog v-model:open="batteryDevicesOpen" />
-  <ResortGroupsDialog v-model:open="resortGroupsOpen" />
+  <ManageGroupsDialog v-model:open="manageGroupsOpen" />
   <GatewayBindWizard />
   <ChannelScanDialog v-model:open="channelScanOpen" />
   <NetworkManagerDialog v-model:open="networkManagerOpen" />

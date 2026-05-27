@@ -14,7 +14,6 @@ import { Pencil } from 'lucide-vue-next'
 
 import { useDevicesStore } from '@/stores/devices'
 import { useConfigDisplay } from '@/composables/useConfigDisplay'
-import { useNetworksStore } from '@/stores/networks'
 import { useRlPresetsStore } from '@/stores/rl_presets'
 import SpecialsLinkButton from '@/components/SpecialsLinkButton.vue'
 import { apiPost } from '@/api/client'
@@ -43,21 +42,17 @@ function configCell(configByte: number): ConfigCellInfo {
 }
 
 const devices = useDevicesStore()
-const networks = useNetworksStore()
 const rlPresets = useRlPresetsStore()
 const toast = useToast()
 
-/** Stage 4 Block 1: render the per-device network as a coloured
- *  badge. Falls back to ``"Default"`` for devices whose
- *  ``network_id`` is null (legacy / unmigrated). */
-function networkLabel(networkId: string | null | undefined): string {
-  const effectiveId = networkId ?? networks.defaultNetworkId
-  return networks.nameOf(effectiveId)
-}
-function networkBadgeClass(networkId: string | null | undefined): string {
-  const effectiveId = networkId ?? networks.defaultNetworkId
-  return networks.colorOf(effectiveId)
-}
+// Per-row network membership is now read off the device's group
+// (one network per group rule). The badge surfaces at the GROUP
+// level — in the DevicesSidebar group list (left of each row) and
+// at the top of DevicesPage's right section (header) for the
+// currently-selected group. Per-device badges + the Network column
+// were retired alongside the per-device Move-to-network UI; the
+// ManageGroupsDialog is now the single place to change network
+// membership.
 
 // Inline-edit state for the Name column. Empty value on commit
 // triggers the backend reset path → default "WLED <mac12>".
@@ -235,13 +230,11 @@ const columns = computed<ColumnDef<Device, any>[]>(() => [
     cell: (info) => info.getValue(),
   }),
   columnHelper.accessor('groupId', { header: 'Group' }),
-  // Stage 4 Block 1: per-row network badge. The accessor returns the
-  // raw id so TanStack sort behaves predictably; the cell template
-  // below renders the operator-visible name via ``nameOf``.
-  columnHelper.accessor((row: Device) => row.network_id ?? null, {
-    id: 'network_id',
-    header: 'Network',
-  }),
+  // The per-device Network column was removed in favour of the
+  // group-level network badge (sidebar + device-view header). The
+  // "one network per group" rule means a device's network is always
+  // exactly its group's network — repeating that per row was just
+  // visual noise. Operator-facing badge lives now on the group.
   columnHelper.accessor('flags', { header: 'Flags' }),
   columnHelper.accessor('configByte', { header: 'Config' }),
   columnHelper.accessor('effectId', {
@@ -375,17 +368,6 @@ function onRowSelect(addr: string, ev: Event) {
         <td class="mono">{{ row.original.addr }}</td>
         <td>{{ row.original.groupId }}</td>
         <td>
-          <span
-            class="inline-block rounded px-1.5 py-0.5 text-[11px] font-medium"
-            :class="networkBadgeClass(row.original.network_id)"
-            :title="row.original.last_known_rf_config
-              ? `last_known: ${row.original.last_known_rf_config.freq_hz / 1_000_000} MHz SF${row.original.last_known_rf_config.sf} BW${row.original.last_known_rf_config.bw_khz_x10 / 10} SW0x${row.original.last_known_rf_config.sync_word.toString(16).padStart(2, '0').toUpperCase()}`
-              : 'No last_known_rf_config reported yet'"
-          >
-            {{ networkLabel(row.original.network_id) }}
-          </span>
-        </td>
-        <td>
           <span class="tag" :class="row.original.flags & RL_FLAG_POWER_ON ? 'ok' : 'off'">
             {{ row.original.flags & RL_FLAG_POWER_ON ? 'ON' : 'OFF' }}
           </span>
@@ -426,7 +408,7 @@ function onRowSelect(addr: string, ev: Event) {
         </td>
       </tr>
       <tr v-if="table.getRowModel().rows.length === 0">
-        <td colspan="17" class="text-muted-foreground" style="text-align: center; padding: 16px">
+        <td colspan="16" class="text-muted-foreground" style="text-align: center; padding: 16px">
           No devices in this view.
         </td>
       </tr>

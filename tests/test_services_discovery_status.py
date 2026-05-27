@@ -84,9 +84,14 @@ class FakeGateway:
 
 
 class FakeController:
-    def __init__(self, devices):
+    def __init__(self, devices, transports=None):
         self._devices = devices
         self.transport = FakeTransport()
+        # Multi-transport fan-out (Bug 5 fix, 2026-05-26): tests that
+        # exercise the per-transport branch supply a list; default keeps
+        # the legacy single-transport behaviour where every device
+        # routes to ``self.transport``.
+        self._transports = list(transports) if transports is not None else None
         self.group_assignments = []
 
     def _to_hex_str(self, value):
@@ -114,6 +119,35 @@ class FakeController:
                 return self._items
 
         return Repo(self._devices)
+
+    @property
+    def transports(self):
+        # When ``transports=`` wasn't passed, expose the singleton as a
+        # 1-element list so resolve_broadcast_transports's "all attached"
+        # fan-out keeps producing the same single radio.
+        if self._transports is not None:
+            return list(self._transports)
+        return [self.transport]
+
+    def transport_for_network(self, network_id):
+        if not network_id:
+            return None
+        for t in self.transports:
+            ident = str(getattr(t, "ident_mac", "") or "").upper()
+            if ident and ident == str(network_id).upper():
+                return t
+        return None
+
+    def transport_for_device(self, addr):
+        # In the legacy single-transport case (no per-device network
+        # binding), every device routes to the singleton transport so
+        # the status service's snapshot picks them up correctly.
+        dev = self.getDeviceFromAddress(addr) if addr else None
+        net_id = getattr(dev, "network_id", None) if dev is not None else None
+        if not net_id:
+            return self.transport
+        routed = self.transport_for_network(net_id)
+        return routed if routed is not None else self.transport
 
 
 class DiscoveryAndStatusTests(unittest.TestCase):
@@ -216,6 +250,69 @@ class DiscoveryAndStatusTests(unittest.TestCase):
         self.assertEqual(result["responders"], {"AABBCCDDEEFF"})
         self.assertFalse(silent.link_online)
         self.assertEqual(silent.link_error, "Missing reply (STATUS)")
+
+    def test_status_service_broadcasts_on_every_attached_transport(self):
+        """Bug 5 fix (2026-05-26): a multi-gateway setup must broadcast
+        OPC_STATUS on every attached transport, scoped per-transport
+        replies, and aggregate the responders. Without this, the off-
+        radio device on the secondary gateway falls into the per-device
+        retry path on every poll (``retried=1, retried_success=1``)
+        instead of answering directly off the broadcast.
+        """
+        gw_a_transport = FakeTransport(ident_mac="GW-A")
+        gw_b_transport = FakeTransport(ident_mac="GW-B")
+        dev_a = RL_Device("AABBCCDDEEFF", 1, "Node A", groupId=255)
+        dev_a.network_id = "GW-A"
+        dev_b = RL_Device("001122334455", 1, "Node B", groupId=255)
+        dev_b.network_id = "GW-B"
+        controller = FakeController(
+            [dev_a, dev_b],
+            transports=[gw_a_transport, gw_b_transport],
+        )
+        # Each transport reports its own device. The FakeGateway tags
+        # replayed events with the matcher's gateway_id, so the
+        # per-transport matcher will only accept the matching event.
+        gateway = FakeGateway(
+            [
+                {
+                    "opc": LP.OPC_STATUS,
+                    "reply": "STATUS_REPLY",
+                    "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                    "sender3": bytes.fromhex("DDEEFF"),
+                    "gateway_id": "GW-A",
+                },
+                {
+                    "opc": LP.OPC_STATUS,
+                    "reply": "STATUS_REPLY",
+                    "mac6": bytes.fromhex("001122334455"),
+                    "sender3": bytes.fromhex("334455"),
+                    "gateway_id": "GW-B",
+                },
+            ],
+            got_closed=True,
+        )
+        service = StatusService(controller, gateway)
+
+        result = service.get_status(group_filter=255)
+
+        # Both transports got a broadcast send.
+        self.assertEqual(
+            [s[0] for s in gw_a_transport.sent], ["status"],
+            "GW-A must have received an OPC_STATUS broadcast",
+        )
+        self.assertEqual(
+            [s[0] for s in gw_b_transport.sent], ["status"],
+            "GW-B must have received an OPC_STATUS broadcast",
+        )
+        # Both devices end up in the aggregated responder set; no retry
+        # round needed because each device answered its own gateway's
+        # broadcast directly.
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(
+            result["responders"], {"AABBCCDDEEFF", "001122334455"},
+        )
+        self.assertEqual(result["retried"], 0)
+        self.assertEqual(result["retried_responders"], set())
 
 
 if __name__ == "__main__":

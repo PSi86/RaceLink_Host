@@ -582,12 +582,33 @@ class GatewayService:
         wait_for_ack: bool = False,
         timeout_s: Optional[float] = None,
     ):
-        transport = self.transport
+        recv3_hex = recv3.hex().upper() if isinstance(recv3, (bytes, bytearray)) else ""
+
+        # Multi-network routing: OPC_CONFIG is unicast-only by design
+        # (see config_service.send_config docstring). Route to the
+        # device's bound transport instead of the singleton primary,
+        # otherwise on N≥2 gateways the wire goes out the wrong radio
+        # and the device never sees the config — and the matcher
+        # (which IS routed via transport_for_device in
+        # send_and_wait_with_retries) waits forever on its own gateway.
+        transport = None
+        if recv3_hex and recv3_hex != "FFFFFF":
+            try:
+                transport = self.controller.transport_for_device(recv3_hex)
+            except Exception:
+                # swallow-ok: routing helper best-effort; fall back to
+                # singleton — at N=1 that IS the device's gateway.
+                logger.debug(
+                    "sendConfig: transport_for_device raised for %s",
+                    recv3_hex, exc_info=True,
+                )
+                transport = None
+        if transport is None:
+            transport = self.transport
         if transport is None:
             logger.warning("sendConfig: communicator not ready")
             return False if wait_for_ack else None
 
-        recv3_hex = recv3.hex().upper() if isinstance(recv3, (bytes, bytearray)) else ""
         dev = None
         if recv3_hex and recv3_hex != "FFFFFF":
             # Locked stash — paired with ``take_pending_config`` on the RX
@@ -622,6 +643,7 @@ class GatewayService:
                 LP.OPC_CONFIG,
                 _send,
                 per_attempt_timeout_s=per_attempt,
+                transport=transport,
             )
             if not events:
                 return False
@@ -717,12 +739,35 @@ class GatewayService:
         retries: int = rf_timing.STREAM_MAX_ATTEMPTS - 1,
         timeout_s: float = rf_timing.STREAM_ATTEMPT_TIMEOUT_S,
     ) -> dict[str, int]:
-        transport = self.transport
+        if device is None and groupId is None:
+            raise ValueError("sendStream requires groupId or device")
+
+        # Multi-network routing: a stream addresses one device (unicast)
+        # or one group (broadcast within the network owning that group).
+        # Either way the right transport is the device's / group's bound
+        # one, not the singleton primary. Without this, on N≥2 gateways
+        # the wire goes out the wrong radio and the stream silently
+        # never reaches the targets.
+        transport = None
+        try:
+            if device is not None:
+                addr = str(getattr(device, "addr", "") or "")
+                if addr:
+                    transport = self.controller.transport_for_device(addr)
+            elif groupId is not None:
+                transport = self.controller.transport_for_group(int(groupId))
+        except Exception:
+            logger.debug(
+                "sendStream: transport routing raised", exc_info=True,
+            )
+            transport = None
+        if transport is None:
+            transport = self.transport
         if transport is None:
             logger.warning("sendStream: communicator not ready")
             return {}
 
-        self.install_transport_hooks()
+        self.install_transport_hooks(transport=transport)
 
         # For OPC_STREAM the host provides one logical payload. The gateway is
         # responsible for fragmenting it into radio packets and assigning the
@@ -730,9 +775,6 @@ class GatewayService:
         data = bytes(payload or b"")
         if len(data) > 128:
             raise ValueError("payload too large (max 128 bytes)")
-
-        if device is None and groupId is None:
-            raise ValueError("sendStream requires groupId or device")
 
         if device is None:
             assert groupId is not None  # narrowed by the guard above
@@ -1283,14 +1325,29 @@ class GatewayService:
         Sends OPC_GET_RF_CONFIG; the node replies with a 12 B P_RfConfig
         body (decoded by :func:`parse_reply_event`). Returns
         ``{"ok": bool, "rf_config": {...}}`` on success.
-        """
-        transport = self.transport
-        if transport is None:
-            return {"ok": False, "error": "transport unavailable"}
 
+        Multi-network routing: unicast OPC_GET_RF_CONFIG must go via the
+        device's bound transport so the matcher's gateway_id filter
+        matches. Falls back to the singleton primary for single-gateway
+        deployments.
+        """
         mac_str = str(mac or "").strip().upper()
         if len(mac_str) != 12:
             return {"ok": False, "error": "mac must be 12 hex chars"}
+
+        transport = None
+        try:
+            transport = self.controller.transport_for_device(mac_str)
+        except Exception:
+            logger.debug(
+                "query_node_rf_config: transport_for_device raised for %s",
+                mac_str, exc_info=True,
+            )
+            transport = None
+        if transport is None:
+            transport = self.transport
+        if transport is None:
+            return {"ok": False, "error": "transport unavailable"}
 
         recv3 = mac_last3_from_hex(mac_str)
         if recv3 == b"\xFF\xFF\xFF":
@@ -1309,6 +1366,7 @@ class GatewayService:
             LP.OPC_GET_RF_CONFIG,
             _send,
             per_attempt_timeout_s=per_attempt,
+            transport=transport,
         )
         if not events:
             return {"ok": False, "error": "timeout"}
@@ -1708,17 +1766,54 @@ class GatewayService:
                 with self._state_lock():
                     dev = self.controller.getDeviceFromAddress(sender3_hex) if sender3_hex else None
                     if dev:
-                        dev.update_from_status(
-                            ev.get("flags"),
-                            ev.get("configByte"),
-                            ev.get("effectId"),
-                            ev.get("brightness"),
-                            ev.get("vbat_mV"),
-                            ev.get("node_rssi"),
-                            ev.get("node_snr"),
-                            ev.get("host_rssi"),
-                            ev.get("host_snr"),
+                        # Cross-network frame guard: a STATUS_REPLY that
+                        # arrives via a gateway different from the one
+                        # bound to this device's network means the device
+                        # is physically on the wrong radio (mid-migration,
+                        # or stuck on an old gateway because its persisted
+                        # master never got cleared). Don't promote
+                        # link_online from such a frame; mark offline so
+                        # the operator sees the divergence in the UI
+                        # instead of a misleading green dot.
+                        ev_gw = str(ev.get("gateway_id") or "").upper() or None
+                        expected_t = None
+                        try:
+                            expected_t = self.controller.transport_for_device(sender3_hex)
+                        except Exception:
+                            logger.exception(
+                                "RaceLink: transport_for_device raised in STATUS_REPLY guard"
+                            )
+                        expected_gw = (
+                            (str(getattr(expected_t, "ident_mac", "") or "").upper() or None)
+                            if expected_t is not None
+                            else None
                         )
+                        if ev_gw and expected_gw and ev_gw != expected_gw:
+                            logger.warning(
+                                "cross-net STATUS_REPLY from %s on gw=%s "
+                                "(device's network gw=%s) -- not promoting online",
+                                sender3_hex, ev_gw, expected_gw,
+                            )
+                            try:
+                                dev.mark_offline(
+                                    reason=f"cross-net heartbeat via {ev_gw}"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "RaceLink: mark_offline raised in cross-net guard"
+                                )
+                        else:
+                            dev.update_from_status(
+                                ev.get("flags"),
+                                ev.get("configByte"),
+                                ev.get("effectId"),
+                                ev.get("brightness"),
+                                ev.get("vbat_mV"),
+                                ev.get("node_rssi"),
+                                ev.get("node_snr"),
+                                ev.get("host_rssi"),
+                                ev.get("host_snr"),
+                            )
             elif int(opc) == int(LP.OPC_GET_CONFIG) and ev.get("reply") == "GET_CONFIG_REPLY":
                 # Pending-registry match above already handed the parsed
                 # event to the waiting ``ConfigService.read_config``
@@ -1732,6 +1827,18 @@ class GatewayService:
                 mac6 = ev.get("mac6")
                 if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
                     mac12 = bytes(mac6).hex().upper()
+                    # Lock-ordering invariant (multi-gateway concurrency):
+                    # this handler takes _state_lock FIRST, releases it,
+                    # then takes _identify_events_lock. The two `with`
+                    # blocks are intentionally NOT nested — there is no
+                    # need to hold the device-repo lock across the
+                    # event-signal. Concurrent IDENTIFY_REPLYs from
+                    # different gateways arrive on independent RX-reader
+                    # threads; each briefly serialises on _state_lock
+                    # for its append/update, then briefly on
+                    # _identify_events_lock for its per-mac Event. Pin
+                    # this order in any future refactor that needs both
+                    # locks at once, to keep the no-deadlock guarantee.
                     with self._state_lock():
                         dev = self.controller.getDeviceFromAddress(mac12)
                         is_known_device = dev is not None

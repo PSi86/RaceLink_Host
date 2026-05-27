@@ -18,7 +18,7 @@ const fwUpdateRequest = ref(0)
 const hostSettingsRequest = ref(0)
 const onboardingRequest = ref(0)
 const batteryDevicesRequest = ref(0)
-const resortGroupsRequest = ref(0)
+const manageGroupsRequest = ref(0)
 // Stage 4 Block 2: Channel-Scan wizard. Triggered from the
 // AppHeader's wrench-menu (or future GatewayStatusBar's
 // per-card action) when an operator wants to recover stranded
@@ -52,7 +52,7 @@ export function useUiBus() {
     hostSettingsRequest,
     onboardingRequest,
     batteryDevicesRequest,
-    resortGroupsRequest,
+    manageGroupsRequest,
     channelScanRequest,
     networkManagerRequest,
     bindWizardRequest,
@@ -84,8 +84,8 @@ export function useUiBus() {
     requestBatteryDevices() {
       batteryDevicesRequest.value += 1
     },
-    requestResortGroups() {
-      resortGroupsRequest.value += 1
+    requestManageGroups() {
+      manageGroupsRequest.value += 1
     },
     requestChannelScan() {
       channelScanRequest.value += 1
