@@ -133,13 +133,17 @@ def _top_level_text() -> str:
     return "racelink\n"
 
 
-def _iter_sources() -> list[tuple[Path, str]]:
+def _iter_sources(*, include_build_backend: bool) -> list[tuple[Path, str]]:
     sources: list[tuple[Path, str]] = []
     # ``_build_backend.py`` is only consumed by the PEP-517 build hook —
-    # at runtime nobody imports it. Skip so the wheel doesn't carry
-    # build-time code into the deployed install.
+    # at runtime nobody imports it, so the wheel (the deployed install)
+    # skips it to avoid shipping build-time code. The sdist MUST keep it:
+    # ``python -m build`` builds the wheel *from the sdist*, and that step
+    # re-imports this backend (per pyproject.toml's ``build-backend``).
+    # Dropping it from the sdist makes the sdist unbuildable, surfacing as
+    # ``BackendUnavailable: Cannot import 'racelink._build_backend'``.
     for path in sorted((ROOT / "racelink").rglob("*.py")):
-        if path.name == "_build_backend.py":
+        if path.name == "_build_backend.py" and not include_build_backend:
             continue
         sources.append((path, path.relative_to(ROOT).as_posix()))
     sources.extend(_package_data_sources())
@@ -197,7 +201,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None) 
     wheel_path = wheel_dir / _wheel_name()
 
     entries: list[tuple[str, bytes]] = []
-    for src_path, rel_path in _iter_sources():
+    for src_path, rel_path in _iter_sources(include_build_backend=False):
         entries.append((rel_path, src_path.read_bytes()))
     entries.extend(_metadata_files().items())
 
@@ -231,7 +235,7 @@ def build_sdist(sdist_directory, config_settings=None) -> str:
     sdist_path = sdist_dir / sdist_name
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        entries = list(_iter_sources())
+        entries = list(_iter_sources(include_build_backend=True))
         entries.extend(
             [
                 (ROOT / "pyproject.toml", "pyproject.toml"),

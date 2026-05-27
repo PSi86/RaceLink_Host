@@ -31,7 +31,10 @@ class PackagingAssetsTests(unittest.TestCase):
         # hashed JS/CSS bundles under ``racelink/static/dist/assets/``.
         # Asset filenames change per build (content-hashed), so assert
         # the shell + at least one JS and one CSS bundle.
-        rel_paths = {rel_path for _src, rel_path in _build_backend._iter_sources()}
+        rel_paths = {
+            rel_path
+            for _src, rel_path in _build_backend._iter_sources(include_build_backend=True)
+        }
 
         self.assertIn("racelink/static/dist/index.html", rel_paths)
         asset_paths = {p for p in rel_paths if p.startswith("racelink/static/dist/assets/")}
@@ -74,6 +77,45 @@ class PackagingAssetsTests(unittest.TestCase):
         asset_paths = {p for p in names if p.startswith(f"{prefix}/racelink/static/dist/assets/")}
         self.assertTrue(any(p.endswith(".js") for p in asset_paths), asset_paths)
         self.assertTrue(any(p.endswith(".css") for p in asset_paths), asset_paths)
+
+    def test_built_sdist_remains_self_buildable(self):
+        # ``python -m build`` builds the wheel *from the sdist*, which
+        # re-imports ``racelink._build_backend`` (pyproject's build-backend).
+        # The sdist must therefore carry the backend module, otherwise the
+        # wheel-from-sdist step fails with
+        # ``BackendUnavailable: Cannot import 'racelink._build_backend'``.
+        build_dir = ROOT / ".sdist-backend-test"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir()
+        try:
+            sdist_name = _build_backend.build_sdist(str(build_dir))
+            sdist_path = build_dir / sdist_name
+            with tarfile.open(sdist_path, "r:gz") as archive:
+                names = {member.name for member in archive.getmembers()}
+        finally:
+            shutil.rmtree(build_dir)
+
+        prefix = f"{_build_backend.NAME}-{_build_backend.VERSION}"
+        self.assertIn(f"{prefix}/pyproject.toml", names)
+        self.assertIn(f"{prefix}/racelink/_build_backend.py", names)
+
+    def test_built_wheel_excludes_build_backend(self):
+        # The wheel is the deployed runtime install; the build-time backend
+        # must not bloat it. (Asymmetry with the sdist is intentional --
+        # see ``test_built_sdist_remains_self_buildable``.)
+        build_dir = ROOT / ".wheel-backend-test"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir()
+        try:
+            wheel_name = _build_backend.build_wheel(str(build_dir))
+            with zipfile.ZipFile(build_dir / wheel_name) as archive:
+                names = set(archive.namelist())
+        finally:
+            shutil.rmtree(build_dir)
+
+        self.assertNotIn("racelink/_build_backend.py", names)
 
     def test_builds_are_reproducible_with_fixed_source_date_epoch(self):
         build_root = ROOT / ".repro-build-test"
