@@ -23,6 +23,26 @@
  * Dialog primitives for enter/exit transitions. CSS-only, ~3 kB. */
 @import "tw-animate-css";
 
+/* Self-hosted brand fonts (mirrored from the racelink.dev website's
+ * dist/assets/fonts/). Chakra Petch — display/UI; Sora — body. Files
+ * sit in frontend/public/fonts/ so Vite serves them at /fonts/* in
+ * dev *and* hashes them into the production bundle under the same
+ * URL path. font-display: swap → no FOIT, system fallback paints
+ * immediately. */
+@font-face {
+  font-family: 'Chakra Petch';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/chakra-petch-v13-latin-regular.woff2') format('woff2');
+}
+@font-face { font-family: 'Chakra Petch'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/chakra-petch-v13-latin-500.woff2') format('woff2'); }
+@font-face { font-family: 'Chakra Petch'; font-style: normal; font-weight: 600; font-display: swap; src: url('/fonts/chakra-petch-v13-latin-600.woff2') format('woff2'); }
+@font-face { font-family: 'Chakra Petch'; font-style: normal; font-weight: 700; font-display: swap; src: url('/fonts/chakra-petch-v13-latin-700.woff2') format('woff2'); }
+@font-face { font-family: 'Sora'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/sora-v17-latin-regular.woff2') format('woff2'); }
+@font-face { font-family: 'Sora'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/sora-v17-latin-500.woff2') format('woff2'); }
+@font-face { font-family: 'Sora'; font-style: normal; font-weight: 600; font-display: swap; src: url('/fonts/sora-v17-latin-600.woff2') format('woff2'); }
+
 @theme {
   /* Spacing token (was ``--gap`` in racelink.css). Tailwind exposes it
    * as ``--spacing-gap`` *and* makes it usable via the ``gap`` /
@@ -42,10 +62,23 @@
    *   text-err   / bg-err        (failures, offline, validation errors)
    */
   --color-bg: #0e0e11;
-  --color-card: #17171c;
+  /* --color-card iterated 2026-05-19: #17171c → #0c0e16 → #07080D →
+   * #07080d1f. Final step takes the solid card colour to alpha 0x1F
+   * (~12%) so cards read as faint glass plates over the body's
+   * pink/cyan radial-glow atmosphere rather than opaque wells. The
+   * ``--color-popover`` alias is broken below so dialogs stay opaque
+   * and readable. */
+  --color-card: #07080d1f;
   --color-text: #e7e7ec;
   --color-muted: #9aa0a6;
-  --color-accent: #4c8bf5;
+  /* --color-accent iterated 2026-05-19: #4c8bf5 (blue) → #1fe6d6 (neon
+   * brand cyan) → #2aa599 (medium teal). The neon cyan was visually
+   * loud on text-accent links, checkbox / radio / slider fills, and
+   * the focus ring. Toned to a medium teal so those interactive bits
+   * stay readable without screaming. The brand wordmark keeps the
+   * neon ``--color-brand-cyan`` (#1fe6d6) — only the *interactive*
+   * accent is dampened. */
+  --color-accent: #2aa599;
   --color-ok: #1faa59;
   --color-warn: #f2c037;
   --color-err: #e84545;
@@ -58,10 +91,18 @@
   --color-background: var(--color-bg);
   --color-foreground: var(--color-text);
   --color-card-foreground: var(--color-text);
-  --color-popover: var(--color-card);
+  /* Popover stays solid even after --color-card went semi-transparent.
+   * Dialog / popover panels need readable, opaque surfaces — the
+   * transparent card glass effect is only intended for in-page boxes. */
+  --color-popover: #07080D;
   --color-popover-foreground: var(--color-text);
   --color-primary: var(--color-accent);
-  --color-primary-foreground: #ffffff;
+  /* Dark foreground on the cyan primary surface (was #ffffff). White
+   * text on teal is the WCAG-failure / eye-strain case the user
+   * called out. With the toned accent (#2aa599) dark #07080D gives
+   * AAA-level contrast and matches the racelink.dev primary-button
+   * pattern (``color:#07080D`` on the pink→cyan gradient). */
+  --color-primary-foreground: #07080D;
   --color-secondary: #232330;
   --color-secondary-foreground: var(--color-text);
   --color-muted-foreground: var(--color-muted);
@@ -75,4 +116,53 @@
   /* Border-radius token consumed by shadcn components via ``rounded-md``
    * (= calc(var(--radius) - 2px)) and ``rounded-lg`` (= var(--radius)). */
   --radius: 0.5rem;
+
+  /* Brand tokens — racelink.dev visual identity (2026-05-19). The
+   * accent (cyan) flows through every shadcn primary surface; pink +
+   * the pink→cyan gradient are opt-in via .rl-brand / .btn-brand, used
+   * sparingly for the wordmark and high-priority CTAs. */
+  --color-brand-pink: #ff2e6e;
+  --color-brand-cyan: #1fe6d6;
+  --color-brand-amber: #ffb23e;
+  --color-brand-gradient: linear-gradient(100deg, #ff2e6e, #1fe6d6);
+
+  --shadow-brand-glow: 0 0 14px #ff2e6e;
+  --shadow-brand-cta: 0 8px 30px rgba(255, 46, 110, 0.30);
+  --shadow-brand-cta-hover: 0 14px 40px rgba(255, 46, 110, 0.42);
+
+  --font-display: 'Chakra Petch', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  --font-body: 'Sora', system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+  /* Run-CTA fill — pink→cyan gradient that gives execute-action
+   * buttons (Start, Re-sync, Send, OTA Start) punchy brand colour
+   * without the original glow-CTA loudness. Opacities tuned 2026-05-19
+   * for ``knalliger`` look and to lean cyan-dominant on the right
+   * (matches the now-cyan ``run`` border). Hover bumps brightness via
+   * filter, which interpolates smoothly (background-image cannot
+   * animate between gradients). */
+  --gradient-run: linear-gradient(100deg, rgba(255, 46, 110, 0.28), rgba(31, 230, 214, 0.42));
+
+  /* Tailwind v4 uses --default-font-family as the implicit body font
+   * and as the resolved value for the ``font-sans`` utility. Pointing
+   * it at our body stack means every utility-styled element (incl.
+   * shadcn-vue primitives that don't set font-family themselves) lands
+   * on Sora without an explicit class. --default-font-family-mono
+   * keeps ui-monospace for the ``.mono`` helper. */
+  --default-font-family: var(--font-body);
+  --font-sans: var(--font-body);
+}
+
+/* ===== Custom utility: btn-run-bg ===================================
+ * Used by the shadcn-vue Button ``run`` variant (execute-action CTAs
+ * like Start / Re-sync / Send / Start update). Painting the gradient
+ * via @utility lands the rule in @layer utilities, so it overrides
+ * the variant's other class properties cleanly. Hover lifts the
+ * filter brightness — gradients can't tween between two
+ * linear-gradient() functions, so filter is the smooth path. */
+@utility btn-run-bg {
+  background-image: var(--gradient-run);
+  transition: filter 0.18s ease, border-color 0.18s ease;
+  &:hover:not(:disabled) {
+    filter: brightness(1.3) saturate(1.15);
+  }
 }

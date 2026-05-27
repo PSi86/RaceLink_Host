@@ -7,7 +7,7 @@
 // reserved (will host the Sortable handle later).
 
 import { computed } from 'vue'
-import { ChevronDown, ChevronUp, GripVertical, X } from 'lucide-vue-next'
+import { ChevronDown, ChevronUp, Copy, GripVertical, X } from 'lucide-vue-next'
 
 import { Button } from '@/components/ui/button'
 import SceneActionBody from './SceneActionBody.vue'
@@ -15,6 +15,7 @@ import OffsetGroupActionBody from './OffsetGroupActionBody.vue'
 import SceneFlagsOverride from './SceneFlagsOverride.vue'
 import SceneTargetPicker from './SceneTargetPicker.vue'
 import SceneCostBadge from './SceneCostBadge.vue'
+import ActionInsertZone from './ActionInsertZone.vue'
 import { useScenesStore } from '@/stores/scenes'
 import { cn } from '@/lib/utils'
 import type {
@@ -34,6 +35,13 @@ const props = defineProps<{
   cost?: SceneCostPerAction
   /** Measured wall-clock duration from the last run, in ms. */
   actualMs?: number | null
+  /** Scene's explicit broadcast scope. Forwarded to the target
+   * picker so the group/device dropdowns can filter to in-scope
+   * networks. ``null`` (auto mode) → no filter. */
+  scopeNetworkIds?: string[] | null
+  /** When the parent flagged this action's target as out-of-scope,
+   * render a warning chip + red border on the target picker. */
+  scopeWarning?: boolean
 }>()
 
 const scenes = useScenesStore()
@@ -61,7 +69,9 @@ function setTarget(value: SceneTarget) {
 
 const rowClass = computed(() =>
   cn(
-    'rounded-md border bg-card/40 p-3 transition-colors',
+    // ``relative`` anchors the absolutely-positioned ActionInsertZone
+    // (which sits over the gap above this row).
+    'relative rounded-md border bg-card/40 p-3 transition-colors',
     props.status === 'ok' && 'border-ok/50',
     props.status === 'error' && 'border-destructive/50 bg-destructive/10',
     props.status === 'degraded' && 'border-warn/50 bg-warn/10',
@@ -73,6 +83,10 @@ const rowClass = computed(() =>
 
 <template>
   <div :class="rowClass">
+    <!-- Hover-zone insert above this row. The zone uses negative
+         vertical margin so it visually sits in the gap above; on
+         first row it covers the gap before the list head. -->
+    <ActionInsertZone :kinds="kindOptions" @insert="(k) => scenes.insertAction(index, k)" />
     <div class="flex flex-wrap items-start gap-3">
       <!-- Drag handle (Slice 10b: vuedraggable wired in SceneEditor;
            the ``rl-action-grip`` selector matches the parent's
@@ -112,11 +126,23 @@ const rowClass = computed(() =>
         <template v-else>
           <SceneActionBody :action="action" />
           <div v-if="supportsTarget" class="flex flex-col gap-1">
-            <span class="text-xs text-muted-foreground">Target</span>
-            <SceneTargetPicker
-              :model-value="action.target"
-              @update:model-value="setTarget"
-            />
+            <span class="text-xs text-muted-foreground">
+              Target
+              <span
+                v-if="scopeWarning"
+                class="ml-1 rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rose-300"
+                title="This action targets a network outside the scene's explicit scope. The server will reject Save with a 400 — adjust the target or widen the scope."
+              >
+                out of scope
+              </span>
+            </span>
+            <div :class="scopeWarning ? 'rounded-md ring-1 ring-rose-500/40' : ''">
+              <SceneTargetPicker
+                :model-value="action.target"
+                :scope-network-ids="scopeNetworkIds"
+                @update:model-value="setTarget"
+              />
+            </div>
           </div>
           <SceneFlagsOverride v-if="supportsFlags" :action="action" />
         </template>
@@ -146,6 +172,15 @@ const rowClass = computed(() =>
           @click="scenes.moveAction(index, 1)"
         >
           <ChevronDown class="h-4 w-4" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          title="Duplicate action (insert a copy below)"
+          @click="scenes.duplicateAction(index)"
+        >
+          <Copy class="h-4 w-4" />
         </Button>
         <Button
           type="button"

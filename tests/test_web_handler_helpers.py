@@ -70,10 +70,16 @@ class _FakeRlInstance:
 
 def _fake_ctx(*, devices=None, group_repo=None, rl_grouplist=None):
     class _Group:
-        def __init__(self, name, static_group=0, dev_type=0):
+        # Stage 3 Part B: ``_prepare_discover_target`` now passes
+        # ``network_id`` so the fresh group inherits the default
+        # network's id. Absorb it (and any future field additions)
+        # via **kwargs so the fake doesn't need to track every
+        # constructor signature change.
+        def __init__(self, name, static_group=0, dev_type=0, **kwargs):
             self.name = name
             self.static_group = static_group
             self.dev_type = dev_type
+            self.network_id = kwargs.get("network_id")
 
     ctx = types.SimpleNamespace(
         rl_lock=threading.RLock(),

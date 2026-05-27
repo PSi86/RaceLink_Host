@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { apiGet, apiPost } from '@/api/client'
 import type {
   GatewayStatus,
+  MasterMapSnapshot,
   MasterResponse,
   MasterSnapshot,
   TaskSnapshot,
@@ -44,9 +45,73 @@ export const useGatewayStore = defineStore('gateway', () => {
 
   const busy = computed(() => task.value.state === 'running')
 
-  function applyMaster(snapshot: Partial<MasterSnapshot> | null | undefined) {
+  // Per-task-name busy selectors used by the long-running dialog
+  // lockdowns (firmware update, presets download, discover). The
+  // dialogs read these to gate their close-control + browser-
+  // navigation guards. Inline ``task.value.name`` checks would be just
+  // as fine, but the named computeds keep the call-sites obviously
+  // intentional.
+  const fwBusy = computed(
+    () => task.value.name === 'fwupdate' && task.value.state === 'running',
+  )
+  const presetsBusy = computed(
+    () => task.value.name === 'presets_download' && task.value.state === 'running',
+  )
+  const discoverBusy = computed(
+    () => task.value.name === 'discover' && task.value.state === 'running',
+  )
+
+  /** Cooperative cancel: ask the server to wind down the current task.
+   *  Returns ``true`` if a running task was signalled, ``false`` if no
+   *  task was running. Optimistically marks ``cancel_requested`` so the
+   *  dialog flips to its "Cancelling…" state without waiting for the
+   *  next SSE update. */
+  async function cancelTask(): Promise<boolean> {
+    const res = (await apiPost('/api/task/cancel', {})) as {
+      ok?: boolean
+      task?: TaskSnapshot
+    }
+    if (res?.ok && res.task) {
+      applyTask(res.task)
+      return true
+    }
+    if (task.value.state === 'running') {
+      // Optimistic: server didn't echo the snapshot back, but we asked.
+      task.value = { ...task.value, cancel_requested: true }
+    }
+    return Boolean(res?.ok)
+  }
+
+  /** Stage 2 Part 4: the SSE ``master`` payload and ``/api/master``
+   *  both carry the multi-network shape. The single-master UI reads
+   *  ``networks[0]`` for backwards compatibility — Stage 4 builds a
+   *  proper multi-network UI. This helper accepts both the new
+   *  ``MasterMapSnapshot`` and the pre-Part-4 ``Partial<MasterSnapshot>``
+   *  for defensive parsing during the rollout. */
+  function applyMaster(
+    snapshot:
+      | Partial<MasterSnapshot>
+      | MasterMapSnapshot
+      | null
+      | undefined,
+  ) {
     if (!snapshot) return
-    master.value = { ...master.value, ...snapshot }
+    // Multi-network shape: pick the default network (or networks[0]).
+    if (
+      typeof snapshot === 'object'
+      && Array.isArray((snapshot as MasterMapSnapshot).networks)
+    ) {
+      const map = snapshot as MasterMapSnapshot
+      if (!map.networks.length) return
+      const defaultId = map.default_network_id
+      const primary
+        = (defaultId
+          ? map.networks.find((n) => n.network_id === defaultId)
+          : undefined) ?? map.networks[0]
+      master.value = { ...master.value, ...primary }
+      return
+    }
+    master.value = { ...master.value, ...(snapshot as Partial<MasterSnapshot>) }
   }
 
   function applyTask(snapshot: Partial<TaskSnapshot> | null | undefined) {
@@ -64,14 +129,23 @@ export const useGatewayStore = defineStore('gateway', () => {
 
   function applyGateway(status: GatewayStatus | null | undefined) {
     if (!status) return
+    const wasReady = gateway.value.ready
     gateway.value = { ...DEFAULT_GATEWAY, ...status }
+    // Optimistic recovery clear: when the USB link comes back, the stale
+    // master.last_error from the disconnect is no longer relevant. The
+    // backend will overwrite this once a STATE_CHANGED / TASK_*_DONE / reply
+    // arrives, but until then we don't want the err: line to keep echoing
+    // the old USB error string.
+    if (status.ready && !wasReady && master.value.last_error) {
+      master.value = { ...master.value, last_error: null }
+    }
   }
 
   async function loadInitial(): Promise<void> {
     const res = (await apiGet('/api/master')) as Partial<MasterResponse> & {
       ok?: boolean
     }
-    if (res?.master) applyMaster(res.master as MasterSnapshot)
+    if (res?.master) applyMaster(res.master)
     if (res?.task) applyTask(res.task as TaskSnapshot)
     if (res?.gateway) applyGateway(res.gateway as GatewayStatus)
   }
@@ -100,11 +174,15 @@ export const useGatewayStore = defineStore('gateway', () => {
     task,
     gateway,
     busy,
+    fwBusy,
+    presetsBusy,
+    discoverBusy,
     applyMaster,
     applyTask,
     applyGateway,
     loadInitial,
     retryGateway,
     queryGatewayState,
+    cancelTask,
   }
 })

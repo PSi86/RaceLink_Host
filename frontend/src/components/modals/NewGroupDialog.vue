@@ -91,7 +91,7 @@ async function onSubmit(ev: Event) {
 
         <DialogFooter>
           <Button type="button" variant="secondary" @click="close">Cancel</Button>
-          <Button type="submit" :disabled="submitting || !name.trim()">
+          <Button variant="brand" type="submit" :disabled="submitting || !name.trim()">
             {{ submitting ? 'Creating…' : 'Create' }}
           </Button>
         </DialogFooter>

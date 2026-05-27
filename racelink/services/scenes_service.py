@@ -812,6 +812,81 @@ def _canonical_actions(raw: Any) -> List[Dict[str, Any]]:
     return [_canonical_action(item) for item in raw]
 
 
+# ---------------------------------------------------------------------------
+# Per-scene network scope (Stage 4 follow-up — scope-aware broadcasts)
+# ---------------------------------------------------------------------------
+#
+# Scenes may carry an optional top-level ``network_scope`` field that
+# constrains which networks broadcast actions reach at runtime. Two modes:
+#
+#   * ``{"mode": "auto"}`` — default, back-compat. Runtime derives the
+#     scope from the union of action targets via
+#     :func:`racelink.services.scene_network_scope.scene_network_ids`.
+#   * ``{"mode": "explicit", "network_ids": [...]}`` — operator-pinned
+#     set. Runtime returns this list (filtered against currently
+#     persisted networks). Per-action target pickers in the editor
+#     restrict to these networks.
+#
+# Validation here is STRUCTURAL only — does the field have the right
+# shape. The cross-action consistency check (every action's resolved
+# target must be a subset of the scope) lives in
+# :func:`racelink.domain.network_boundary.validate_scene_scope_consistency`
+# because it needs the device + group repositories, and ``scenes_service``
+# deliberately stays repository-free for testability.
+def _canonical_network_scope(raw: Any) -> Dict[str, Any]:
+    """Validate + normalise the scene-level ``network_scope`` field.
+
+    Returns:
+        ``{"mode": "auto"}`` for None/missing input — the back-compat
+        default. ``{"mode": "explicit", "network_ids": [...]}`` for a
+        valid explicit-mode payload.
+
+    Raises:
+        ValueError on any malformed shape: unknown mode, non-list
+        network_ids, non-string entries, empty list after coercion.
+
+    Normalisation:
+        * String coercion + whitespace strip for each network_id.
+        * Empty entries dropped.
+        * Order-preserving dedupe.
+    """
+    if raw is None:
+        return {"mode": "auto"}
+    if not isinstance(raw, dict):
+        raise ValueError("network_scope must be an object")
+    mode = raw.get("mode")
+    if mode == "auto":
+        # Strip stray network_ids on auto-mode payloads so the persisted
+        # shape is clean. A common round-trip from the frontend keeps the
+        # previously-set explicit list when switching to auto; we drop it
+        # at the boundary.
+        return {"mode": "auto"}
+    if mode == "explicit":
+        raw_ids = raw.get("network_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError(
+                "network_scope.network_ids must be a list when mode='explicit'"
+            )
+        seen: set = set()
+        out: List[str] = []
+        for entry in raw_ids:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    "network_scope.network_ids entries must be strings"
+                )
+            nid = entry.strip()
+            if not nid or nid in seen:
+                continue
+            seen.add(nid)
+            out.append(nid)
+        if not out:
+            raise ValueError(
+                "network_scope.network_ids must be non-empty when mode='explicit'"
+            )
+        return {"mode": "explicit", "network_ids": out}
+    raise ValueError(f"network_scope.mode must be 'auto' or 'explicit', got {mode!r}")
+
+
 def _collapse_groups_target(target: Dict[str, Any],
                             known_set: set) -> Dict[str, Any]:
     """If ``target.kind == "groups"`` and the value covers every currently
@@ -1007,6 +1082,13 @@ class SceneService:
                 # uncheck the editor checkbox per scene. Existing scenes
                 # without the field default to True on load.
                 "stop_on_error": _coerce_bool(entry.get("stop_on_error"), default=True),
+                # Scope follow-up (broadcast-target branch): operator-set
+                # network scope for the scene's broadcast actions. Missing
+                # field on load defaults to ``{"mode": "auto"}`` via the
+                # canonicalizer; no schema bump needed because the field
+                # is purely additive and old hosts silently drop unknown
+                # keys.
+                "network_scope": _canonical_network_scope(entry.get("network_scope")),
             })
 
         persisted_next = data.get("next_id")
@@ -1107,7 +1189,8 @@ class SceneService:
 
     def create(self, *, label: str, actions: Optional[list] = None,
                key: Optional[str] = None,
-               stop_on_error: Optional[bool] = None) -> dict:
+               stop_on_error: Optional[bool] = None,
+               network_scope: Optional[dict] = None) -> dict:
         label_clean = (label or "").strip()
         if not label_clean:
             raise ValueError("label is required")
@@ -1119,6 +1202,10 @@ class SceneService:
         stop_on_error_resolved = (
             True if stop_on_error is None else _coerce_bool(stop_on_error, default=True)
         )
+        # Scope: canonicalize. None / missing -> {"mode": "auto"}; explicit
+        # payloads validated for shape (cross-action subset check happens
+        # at the API layer where the repositories are available).
+        canonical_scope = _canonical_network_scope(network_scope)
         with self._lock:
             items = self._items()
             existing_keys = {s["key"] for s in items}
@@ -1135,6 +1222,7 @@ class SceneService:
                 "updated": now,
                 "actions": canonical_actions,
                 "stop_on_error": stop_on_error_resolved,
+                "network_scope": canonical_scope,
             }
             items.append(scene)
             self._write_atomic(items)
@@ -1144,13 +1232,20 @@ class SceneService:
 
     def update(self, key: str, *, label: Optional[str] = None,
                actions: Optional[list] = None,
-               stop_on_error: Optional[bool] = None) -> Optional[dict]:
+               stop_on_error: Optional[bool] = None,
+               network_scope: Optional[dict] = None) -> Optional[dict]:
         if actions is not None:
             canonical_actions = self._apply_broadcast_collapse(
                 _canonical_actions(actions)
             )
         else:
             canonical_actions = None
+        # Canonicalize scope on the way in — same None-means-don't-change
+        # convention as the other kwargs. A persisted scope can be replaced
+        # by passing the new dict; auto-mode is the default for new scenes.
+        canonical_scope = (
+            _canonical_network_scope(network_scope) if network_scope is not None else None
+        )
         updated: Optional[dict] = None
         with self._lock:
             items = list(self._items())
@@ -1169,6 +1264,8 @@ class SceneService:
                     new_entry["stop_on_error"] = _coerce_bool(
                         stop_on_error, default=True,
                     )
+                if canonical_scope is not None:
+                    new_entry["network_scope"] = canonical_scope
                 new_entry["updated"] = _now_iso()
                 items[idx] = new_entry
                 self._write_atomic(items)
@@ -1199,7 +1296,54 @@ class SceneService:
             label=label,
             actions=src["actions"],
             stop_on_error=src.get("stop_on_error", True),
+            # Copy scope verbatim — operator-resolved decision: duplicating
+            # a scene with explicit scope should keep that scope. They can
+            # change it via the editor after the clone if they want.
+            network_scope=src.get("network_scope"),
         )
+
+    def remap_group_ids(self, mapping: Dict[int, int]) -> int:
+        """Apply an old→new groupId mapping to every scene action.
+
+        Sibling of :meth:`renumber_group_references`. Where the
+        post-delete shift is implicit (``deleted_gid`` plus the
+        ``higher→down-by-one`` rule), the resort flow needs an
+        explicit permutation map. Both walk the same four reference
+        sites — top-level target, offset_group container target,
+        offset_group child targets (recursive), explicit-offset
+        per-group entries — through sibling helpers
+        :func:`_remap_action` / :func:`_remap_actions_for_mapping`.
+
+        Identity mappings (``{1: 1, 2: 2}``) are no-ops: nothing is
+        re-canonicalised and ``_fire_changed`` does not fire. Re-
+        applying the same mapping is therefore safe.
+
+        Returns the count of scenes whose actions were modified.
+        """
+        if not mapping:
+            return 0
+        changed = 0
+        with self._lock:
+            items = list(self._items())
+            new_items: List[dict] = []
+            for scene in items:
+                new_actions, was_changed = _remap_actions_for_mapping(
+                    scene["actions"], mapping,
+                )
+                if was_changed:
+                    changed += 1
+                    new_entry = dict(scene)
+                    new_entry["actions"] = _canonical_actions(new_actions)
+                    new_entry["updated"] = _now_iso()
+                    new_items.append(new_entry)
+                else:
+                    new_items.append(scene)
+            if changed:
+                self._write_atomic(new_items)
+                self._invalidate()
+        if changed:
+            self._fire_changed()
+        return changed
 
     def renumber_group_references(self, deleted_gid: int) -> int:
         """Rewrite every scene's group references after a group deletion.
@@ -1440,9 +1584,154 @@ def _renumber_action(
     return new_action, True
 
 
+# ---------------------------------------------------------------------
+# Resort sibling: explicit old→new groupId mapping (not a delete-shift)
+# ---------------------------------------------------------------------
+#
+# The functions below mirror ``_renumber_*`` / ``_shift_*`` but take an
+# explicit ``Dict[int, int]`` mapping instead of a single deleted index.
+# Used by :meth:`SceneService.remap_group_ids` for the operator-driven
+# group resort flow. Same four reference sites, same dedup discipline,
+# same defensive-copy contract — only the per-id rule differs.
+
+def _map_group_value(value: int, mapping: Dict[int, int]) -> int:
+    """Look up ``value`` in the mapping; unmapped ids pass through."""
+    return mapping.get(int(value), int(value))
+
+
+def _map_target_groups_list(
+    target: Dict[str, Any], mapping: Dict[int, int],
+) -> tuple[Dict[str, Any], bool]:
+    """Apply :func:`_map_group_value` to every id in a
+    ``target.kind == "groups"`` list. Dedupes (a mapping may collide
+    two old ids onto the same new id; the dedup keeps the list valid).
+
+    Returns ``(new_target, changed)``; the target is a fresh dict only
+    when ``changed`` is True.
+    """
+    if target.get("kind") != "groups":
+        return target, False
+    raw_value = target.get("value")
+    if not isinstance(raw_value, list):
+        return target, False
+    mapped_list = [_map_group_value(int(g), mapping) for g in raw_value]
+    seen: set[int] = set()
+    deduped: List[int] = []
+    for g in mapped_list:
+        if g not in seen:
+            seen.add(g)
+            deduped.append(g)
+    if deduped == list(raw_value):
+        return target, False
+    new_target = dict(target)
+    new_target["value"] = deduped
+    return new_target, True
+
+
+def _remap_action(
+    action: Dict[str, Any],
+    mapping: Dict[int, int],
+) -> tuple[Dict[str, Any], bool]:
+    """Rewrite group references in one action via an explicit
+    ``{old_gid: new_gid}`` mapping. Mirror of :func:`_renumber_action`
+    — same four reference sites, same fresh-dict contract.
+    """
+    kind = action.get("kind")
+    changed = False
+
+    target = action.get("target")
+    new_target = target
+    if isinstance(target, dict):
+        new_target, t_changed = _map_target_groups_list(target, mapping)
+        if t_changed:
+            changed = True
+
+    new_children = action.get("actions")
+    if kind == KIND_OFFSET_GROUP and isinstance(new_children, list):
+        rewritten_children, children_changed = _remap_actions_for_mapping(
+            new_children, mapping,
+        )
+        if children_changed:
+            new_children = rewritten_children
+            changed = True
+
+    offset_block = action.get("offset")
+    new_offset = offset_block
+    if (
+        kind == KIND_OFFSET_GROUP
+        and isinstance(offset_block, dict)
+        and offset_block.get("mode") == "explicit"
+        and isinstance(offset_block.get("values"), list)
+    ):
+        rewritten_values: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        offset_changed = False
+        for entry in offset_block["values"]:
+            try:
+                old = int(entry.get("id"))
+            except (TypeError, ValueError):
+                rewritten_values.append(entry)
+                continue
+            mapped = _map_group_value(old, mapping)
+            if mapped != old:
+                offset_changed = True
+            if mapped in seen_ids:
+                # Collision after remap — drop the duplicate. The
+                # canonical pass on save sorts by id; first-write-wins
+                # matches the dedup order in the target-list helper.
+                offset_changed = True
+                continue
+            seen_ids.add(mapped)
+            new_entry = dict(entry)
+            new_entry["id"] = mapped
+            rewritten_values.append(new_entry)
+        if offset_changed:
+            new_offset = dict(offset_block)
+            new_offset["values"] = rewritten_values
+            changed = True
+
+    if not changed:
+        return action, False
+
+    new_action = dict(action)
+    if new_target is not action.get("target"):
+        new_action["target"] = new_target
+    if kind == KIND_OFFSET_GROUP:
+        if new_children is not action.get("actions"):
+            new_action["actions"] = new_children
+        if new_offset is not action.get("offset"):
+            new_action["offset"] = new_offset
+    return new_action, True
+
+
+def _remap_actions_for_mapping(
+    actions: List[Dict[str, Any]],
+    mapping: Dict[int, int],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Walk a scene's actions, applying :func:`_remap_action` to each.
+    Returns ``(new_actions, changed)`` with the same defensive-copy
+    contract as :func:`_renumber_actions_for_deleted_group`.
+    """
+    changed = False
+    new_actions: List[Dict[str, Any]] = []
+    for action in actions:
+        new_action, action_changed = _remap_action(action, mapping)
+        if action_changed:
+            changed = True
+        new_actions.append(new_action)
+    return (new_actions if changed else actions), changed
+
+
 def _clone_scene(scene: dict) -> dict:
     """Return a defensive shallow-deep copy: scene dict + nested actions list
     + per-action shallow copies. Callers can iterate / mutate freely."""
+    raw_scope = scene.get("network_scope")
+    if isinstance(raw_scope, dict):
+        scope_clone: dict = {"mode": raw_scope.get("mode", "auto")}
+        if scope_clone["mode"] == "explicit":
+            scope_clone["network_ids"] = list(raw_scope.get("network_ids") or [])
+    else:
+        scope_clone = {"mode": "auto"}
     return {
         "id": scene["id"],
         "key": scene["key"],
@@ -1453,6 +1742,10 @@ def _clone_scene(scene: dict) -> dict:
         # Default True so a clone of a legacy scene (loaded before the
         # field existed) carries the safer abort-on-error behaviour.
         "stop_on_error": bool(scene.get("stop_on_error", True)),
+        # Default {"mode": "auto"} for legacy scenes loaded before the
+        # scope field existed. The clone is independent of the persisted
+        # dict so callers can mutate without aliasing.
+        "network_scope": scope_clone,
     }
 
 

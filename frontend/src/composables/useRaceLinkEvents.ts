@@ -10,6 +10,7 @@ import { onScopeDispose, ref, watch } from 'vue'
 import { apiGet, withBasePath } from '@/api/client'
 import { useDevicesStore } from '@/stores/devices'
 import { useGatewayStore } from '@/stores/gateway'
+import { useGatewaysStore } from '@/stores/gateways'
 import { useGroupsStore } from '@/stores/groups'
 import { useSpecialsStore } from '@/stores/specials'
 import { useRlPresetsStore } from '@/stores/rl_presets'
@@ -17,7 +18,21 @@ import { useWledPresetsStore } from '@/stores/wled_presets'
 import { useScenesStore } from '@/stores/scenes'
 import { useToast } from '@/composables/useToast'
 
-const NAMED_EVENTS = ['master', 'task', 'gateway', 'refresh', 'scene_progress'] as const
+// Stage 4 Block 2: the three ``gateway_*`` bind events feed the
+// gateways store and trigger the GatewayBindWizard's auto-open
+// watcher via the store's ``attentionRecord`` derived state.
+const NAMED_EVENTS = [
+  'master',
+  'task',
+  'gateway',
+  'refresh',
+  'scene_progress',
+  'gateway_bound',
+  'gateway_conflict',
+  'gateway_unbound',
+  'gateway_detached',
+  'gateway_missing',
+] as const
 
 const TRANSIENT_GRACE_MS = 2000
 
@@ -32,6 +47,7 @@ function safeJson<T = unknown>(raw: string | null | undefined): T | null {
 
 export function useRaceLinkEvents() {
   const gateway = useGatewayStore()
+  const gateways = useGatewaysStore()
   const devices = useDevicesStore()
   const groups = useGroupsStore()
   const specials = useSpecialsStore()
@@ -89,6 +105,11 @@ export function useRaceLinkEvents() {
       if (gateway.master.state === 'UNKNOWN') {
         await gateway.queryGatewayState().catch(() => undefined)
       }
+      // Stage 4 Block 2: refresh the bind-state snapshot too. The SSE
+      // gateway_* events are emitted on state changes, not on every
+      // reconnect; explicit rehydrate covers the "host restarted
+      // mid-conflict" case so the wizard re-opens.
+      await gateways.load().catch(() => undefined)
     } catch {
       // Tolerated: SSE will deliver fresh snapshots in a few hundred ms.
     }
@@ -207,12 +228,41 @@ export function useRaceLinkEvents() {
     switch (name) {
       case 'master':
         gateway.applyMaster(payload as never)
+        // Round 3 Task 6: also fan the per-network state out into the
+        // gateways store so MasterBar pills can colour-code per-
+        // gateway RF activity (TX/IDLE/RX/ERROR) alongside bind state.
+        gateways.applyMasterMap(payload as never)
         return
       case 'task':
         gateway.applyTask(payload as never)
         return
       case 'gateway':
         gateway.applyGateway(payload as never)
+        return
+      case 'gateway_bound':
+      case 'gateway_conflict':
+      case 'gateway_unbound':
+        // Stage 4 Block 2: every bind-state event carries the full
+        // ``BindRecord`` payload (see ``GatewayBindService._broadcast_event``
+        // in gateway_bind_service.py). The store re-keys by
+        // ident_mac so a duplicate event (e.g. on reconnect) just
+        // overwrites the same slot.
+        gateways.applyRecord(payload as never)
+        return
+      case 'gateway_detached': {
+        // Per-transport disconnect cleanup in multi-transport setups.
+        // The controller emits this when ONE of N transports dies
+        // while the others stay online — the store drops the dead
+        // record so the MasterBar pill disappears.
+        const ident = (payload as { ident_mac?: string } | null)?.ident_mac
+        if (ident) gateways.removeRecord(ident)
+        return
+      }
+      case 'gateway_missing':
+        // Round 3 Task 6: full list overwrite — the host's
+        // MissingTransportTracker is the source of truth, including
+        // empty arrays (which clear the banner).
+        gateways.applyMissing(payload as never)
         return
       case 'refresh': {
         const what = (payload as { what?: string[] } | null)?.what ?? ['groups', 'devices']

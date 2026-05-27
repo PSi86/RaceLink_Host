@@ -13,13 +13,17 @@ import unittest
 
 from racelink.domain import RL_Device, RL_Dev_Type
 from racelink.services.config_service import ConfigService
+from racelink.transport import LP
 
 
 class _FakeTransport:
     """Minimal transport stub: just enough for ``send_get_config`` to
     be call-counted."""
 
-    def __init__(self):
+    def __init__(self, ident_mac: str = "TEST-GW"):
+        # Stage 3 Part C: every transport carries an ident_mac so the
+        # matcher's gateway_id filter has a stable anchor.
+        self.ident_mac = ident_mac
         self.get_config_calls: list[tuple[bytes, int]] = []
 
     def send_get_config(self, recv3, option):
@@ -31,18 +35,49 @@ class _FakeGatewayService:
 
     def __init__(self, *, replies=None):
         self.transport = _FakeTransport()
+        # Stage 3 Part C: production ``ConfigService.read_config`` reads
+        # ``gateway_service.controller.transport_for_device(...)`` to
+        # route the unicast. The fake has no controller, so the route
+        # falls through to ``self.transport``. Mirror the production
+        # contract by exposing ``controller=None`` explicitly.
+        self.controller = None
         self._replies = list(replies or [])
         self.send_calls: list[dict] = []
 
-    def send_and_wait_for_reply(self, recv3, opcode7, send_fn, *, timeout_s=None, discriminator=None):
+    def send_and_match(self, send_fn, matcher, *, transport=None):
+        """Phase-2 path: record the matcher's filters for assertions, run
+        send_fn, and replay queued replies through ``matcher.matches`` so the
+        discriminator filter and structured fields are exercised end-to-end.
+
+        Stage 3 Part C: accepts the new ``transport`` kwarg the
+        production ``GatewayService`` exposes for multi-network
+        routing. The fake doesn't actually route — it always uses
+        ``self.transport`` — but mirroring the signature keeps the
+        production-vs-fake contract honest.
+        """
+        # Surface the filters the caller built so existing tests can keep
+        # asserting "discriminator was forwarded as 0x05" etc.
         self.send_calls.append({
-            "recv3": bytes(recv3),
-            "opcode7": int(opcode7),
-            "timeout_s": timeout_s,
-            "discriminator": discriminator,
+            "sender_filter": matcher.sender_filter,
+            "expected_opcode": matcher.expected_opcode,
+            "expected_ack_of": matcher.expected_ack_of,
+            "discriminator": matcher.discriminator_value,
+            "max_timeout_s": matcher.max_timeout_s,
+            "gateway_id": matcher.gateway_id,
         })
         send_fn()
-        return list(self._replies), bool(self._replies)
+        # Stage 3 Part C: the matcher carries a concrete gateway_id
+        # (from the routed transport); tag each replayed reply so
+        # ``matcher.matches`` accepts it. Mirrors the real transport's
+        # ``_emit`` tagging.
+        for ev in self._replies:
+            tagged = dict(ev)
+            tagged.setdefault("gateway_id", self.transport.ident_mac)
+            if matcher.matches(tagged):
+                matcher.collected.append(tagged)
+                if len(matcher.collected) >= matcher.expected_count:
+                    break
+        return list(matcher.collected), "count" if matcher.collected else "no_reply"
 
 
 def _make_dev(addr: str = "AABBCCDDEEFF"):
@@ -52,6 +87,8 @@ def _make_dev(addr: str = "AABBCCDDEEFF"):
 class ReadConfigTests(unittest.TestCase):
     def test_returns_parsed_tuple_on_success(self):
         replies = [{
+            "opc": int(LP.OPC_GET_CONFIG),
+            "sender3": bytes.fromhex("DDEEFF"),
             "reply": "GET_CONFIG_REPLY",
             "option": 0x05,
             "data0": 60,

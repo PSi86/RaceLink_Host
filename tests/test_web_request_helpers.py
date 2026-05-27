@@ -106,10 +106,13 @@ class WebRequestHelpersTests(unittest.TestCase):
         # Used by the host-side auto-unlock POST on a /update 401.
         self.assertEqual(parsed["ota_password"], "wledota")
 
-    def test_parse_wifi_options_lowered_timeout_default(self):
-        # 35 s → 20 s default. Real associations finish in 5–15 s so
-        # 20 is a generous 4× ceiling; operators can still override
-        # via the dialog's WiFi-timeout field.
+    def test_parse_wifi_options_default_timeout(self):
+        # 30 s default. Real associations finish in 5–15 s but neu 93.txt
+        # captured a multi-device run where nmcli expired exactly at 20 s
+        # while NM was still in transition from the previous device's
+        # disconnect — 30 s gives enough headroom for that case without
+        # impacting the common-path runtime (success returns immediately).
+        # Operators can still override via the dialog's WiFi-timeout field.
         class FakeOTA:
             @staticmethod
             def wled_base_url(raw):
@@ -117,7 +120,7 @@ class WebRequestHelpersTests(unittest.TestCase):
 
         helpers = _load_request_helpers()
         parsed = helpers.parse_wifi_options({}, FakeOTA())
-        self.assertEqual(parsed["timeout_s"], 20.0)
+        self.assertEqual(parsed["timeout_s"], 30.0)
 
     def test_parse_wifi_options_threads_ota_password_through(self):
         class FakeOTA:

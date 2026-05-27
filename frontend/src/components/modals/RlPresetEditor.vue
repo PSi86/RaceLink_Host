@@ -156,15 +156,20 @@ async function onDelete() {
          filter, so the operator never sees an empty heading. Within
          each section, vars render in the order declared in SECTIONS;
          hidden vars use ``v-show`` so the value rides the draft and a
-         later mode change can re-reveal them without losing input. -->
-    <fieldset
+         later mode change can re-reveal them without losing input.
+
+         div + h4 (not fieldset/legend) because tailwind.css opts out of
+         Preflight, so fieldset would render with the browser-default
+         groove border + special legend positioning. Mirrors the
+         heading pattern used in ``SceneEditor.vue``. -->
+    <div
       v-for="section in visibleSections"
       :key="section.title"
       class="grid gap-2"
     >
-      <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <h4 class="m-0 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
         {{ section.title }}
-      </legend>
+      </h4>
       <div :class="section.grid">
         <div
           v-for="varKey in section.vars"
@@ -202,7 +207,7 @@ async function onDelete() {
           />
         </div>
       </div>
-    </fieldset>
+    </div>
 
     <!-- Flags previously lived here (one tri-state toggle per
          RL_FLAG_*). They moved to the Scene Editor's per-action
@@ -218,14 +223,14 @@ async function onDelete() {
         Unsaved changes.
       </span>
       <template v-if="isExisting">
-        <Button type="button" variant="ghost" :disabled="submitting" @click="onDelete">
+        <Button type="button" variant="destructive" :disabled="submitting" @click="onDelete">
           Delete
         </Button>
         <Button type="button" variant="secondary" :disabled="submitting" @click="onDuplicate">
           Duplicate
         </Button>
       </template>
-      <Button type="submit" :disabled="submitting">{{ submitLabel }}</Button>
+      <Button variant="brand" type="submit" :disabled="submitting">{{ submitLabel }}</Button>
     </div>
   </form>
 </template>

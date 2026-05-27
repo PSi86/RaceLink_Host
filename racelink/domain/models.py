@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Optional
 
 from .device_types import RL_FLAG_POWER_ON
+
+
+def default_device_name(mac: str) -> str:
+    """Default display name for a device, derived from its MAC.
+
+    Shared between the IDENTIFY path (first appearance) and the
+    rename-reset path (operator clears the name to revert to default).
+    The format is ``"WLED <12 hex chars upper>"``; non-hex separators
+    in ``mac`` (``:``, ``-``) are stripped before formatting.
+    """
+    cleaned = "".join(c for c in (mac or "") if c.isalnum()).upper()
+    return f"WLED {cleaned[-12:]}"
 
 
 class RL_Device:
@@ -25,6 +38,8 @@ class RL_Device:
         brightness: int = 70,
         configByte: int = 0,
         effectId: int = 0,
+        network_id: Optional[str] = None,
+        last_known_rf_config: Optional[dict] = None,
     ):
         self.addr: str = addr
         self.dev_type: int = int(dev_type)
@@ -32,6 +47,18 @@ class RL_Device:
         self.version: int = int(version)
         self.caps: int = int(caps)
         self.groupId: int = int(groupId)
+        # Multi-network attributes (Stage 2). ``network_id`` is the
+        # stable UUID of the RL_Network this device is bound to;
+        # ``None`` means "no network assigned yet" (will land in the
+        # default network on the next persistence migration).
+        # ``last_known_rf_config`` is the single-value snapshot of
+        # the PHY settings the device reported on its last
+        # IDENTIFY_REPLY / OPC_GET_RF_CONFIG reply — used by the
+        # Setup-Change-Assistant (Stage 3+) for diff detection.
+        self.network_id: Optional[str] = str(network_id) if network_id else None
+        self.last_known_rf_config: Optional[dict] = (
+            dict(last_known_rf_config) if isinstance(last_known_rf_config, dict) else None
+        )
 
         # presetId: last preset we asked the device to load (set by send paths).
         # effectId: device's currently active segment mode (set by STATUS_REPLY;
@@ -143,7 +170,52 @@ class RL_Device:
 
 
 class RL_DeviceGroup:
-    def __init__(self, name: str, static_group: int = 0, dev_type: int = 0):
+    def __init__(
+        self,
+        name: str,
+        static_group: int = 0,
+        dev_type: int = 0,
+        network_id: Optional[str] = None,
+    ):
         self.name: str = name
         self.static_group: int = static_group
         self.dev_type: int = int(dev_type)
+        # Multi-network: a group never spans networks (hard-enforced
+        # in Stage 3's bulk_set_group validation). ``None`` means
+        # "default network" pre-migration; v1->v2 persistence
+        # migration backfills this from the singleton default
+        # network so every persisted group carries a stable id.
+        self.network_id: Optional[str] = str(network_id) if network_id else None
+
+
+class RL_Network:
+    """A logical RaceLink network — one LoRa channel + sync-word band that
+    devices and a gateway share. Hardware MAC of the bound gateway is
+    stored so a hardware swap (same identity, different physical unit)
+    is just a re-bind, not a re-create.
+
+    Stable across reboots; ``id`` is a UUID4 string. ``rf_config`` mirrors
+    the wire-format P_RfConfig dict (freq_hz / bw_khz_x10 / sf / cr_den /
+    sync_word / tx_power_dbm / preamble) so the network and the actual
+    radio carrying it speak the same field shape. Stage 3 introduces a
+    ``channel_id`` indirection on top (pointer into the region channel
+    table); for Stage 2 the field exists but is always ``None``.
+    """
+
+    def __init__(
+        self,
+        id: Optional[str] = None,
+        name: str = "Default",
+        gateway_mac: Optional[str] = None,
+        region: str = "EU868",
+        channel_id: Optional[int] = None,
+        rf_config: Optional[dict] = None,
+        created_ts: Optional[float] = None,
+    ):
+        self.id: str = str(id) if id else str(uuid.uuid4())
+        self.name: str = str(name)
+        self.gateway_mac: Optional[str] = str(gateway_mac).upper() if gateway_mac else None
+        self.region: str = str(region)
+        self.channel_id: Optional[int] = int(channel_id) if channel_id is not None else None
+        self.rf_config: Optional[dict] = dict(rf_config) if isinstance(rf_config, dict) else None
+        self.created_ts: float = float(created_ts) if created_ts is not None else time.time()

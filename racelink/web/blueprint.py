@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 from typing import Any, Callable
 
 from flask import Blueprint, templating
+
+logger = logging.getLogger(__name__)
 
 from ..services import HostWifiService, OTAService, PresetsService
 from .api import register_api_routes
@@ -221,6 +224,9 @@ def create_racelink_web_blueprint(
             host_wifi_service=ctx.services["host_wifi"],
             presets_service=ctx.services["presets"],
         )
+    if "host_settings" not in ctx.services:
+        from ..services.host_settings_service import HostSettingsService
+        ctx.services["host_settings"] = HostSettingsService(controller=ctx.rl_instance)
 
     static_dir = _resolve_asset_dirs()
     bp = Blueprint(
@@ -232,6 +238,39 @@ def create_racelink_web_blueprint(
     )
 
     sse = SSEBridge(logger=runtime.logger)
+    # Stage 2 Part 4: bind the per-network ``MasterStateMap`` to the
+    # controller so the ``/api/master`` snapshot iterates the
+    # operator's persisted networks and ``EV_STATE_CHANGED`` events
+    # can route via ``gateway_id → network_id``.
+    try:
+        sse.attach_controller(runtime.rl_instance)
+    except Exception:
+        logger.exception("SSE attach_controller raised; multi-network routing degraded")
+    # Stage 3 Part D: feed the gateway-bind state machine's
+    # ``gateway_bound`` / ``gateway_conflict`` / ``gateway_unbound``
+    # events into the SSE broadcaster. The bind service buffers
+    # events emitted before this point and discards them silently —
+    # the WebUI re-fetches ``/api/gateways`` on connect so any
+    # pre-bridge state is recoverable.
+    bind_service = getattr(runtime.rl_instance, "gateway_bind_service", None)
+    if bind_service is not None:
+        try:
+            bind_service.attach_broadcast(sse.broadcast)
+        except Exception:
+            logger.exception("gateway_bind_service.attach_broadcast raised")
+    # Round 3: same wiring for the missing-transport tracker so the
+    # gateway_missing SSE event fans out to the WebUI.
+    missing_tracker = getattr(runtime.rl_instance, "missing_transport_tracker", None)
+    if missing_tracker is not None:
+        try:
+            missing_tracker.attach_broadcast(sse.broadcast)
+            # The controller boot path already ran discoverPort by the
+            # time the blueprint registers; evaluate now so any post-
+            # boot missing gateways surface immediately on the very
+            # first SSE subscriber.
+            missing_tracker.evaluate_and_arm()
+        except Exception:
+            logger.exception("missing_transport_tracker.attach_broadcast raised")
     tasks = TaskManager(broadcaster=sse.broadcast, master_state=sse.master, logger=runtime.logger)
     sse.attach_task_manager(tasks)
     attach_task_manager = getattr(runtime.rl_instance, "attach_task_manager", None)
@@ -248,6 +287,24 @@ def create_racelink_web_blueprint(
         )
     except Exception:
         # swallow-ok: not every host exposes the attribute; degrade to polling
+        pass
+
+    # Re-install the SSE transport-event hook on every gateway (re)connect.
+    # ensure_transport_hooked() is one-time-gated; without this callback the
+    # bridge would stay attached to the closed pre-reconnect transport and
+    # post-reconnect events (e.g. an unsolicited IDENTIFY_REPLY from a
+    # freshly powered-on node) would never fan out to SSE clients — the
+    # WebUI's per-row flash animation would silently stop after the first
+    # disconnect/reconnect cycle.
+    try:
+        setattr(
+            runtime.rl_instance,
+            "on_transport_rebind",
+            sse.rebind_transport,
+        )
+    except Exception:
+        # swallow-ok: degraded behaviour is "SSE refresh broadcasts
+        # missing after a reconnect", not a crash.
         pass
 
     ctx.sse = sse

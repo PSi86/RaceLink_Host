@@ -25,9 +25,10 @@ Public API:
 
 Threading: typically driven by the task manager from a worker
 thread (the operator clicks "Discover" → web route → task →
-this service). The reply-collection path uses
-:meth:`GatewayService.send_and_collect`, which installs a
-listener on the transport for the duration of the window.
+this service). The reply-collection path builds a wildcard
+:class:`PendingMatcher` and waits via
+:meth:`GatewayService.send_and_match`; the matcher exits on
+idle-timeout after the last late-comer goes quiet.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from typing import Any, Iterable, List, Optional
 
 from ..transport import LP, mac_last3_from_hex
 from . import rf_timing
+from .pending_requests import PendingMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +52,23 @@ class DiscoveryService:
     def transport(self):
         return getattr(self.controller, "transport", None)
 
-    def discover_devices(self, *, group_filter=255, target_device=None, add_to_group=-1) -> dict:
-        transport = self.transport
+    def discover_devices(self, *, group_filter=255, target_device=None,
+                         add_to_group=-1, transport=None) -> dict:
+        """Trigger an ``OPC_DEVICES`` broadcast and collect IDENTIFY_REPLYs.
+
+        ``transport`` (Stage 3 Part F): scan a specific gateway
+        instance instead of the controller's primary slot. The
+        channel-scan service uses this to walk a region's channels
+        on one gateway while the others stay on their own settings.
+        Defaults to ``self.transport`` for backward compatibility.
+        """
+        if transport is None:
+            transport = self.transport
         if transport is None:
             logger.warning("getDevices: communicator not ready")
             return {"found": 0, "responders": set(), "assigned_group": None}
 
-        self.gateway_service.install_transport_hooks()
+        self.gateway_service.install_transport_hooks(transport=transport)
 
         if target_device is None:
             recv3 = b"\xFF\xFF\xFF"
@@ -64,28 +76,6 @@ class DiscoveryService:
         else:
             recv3 = mac_last3_from_hex(target_device.addr)
             group_id = int(target_device.groupId) & 0xFF
-
-        found = 0
-        responders = set()
-
-        def _collect(ev: dict) -> bool:
-            nonlocal found
-            try:
-                if ev.get("opc") == LP.OPC_DEVICES and ev.get("reply") == "IDENTIFY_REPLY":
-                    found += 1
-                    mac6 = ev.get("mac6")
-                    if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
-                        responders.add(bytes(mac6).hex().upper())
-                    else:
-                        sender3 = ev.get("sender3")
-                        sender_hex = self.controller._to_hex_str(sender3)
-                        if sender_hex:
-                            responders.add(sender_hex.upper())
-                    return True
-            except Exception:
-                # swallow-ok: best-effort fallback; caller proceeds with safe default
-                pass
-            return False
 
         logger.debug("GET_DEVICES -> recv3=%s group=%d flags=%d", recv3.hex().upper(), group_id, 0)
 
@@ -98,13 +88,33 @@ class DiscoveryService:
         # responder count is genuinely unknown (a fresh device could answer),
         # so we keep the hard ceiling at 5 s. Idle-based termination still
         # lets us return early once the last late-comer has gone quiet for
-        # 600 ms.
-        self.gateway_service.send_and_collect(
-            lambda: transport.send_get_devices(recv3=recv3, group_id=group_id, flags=0),
-            _collect,
+        # 600 ms. ``expected_count`` is a large sentinel so the matcher
+        # never exits on count — only idle or max-timeout terminate it.
+        matcher = PendingMatcher(
+            sender_filter=None,  # wildcard — any device may answer
+            expected_opcode=int(LP.OPC_DEVICES) & 0x7F,
+            discriminator_field="reply",
+            discriminator_value="IDENTIFY_REPLY",
+            expected_count=2**31,
             idle_timeout_s=rf_timing.COLLECT_IDLE_TIMEOUT_S,
             max_timeout_s=rf_timing.COLLECT_MAX_CEILING_S,
         )
+        replies, _reason = self.gateway_service.send_and_match(
+            lambda: transport.send_get_devices(recv3=recv3, group_id=group_id, flags=0),
+            matcher,
+            transport=transport,
+        )
+
+        responders: set[str] = set()
+        for ev in replies:
+            mac6 = ev.get("mac6")
+            if isinstance(mac6, (bytes, bytearray)) and len(mac6) == 6:
+                responders.add(bytes(mac6).hex().upper())
+                continue
+            sender_hex = self.controller._to_hex_str(ev.get("sender3"))
+            if sender_hex:
+                responders.add(sender_hex.upper())
+        found = len(replies)
 
         assigned_group = None
         if add_to_group > 0 and add_to_group < 255:

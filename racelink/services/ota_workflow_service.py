@@ -46,7 +46,7 @@ class OTAWorkflowService:
                     # cleanly release the AP.
                     results["errors"].append(
                         f"Host WiFi cleanup: disconnect from {ssid!r} failed: "
-                        f"{type(ex).__name__}: {ex}"
+                        f"{str(ex) or type(ex).__name__}"
                     )
                     # Warning is the actionable single line; the
                     # traceback drops to DEBUG so support sessions can
@@ -61,12 +61,12 @@ class OTAWorkflowService:
                 results["hostWifi"]["enabled"] = False
                 results["hostWifi"]["restored"] = True
             except Exception as ex:
-                # swallow-ok: surfaces via ``results["errors"]``. Add
-                # type prefix so the operator sees the failure mode,
-                # not just the message; the traceback is DEBUG so the
-                # WARNING line stays a clean one-liner.
+                # swallow-ok: surfaces via ``results["errors"]``. The
+                # short prefix ("Host WiFi restore failed: ") tells the
+                # operator which phase broke; the exception text follows
+                # cleanly without the Python class name (2026-05-19).
                 results["errors"].append(
-                    f"Host WiFi restore failed: {type(ex).__name__}: {ex}"
+                    f"Host WiFi restore failed: {str(ex) or type(ex).__name__}"
                 )
                 results["ok"] = False
                 logger.warning("host wifi restore failed: %s", ex)
@@ -81,14 +81,34 @@ class OTAWorkflowService:
             results["hostWifi"]["enabled"] = True
         return host_wifi_changed
 
-    def _connect_wled_wifi(self, task_manager, *, wifi, host_wifi_enable, host_wifi_changed, results, meta):
+    def _connect_wled_wifi(self, task_manager, *, wifi, host_wifi_enable, host_wifi_changed, results, meta, avoid_bssid: str = ""):
         """Scan for any of ``wifi["ssids"]`` and connect to the first
         match using ``wifi["password"]``. Returns ``(matched_ssid,
         host_wifi_changed)``: callers stash the SSID for the
         per-device result and the restore path's ``con down`` call.
+
+        When no explicit ``wifi["bssid"]`` was supplied, predict the
+        target device's SoftAP BSSID from its STA MAC (ESP32 default
+        ``AP_MAC = STA_MAC + 1``). This locks the connect to the
+        intended device's AP even when the previous device's AP is
+        still in the scan cache with a stronger signal. Falls back
+        to ``<auto>`` if the prediction fails (malformed MAC).
+
+        ``avoid_bssid`` is the BSSID of the *previously* connected
+        device — passed through to ``connect_ap`` so the multi-device
+        fallback can pick a single non-avoid candidate when the
+        predicted BSSID isn't visible (handles WLED nodes that don't
+        follow the ESP32 ``AP_MAC = STA_MAC + 1`` default).
         """
         ssids = list(wifi["ssids"])
         ssids_label = ", ".join(ssids) if len(ssids) > 1 else (ssids[0] if ssids else "<none>")
+        # bssid hint: operator-supplied wins; otherwise derive from
+        # this iteration's target MAC carried in ``meta["addr"]``.
+        bssid_hint = str(wifi.get("bssid") or "").strip()
+        if not bssid_hint:
+            addr = str(meta.get("addr") or "")
+            if addr:
+                bssid_hint = self.ota.expected_softap_bssid(addr)
         task_manager.update(
             meta={
                 **meta,
@@ -101,7 +121,8 @@ class OTAWorkflowService:
                 ssids,
                 wifi["password"],
                 iface=wifi["iface"],
-                bssid=wifi["bssid"],
+                bssid=bssid_hint,
+                avoid_bssid=avoid_bssid,
                 timeout_s=wifi["timeout_s"],
             )
             return matched, host_wifi_changed
@@ -122,14 +143,18 @@ class OTAWorkflowService:
                     ssids,
                     wifi["password"],
                     iface=wifi["iface"],
-                    bssid=wifi["bssid"],
+                    bssid=bssid_hint,
+                    avoid_bssid=avoid_bssid,
                     timeout_s=wifi["timeout_s"],
                 )
                 return matched, True
             raise
 
     def download_presets(self, *, rl_instance, task_manager, mac: str, base_url: str, wifi: dict, host_wifi_enable: bool, host_wifi_restore: bool):
-        results = {"ok": True, "baseUrl": base_url, "addr": mac, "file": None, "errors": []}
+        results = {
+            "ok": True, "baseUrl": base_url, "addr": mac, "file": None, "errors": [],
+            "cancelled": False,
+        }
         host_wifi_initial = self.host_wifi.radio_enabled()
         results["hostWifi"] = {"wasEnabled": host_wifi_initial, "enabled": host_wifi_initial, "restored": False}
         # ``connected_ssid`` is the SSID we actually associated to so the
@@ -138,6 +163,13 @@ class OTAWorkflowService:
         connected_ssid = ""
 
         try:
+            # Cooperative cancel: check before any host-WiFi mutation. If
+            # the operator hits Cancel before we have changed network
+            # state there is nothing to roll back.
+            if task_manager.is_cancel_requested():
+                results["cancelled"] = True
+                logger.info("presets-download cancelled by operator before WiFi setup")
+                return results
             host_wifi_changed = self._ensure_wifi_ready(
                 task_manager,
                 wifi=wifi,
@@ -160,6 +192,16 @@ class OTAWorkflowService:
                 results=results,
                 meta={"addr": mac},
             )
+
+            # Second cancel check: WiFi setup is the only step where the
+            # connect can take 5-10 s. After it lands we're on the device
+            # AP, so cancel from here on means "skip the HTTP GET and
+            # let the finally restore WiFi". The download itself is fast
+            # (< 5 s) and not interrupted mid-flight.
+            if task_manager.is_cancel_requested():
+                results["cancelled"] = True
+                logger.info("presets-download cancelled by operator after WiFi connect")
+                return results
 
             expected_mac = self.ota.expected_mac_hex(mac)
             task_manager.update(meta={"stage": "WAIT_HTTP", "addr": mac, "message": f"Waiting for WLED /json/info mac to match {expected_mac}"})
@@ -188,7 +230,7 @@ class OTAWorkflowService:
             # exception text says everything and a fleet OTA can hit
             # the same expected failure for several devices.
             results["ok"] = False
-            results["errors"].append(f"{type(ex).__name__}: {ex}")
+            results["errors"].append(str(ex) or type(ex).__name__)
             logger.warning("presets workflow failed for %s: %s", mac, ex)
         finally:
             self._restore_host_wifi(
@@ -218,7 +260,20 @@ class OTAWorkflowService:
         host_wifi_restore: bool,
         skip_validation: bool = False,
     ):
-        results = {"ok": True, "baseUrl": base_url, "devices": [], "errors": []}
+        results = {
+            "ok": True,
+            "baseUrl": base_url,
+            "devices": [],
+            "errors": [],
+            # Cancel-aware fields populated by the cooperative cancel
+            # check at the device-loop entry. ``cancelled_after`` is the
+            # 1-based index of the last device that ran to completion
+            # (success or per-device error); zero when cancel landed
+            # before the first device. The WiFi-restore finally still
+            # runs unconditionally — see ``_restore_host_wifi``.
+            "cancelled": False,
+            "cancelled_after": None,
+        }
         host_wifi_initial = self.host_wifi.radio_enabled()
         results["hostWifi"] = {"wasEnabled": host_wifi_initial, "enabled": host_wifi_initial, "restored": False}
         # Captured from the most recent successful ``_connect_wled_wifi``
@@ -227,6 +282,13 @@ class OTAWorkflowService:
         # connects to nodes broadcasting different SSIDs (mixed-firmware
         # fleet) still releases the right one at the end.
         last_connected_ssid = ""
+        # BSSID of the previous device we connected to. Threaded into
+        # the next iteration's ``connect_ap`` as ``avoid_bssid`` so
+        # the multi-device fallback can pick a single non-avoid
+        # candidate when the predicted BSSID isn't visible (handles
+        # WLED nodes that don't follow ``AP_MAC = STA_MAC + 1``).
+        # Empty before the first device — no discriminator yet.
+        last_connected_bssid = ""
         # Emit a single workflow-start line so an operator following the
         # log can confirm what was actually scheduled. Without this the
         # only signal a silently-skipped upload leaves is "no error but
@@ -267,6 +329,14 @@ class OTAWorkflowService:
         # frontend/POST_MIGRATION_CLEANUP.md §9 for the prior heuristic.
         addrs = [str(m) for m in macs]
         device_state: dict[str, str] = {a: "queued" for a in addrs}
+        # Per-device live message companion to ``device_state``. Only
+        # populated on the ``error`` transition so the WebUI row can
+        # show the concrete failure ("Timeout waiting for CONFIG ACK
+        # …") instead of the generic "error" label. Read by
+        # FwProgressPanel via ``meta.deviceMessages`` before the task
+        # ends — until 2026-05-19 the panel could only surface error
+        # detail post-run from ``result.errors[]``.
+        device_messages: dict[str, str] = {}
 
         def _meta_base(**extras: Any) -> dict[str, Any]:
             """Build a fresh meta dict carrying the workflow-wide fields
@@ -283,6 +353,7 @@ class OTAWorkflowService:
                 "retries": retries,
                 "baseUrl": base_url,
                 "deviceState": dict(device_state),
+                "deviceMessages": dict(device_messages),
                 **extras,
             }
 
@@ -300,6 +371,20 @@ class OTAWorkflowService:
             )
 
             for idx, addr in enumerate(macs, start=1):
+                # Cooperative cancel: "after the current device" semantics.
+                # Checked only at loop entry — the per-device flash + verify
+                # + reconnect sequence below runs to completion once it has
+                # started, so a cancelled OTA never leaves a device in a
+                # half-flashed state. WiFi-restore still runs in the outer
+                # finally regardless.
+                if task_manager.is_cancel_requested():
+                    results["cancelled"] = True
+                    results["cancelled_after"] = idx - 1
+                    logger.info(
+                        "fw-update cancelled by operator after %d of %d device(s)",
+                        idx - 1, total,
+                    )
+                    break
                 addr_key = str(addr)
                 device_state[addr_key] = "running"
                 expected_mac = self.ota.expected_mac_hex(addr_key)
@@ -311,25 +396,66 @@ class OTAWorkflowService:
                     "error": None,
                 }
                 results["devices"].append(dev_res)
+                # Tracks whether the device has actually ACKed the
+                # AP-enable. Read in the finally block to decide if
+                # AP-Close needs to run as a cleanup step (only when
+                # AP was opened but the subsequent upload failed —
+                # otherwise the WLED reboot drops the AP for us, or
+                # the AP never came up).
+                ap_opened = False
                 try:
-                    emit(
-                        "RACELINK_AP_ON",
-                        index=idx, addr=addr,
-                        message="Enable WLED AP via RaceLink (waiting for ACK)",
-                    )
+                    # N2 setup: drop any stale IDENTIFY_REPLY event for
+                    # this MAC so the post-AP-Close wait below only
+                    # resolves on a *new* identify (after the reboot
+                    # we're about to trigger).
+                    _gw = getattr(rl_instance, "gateway_service", None)
+                    if _gw is not None:
+                        try:
+                            _gw.clear_identify(str(addr))
+                        except Exception as ex:
+                            # swallow-ok: the wait is best-effort
+                            # synchronisation; on failure we proceed
+                            # without it and the next iteration may
+                            # see the previous identify as fresh.
+                            logger.debug("clear_identify failed for %s: %s", addr, ex)
                     # W4: wait for the device to ACK the AP-enable before
                     # starting the WiFi scan/connect — otherwise the host
                     # races into an empty scan list when LoRa latency
                     # delays the device's AP bring-up.
-                    ok_ap = rl_instance.sendConfig(
-                        0x04, data0=1,
-                        recv3=self.ota.recv3_bytes_from_addr(addr_key),
-                        wait_for_ack=True, timeout_s=8.0,
-                    )
+                    #
+                    # 2026-05-19: switched from a single 8 s attempt to
+                    # 1.5 s × 2 attempts (1 retry). Failed devices now
+                    # surface in the UI within ~3 s instead of 8 s, and
+                    # healthy devices typically ACK in < 1 s anyway. The
+                    # retry helps if the first frame is lost in the radio
+                    # without paying the legacy 8 s penalty.
+                    ok_ap = False
+                    for ap_attempt in range(1, 3):
+                        emit(
+                            "RACELINK_AP_ON",
+                            index=idx, addr=addr, attempt=ap_attempt,
+                            message=(
+                                f"Enable WLED AP via RaceLink "
+                                f"(try {ap_attempt}/2)"
+                            ),
+                        )
+                        ok_ap = rl_instance.sendConfig(
+                            0x04, data0=1,
+                            recv3=self.ota.recv3_bytes_from_addr(addr_key),
+                            wait_for_ack=True, timeout_s=1.5,
+                        )
+                        if ok_ap:
+                            break
                     if not ok_ap:
                         raise RuntimeError(
                             f"Timeout waiting for CONFIG ACK from {addr} (AP-enable)"
                         )
+                    # AP is now live on the device. From here on, any
+                    # failure path MUST close the AP — see the finally
+                    # block below. A clean success path doesn't need
+                    # AP-Close: the WLED reboot triggered by the
+                    # firmware-upload drops the AP automatically.
+                    ap_opened = True
                     logger.info("OTA %s: AP-enable ACK received, scanning for SSIDs", addr)
                     matched_ssid, _changed = self._connect_wled_wifi(
                         task_manager,
@@ -338,7 +464,23 @@ class OTAWorkflowService:
                         host_wifi_changed=results["hostWifi"]["enabled"] and not host_wifi_initial,
                         results=results,
                         meta=_meta_base(index=idx, addr=addr),
+                        avoid_bssid=last_connected_bssid,
                     )
+                    # Remember which BSSID nmcli actually associated with
+                    # — used as the next iteration's ``avoid_bssid``. The
+                    # query is best-effort: a failure here only loses the
+                    # discriminator for the multi-device fallback path,
+                    # which then re-degrades to the predicted-only mode.
+                    try:
+                        last_connected_bssid = self.host_wifi.active_bssid(wifi["iface"]) or last_connected_bssid
+                    except Exception as ex:
+                        # swallow-ok: see comment above; logged once for
+                        # support, no traceback (the nmcli error is the
+                        # actionable signal, not the Python frames).
+                        logger.debug(
+                            "active_bssid lookup failed after connect for %s: %s",
+                            addr, ex,
+                        )
                     last_connected_ssid = matched_ssid or last_connected_ssid
                     dev_res["ssid"] = matched_ssid
                     logger.info("OTA %s: connected to SSID %r", addr, matched_ssid)
@@ -431,6 +573,25 @@ class OTAWorkflowService:
                         message=f"{addr}: update complete",
                     )
                     logger.info("OTA %s: completed successfully", addr)
+                    # Post-upload: hard-disconnect the host's WiFi from
+                    # the now-rebooting device. ``-w 0`` skips the 802.11
+                    # deactivation handshake (there is no peer to
+                    # complete it — the device is in reset) and unblocks
+                    # NM's scan-throttle so the *next* iteration's
+                    # ``connect_ap`` doesn't spend ~10 s waiting for the
+                    # scan cache to refresh. See neu 96.txt for the
+                    # specific symptom this addresses.
+                    try:
+                        self.host_wifi.disconnect_iface_fast(wifi["iface"])
+                    except Exception as ex:
+                        # swallow-ok: post-upload disconnect is a
+                        # performance optimisation, not load-bearing for
+                        # correctness; the workflow finishes the device
+                        # successfully either way.
+                        logger.debug(
+                            "post-upload disconnect_iface_fast failed for %s: %s",
+                            addr, ex,
+                        )
                 except Exception as ex:
                     # Per-device failures are operator-actionable in the
                     # vast majority of cases (wrong password, polkit
@@ -441,24 +602,163 @@ class OTAWorkflowService:
                     # DEBUG, because RotorHazard typically runs at
                     # DEBUG level and a fleet OTA can hit the same
                     # expected failure mode for half the fleet.
-                    dev_res["error"] = f"{type(ex).__name__}: {ex}"
-                    results["errors"].append(f"{type(ex).__name__}: {ex}")
+                    #
+                    # 2026-05-19: dropped the ``RuntimeError:`` prefix —
+                    # the class name was Python-jargon that confused
+                    # operators reading the WebUI summary. The fallback
+                    # to ``type(ex).__name__`` only kicks in for
+                    # exceptions whose ``__str__`` is empty (rare; some
+                    # C-API errors). Same string is mirrored into
+                    # ``device_messages`` so the live row can show it
+                    # without waiting for the final result snapshot.
+                    err_text = str(ex) or type(ex).__name__
+                    dev_res["error"] = err_text
+                    results["errors"].append(err_text)
                     device_state[addr_key] = "error"
+                    device_messages[addr_key] = err_text
                     emit(
                         "DEVICE_ERROR",
                         index=idx, addr=addr,
-                        message=f"{addr}: {type(ex).__name__}: {ex}",
+                        message=f"{addr}: {err_text}",
                     )
                     logger.warning("fw upload failed for %s: %s", addr, ex)
                     if stop_on_error:
                         raise
                 finally:
-                    try:
-                        rl_instance.sendConfig(0x04, data0=0, recv3=self.ota.recv3_bytes_from_addr(str(addr)))
-                    except Exception as ex:
-                        # swallow-ok: per-device cleanup config send;
-                        # workflow is already complete or aborting.
-                        logger.debug("post-fw sendConfig failed for %s: %s", addr, ex)
+                    # N2 + N3 (re-ordered per neu 92.txt review):
+                    # wait for the device to come back on the radio and
+                    # for the standard auto-restore SET_GROUP to ACK
+                    # BEFORE we send AP-Close. Otherwise the AP-Close
+                    # frame goes out into the reboot window where the
+                    # device cannot process it — neu 92.txt shows
+                    # attempt 1/3 of every AP-Close timing out and only
+                    # attempt 2/3 ACKing after the reboot.
+                    #
+                    # We only wait when the per-device upload actually
+                    # succeeded — a failed device will not reboot, so
+                    # IDENTIFY_REPLY will not arrive and we'd just burn
+                    # 30 s here for nothing.
+                    if dev_res.get("ok"):
+                        gw = getattr(rl_instance, "gateway_service", None)
+                        if gw is not None:
+                            identify_ok = False
+                            try:
+                                emit(
+                                    "REANNOUNCE_WAIT",
+                                    index=idx, addr=addr,
+                                    message=(
+                                        f"Waiting for {addr} to re-register "
+                                        "on RaceLink radio after reboot"
+                                    ),
+                                )
+                                identify_ok = gw.wait_for_identify(
+                                    str(addr), timeout_s=30.0
+                                )
+                            except Exception as ex:
+                                # swallow-ok: best-effort synchronisation;
+                                # on failure we fall through to the AP-
+                                # Close + next iteration just like the
+                                # legacy code did.
+                                logger.debug(
+                                    "wait_for_identify raised for %s: %s",
+                                    addr, ex,
+                                )
+                            if not identify_ok:
+                                logger.warning(
+                                    "OTA %s: no IDENTIFY_REPLY within 30s "
+                                    "after upload; auto-restore may not "
+                                    "have run for this device",
+                                    addr,
+                                )
+                                device_state[addr_key] = "reannounce_timeout"
+                                dev_res["autoRestoreOk"] = "timeout"
+                                # Snapshot the new state into the SSE
+                                # stream — without an emit() here the
+                                # last meta a client sees still carries
+                                # the "ok" state from DEVICE_DONE.
+                                emit(
+                                    "REANNOUNCE_TIMEOUT",
+                                    index=idx, addr=addr,
+                                    message=(
+                                        f"{addr} did not re-register on "
+                                        "RaceLink within 30s"
+                                    ),
+                                )
+                            else:
+                                autorestore_ok = False
+                                try:
+                                    emit(
+                                        "AUTORESTORE_WAIT",
+                                        index=idx, addr=addr,
+                                        message=(
+                                            f"Waiting for auto-restore "
+                                            f"SET_GROUP for {addr}"
+                                        ),
+                                    )
+                                    autorestore_ok = gw.wait_for_auto_restore(
+                                        str(addr), timeout_s=8.0
+                                    )
+                                except Exception as ex:
+                                    # swallow-ok: see wait_for_identify
+                                    # comment above.
+                                    logger.debug(
+                                        "wait_for_auto_restore raised for %s: %s",
+                                        addr, ex,
+                                    )
+                                if not autorestore_ok:
+                                    logger.warning(
+                                        "OTA %s: auto-restore SET_GROUP did "
+                                        "not finish within 8s; next device "
+                                        "may collide on the radio",
+                                        addr,
+                                    )
+                                    dev_res["autoRestoreOk"] = "timeout"
+                                else:
+                                    dev_res["autoRestoreOk"] = True
+                    # N1: AP-Close with ACK. 2026-05-19: scoped to the
+                    # *error-after-AP-open* case only. On a clean
+                    # success the WLED reboot drops the AP for us; on
+                    # an AP-enable timeout the AP never came up. But
+                    # if AP-enable ACKed and a *later* step failed
+                    # (wrong OTA password, bad firmware binary, HTTP
+                    # 401/500/timeout, …) the device's AP is still
+                    # broadcasting — and that's a soft-security
+                    # concern, so we must close it before moving on.
+                    #
+                    # 1.5 s × 2 attempts matches AP-enable above:
+                    # device is still alive on LoRa in this branch,
+                    # so the first attempt almost always succeeds;
+                    # the retry covers a single dropped frame.
+                    if ap_opened and not dev_res.get("ok"):
+                        try:
+                            ap_closed = False
+                            for close_attempt in range(1, 3):
+                                emit(
+                                    "AP_CLOSE",
+                                    index=idx, addr=addr, attempt=close_attempt,
+                                    message=(
+                                        "Disable WLED AP via RaceLink "
+                                        f"(try {close_attempt}/2)"
+                                    ),
+                                )
+                                ap_closed = rl_instance.sendConfig(
+                                    0x04, data0=0,
+                                    recv3=self.ota.recv3_bytes_from_addr(str(addr)),
+                                    wait_for_ack=True, timeout_s=1.5,
+                                )
+                                if ap_closed:
+                                    break
+                            if not ap_closed:
+                                logger.warning(
+                                    "OTA %s: AP-disable did not ACK within 2 × 1.5s "
+                                    "(device may still be broadcasting its AP)",
+                                    addr,
+                                )
+                        except Exception as ex:
+                            # swallow-ok: per-device cleanup config send;
+                            # workflow is already aborting. The next
+                            # device's iteration won't be affected.
+                            logger.debug("post-fw sendConfig failed for %s: %s", addr, ex)
         except Exception as ex:
             # swallow-ok: outer fallback for the per-device loop. The
             # ``stop_on_error=True`` raise above lands here; per-device
@@ -474,5 +774,26 @@ class OTAWorkflowService:
                 host_wifi_initial=host_wifi_initial,
                 ssid=last_connected_ssid,
             )
+
+        # Workflow-end summary. The UI's status pill renders ``summary``
+        # directly so the operator sees a single-line outcome instead of
+        # the full per-device result JSON. The detailed result is also
+        # emitted to the debug log so a support session can still pull
+        # the full info without re-running the workflow.
+        ok_count = sum(1 for d in results.get("devices", []) if d.get("ok"))
+        total = len(addrs)
+        err_count = len(results.get("errors", []))
+        if results.get("cancelled"):
+            after = results.get("cancelled_after") or 0
+            summary = f"cancelled after {after}/{total} device(s)"
+            if err_count:
+                summary += f", {err_count} error(s)"
+        elif err_count or ok_count < total:
+            summary = f"{ok_count}/{total} ok, {err_count} error(s)"
+        else:
+            summary = f"{ok_count}/{total} ok"
+        results["summary"] = summary
+        logger.info("fw-update workflow finished: %s", summary)
+        logger.debug("fw-update workflow full result: %s", results)
 
         return results

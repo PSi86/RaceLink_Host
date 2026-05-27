@@ -562,6 +562,83 @@ class WebApiScenesRouteTests(unittest.TestCase):
         self.assertEqual(result[1], 400)
         self.assertEqual(self.ctx.sse.broadcasts, [])
 
+    # ---- network_scope ------------------------------------------------
+
+    def test_create_with_explicit_scope_persists(self):
+        self._set_body({
+            "label": "Scoped",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": ["net-a"]},
+        })
+        result = self._route("/api/scenes", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-a"]},
+        )
+
+    def test_create_without_scope_defaults_to_auto(self):
+        self._set_body({"label": "AutoMode", "actions": [{"kind": "sync"}]})
+        result = self._route("/api/scenes", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["scene"]["network_scope"], {"mode": "auto"})
+
+    def test_create_malformed_scope_returns_400(self):
+        self._set_body({
+            "label": "Bad",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": []},
+        })
+        result = self._route("/api/scenes", "POST")()
+        self.assertEqual(result[1], 400)
+
+    def test_update_can_set_explicit_scope(self):
+        self._set_body({"label": "X", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        self._set_body({
+            "network_scope": {"mode": "explicit", "network_ids": ["net-x"]},
+        })
+        result = self._route("/api/scenes/<key>", "PUT")("x")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-x"]},
+        )
+
+    def test_duplicate_copies_scope(self):
+        self._set_body({
+            "label": "Src",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "explicit", "network_ids": ["net-a"]},
+        })
+        self._route("/api/scenes", "POST")()
+        self._set_body({"label": "Copy"})
+        result = self._route("/api/scenes/<key>/duplicate", "POST")("src")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["scene"]["network_scope"],
+            {"mode": "explicit", "network_ids": ["net-a"]},
+        )
+
+    def test_estimate_includes_resolved_network_ids(self):
+        self._set_body({"label": "E", "actions": [{"kind": "sync"}]})
+        self._route("/api/scenes", "POST")()
+        result = self._route("/api/scenes/<key>/estimate", "GET")("e")
+        self.assertTrue(result["ok"])
+        self.assertIn("resolved_network_ids", result)
+        self.assertIn("network_scope_mode", result)
+        self.assertEqual(result["network_scope_mode"], "auto")
+
+    def test_draft_estimate_accepts_scope_field(self):
+        self._set_body({
+            "label": "draft",
+            "actions": [{"kind": "sync"}],
+            "network_scope": {"mode": "auto"},
+        })
+        result = self._route("/api/scenes/estimate", "POST")()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["network_scope_mode"], "auto")
+
     # ---- estimate -----------------------------------------------------
 
     def test_editor_schema_includes_offset_group_and_lora_params(self):
@@ -878,6 +955,387 @@ class WebApiScenesRouteTests(unittest.TestCase):
         self.assertNotIn("scene_progress", topics)
 
 
+class _FakeTransport:
+    def __init__(self, ident_mac):
+        self.ident_mac = ident_mac
+
+
+class _FakeGatewayService:
+    """Records (transport, kwargs) per call so the test can assert that
+    the per-gateway routes pass through the resolved transport instance
+    and the legacy routes pass ``transport=None``."""
+
+    def __init__(self, *, get_cfg=None, set_result=None):
+        self.get_calls: list = []
+        self.set_calls: list = []
+        self._get_cfg = get_cfg or {
+            "freq_hz": 867_700_000, "bw_khz_x10": 1250, "sf": 7, "cr_den": 5,
+            "sync_word": 0x12, "tx_power_dbm": 14, "preamble": 8,
+        }
+        self._set_result = set_result or {"ok": True}
+
+    def query_gateway_rf_config(self, *, transport=None, timeout_s=0.5):
+        self.get_calls.append({"transport": transport})
+        return {"ok": True, "rf_config": dict(self._get_cfg)}
+
+    def set_gateway_rf_config(self, rf_config, *, persist=True, transport=None,
+                              timeout_s=1.0):
+        self.set_calls.append({
+            "rf_config": dict(rf_config),
+            "persist": persist,
+            "transport": transport,
+        })
+        return dict(self._set_result)
+
+
+class _RfConfigRouteContext(_FakeContext):
+    """Extends ``_FakeContext`` with the gateway_service + transports
+    that the per-gateway RF-config routes need. Inheriting from
+    ``_FakeContext`` keeps ``services``, ``sse`` etc. populated so
+    ``register_api_routes`` reaches the route definitions."""
+
+    def __init__(self, *, gw_service, transports):
+        super().__init__()
+        self.rl_instance = type("RL", (), {
+            "gateway_service": gw_service,
+            "transports": list(transports),
+            "uiPresetList": [],
+        })()
+
+
+class GatewayRfConfigRouteTests(unittest.TestCase):
+    """Bug 4 (multi-gateway): /api/gateways/<ident_mac>/rf_config
+    GET+POST must route to the matching attached transport, return 404
+    when nothing matches, and preserve the legacy /api/gateway/rf_config
+    single-transport behaviour."""
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+        self.gw = _FakeGatewayService()
+        self.t_a = _FakeTransport("AA:BB:CC:DD:EE:01")
+        self.t_b = _FakeTransport("AA:BB:CC:DD:EE:02")
+        self.bp = _FakeBlueprint()
+        self.ctx = _RfConfigRouteContext(
+            gw_service=self.gw, transports=[self.t_a, self.t_b],
+        )
+        self.api_module.register_api_routes(self.bp, self.ctx)
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    def _get(self, path):
+        return self.bp.routes[(path, ("GET",))]
+
+    def _post(self, path):
+        return self.bp.routes[(path, ("POST",))]
+
+    # ---- per-gateway GET ----------------------------------------------
+
+    def test_per_gateway_get_routes_to_matching_transport(self):
+        handler = self._get("/api/gateways/<ident_mac>/rf_config")
+        payload = handler("AA:BB:CC:DD:EE:02")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(self.gw.get_calls), 1)
+        # The route passed the *exact* second transport instance, not
+        # the primary slot.
+        self.assertIs(self.gw.get_calls[0]["transport"], self.t_b)
+
+    def test_per_gateway_get_is_case_insensitive(self):
+        handler = self._get("/api/gateways/<ident_mac>/rf_config")
+        payload = handler("aa:bb:cc:dd:ee:01")
+        self.assertTrue(payload["ok"])
+        self.assertIs(self.gw.get_calls[0]["transport"], self.t_a)
+
+    def test_per_gateway_get_returns_404_when_no_match(self):
+        handler = self._get("/api/gateways/<ident_mac>/rf_config")
+        result = handler("FF:FF:FF:FF:FF:FF")
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 404)
+        self.assertFalse(payload["ok"])
+        # The gateway_service was never invoked.
+        self.assertEqual(self.gw.get_calls, [])
+
+    # ---- per-gateway POST ---------------------------------------------
+
+    def test_per_gateway_post_routes_to_matching_transport(self):
+        good = {
+            "rf_config": {
+                "freq_hz": 868_300_000, "bw_khz_x10": 1250, "sf": 8,
+                "cr_den": 5, "sync_word": 0x34, "tx_power_dbm": 10,
+                "preamble": 8,
+            },
+            "persist": True,
+        }
+        self._set_body(good)
+        handler = self._post("/api/gateways/<ident_mac>/rf_config")
+        payload = handler("AA:BB:CC:DD:EE:01")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(self.gw.set_calls), 1)
+        self.assertIs(self.gw.set_calls[0]["transport"], self.t_a)
+        self.assertEqual(self.gw.set_calls[0]["rf_config"]["sf"], 8)
+        self.assertTrue(self.gw.set_calls[0]["persist"])
+
+    def test_per_gateway_post_returns_404_when_no_match(self):
+        self._set_body({"rf_config": {
+            "freq_hz": 0, "bw_khz_x10": 0, "sf": 0, "cr_den": 0,
+            "sync_word": 0, "tx_power_dbm": 0, "preamble": 0,
+        }})
+        handler = self._post("/api/gateways/<ident_mac>/rf_config")
+        result = handler("FF:FF:FF:FF:FF:FF")
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 404)
+        self.assertEqual(self.gw.set_calls, [])
+
+    def test_per_gateway_post_validates_missing_fields(self):
+        self._set_body({"rf_config": {"freq_hz": 0}})
+        handler = self._post("/api/gateways/<ident_mac>/rf_config")
+        result = handler("AA:BB:CC:DD:EE:01")
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 400)
+        # Body validation happens before transport pass-through.
+        self.assertEqual(self.gw.set_calls, [])
+
+    # ---- legacy single-gateway routes still work ----------------------
+
+    def test_legacy_get_passes_no_transport(self):
+        handler = self._get("/api/gateway/rf_config")
+        payload = handler()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(self.gw.get_calls), 1)
+        # Legacy route defers to the gateway_service default (which
+        # itself falls back to the controller's primary transport).
+        self.assertIsNone(self.gw.get_calls[0]["transport"])
+
+    def test_legacy_post_passes_no_transport(self):
+        good = {
+            "rf_config": {
+                "freq_hz": 868_300_000, "bw_khz_x10": 1250, "sf": 7,
+                "cr_den": 5, "sync_word": 0x12, "tx_power_dbm": 14,
+                "preamble": 8,
+            },
+        }
+        self._set_body(good)
+        handler = self._post("/api/gateway/rf_config")
+        payload = handler()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(self.gw.set_calls), 1)
+        self.assertIsNone(self.gw.set_calls[0]["transport"])
+
+
+class _FakeMissingTransportTracker:
+    """Records cancel / clear_cancelled / evaluate_and_arm so route
+    tests can assert the controller-side state transitions without
+    needing a real tracker thread."""
+
+    def __init__(self):
+        self.cancel_calls: list = []
+        self.clear_calls = 0
+        self.evaluate_calls = 0
+        self._cancelled: set[str] = set()
+        self._snapshot: list[dict] = []
+
+    def cancel(self, ident_mac):
+        self.cancel_calls.append(ident_mac)
+        if ident_mac is None:
+            # Simulate "cancel all missing" — for the test we just
+            # tag a sentinel so the assertion knows it happened.
+            self._cancelled.add("__ALL__")
+        else:
+            self._cancelled.add(str(ident_mac).upper())
+
+    def clear_cancelled(self):
+        self.clear_calls += 1
+        self._cancelled.clear()
+
+    def evaluate_and_arm(self):
+        self.evaluate_calls += 1
+
+    def cancelled_macs(self):
+        return set(self._cancelled)
+
+    def snapshot(self):
+        return list(self._snapshot)
+
+
+class _GatewayRoutesContext(_FakeContext):
+    """Context for the Round-3 gateway routes (query-state, rediscover,
+    cancel-reconnect). Owns the fake gateway_service, transports, and
+    tracker so each test can program their behaviour."""
+
+    def __init__(self, *, transports, gw_service=None, tracker=None,
+                 soft_rediscover_result=0, soft_rediscover_raises=False):
+        super().__init__()
+        self._fake_gw = gw_service
+        self._fake_tracker = tracker
+        self._soft_result = int(soft_rediscover_result)
+        self._soft_raises = bool(soft_rediscover_raises)
+        self.soft_rediscover_calls = 0
+        self._transports_list = list(transports)
+
+        outer = self
+
+        class _RL:
+            gateway_service = outer._fake_gw
+            missing_transport_tracker = outer._fake_tracker
+            transports = outer._transports_list
+            uiPresetList: list = []
+
+            def soft_rediscover(self):
+                outer.soft_rediscover_calls += 1
+                if outer._soft_raises:
+                    raise RuntimeError("simulated USB failure")
+                return outer._soft_result
+
+        self.rl_instance = _RL()
+
+
+class _FakeQueryStateGwService:
+    def __init__(self, *, results_by_mac=None):
+        self.calls: list = []
+        self._results = dict(results_by_mac or {})
+
+    def query_state(self, *, timeout_s=0.5, transport=None):
+        self.calls.append({"transport": transport})
+        mac = (getattr(transport, "ident_mac", "") or "").upper()
+        result = self._results.get(mac, {
+            "ok": True,
+            "state": "IDLE",
+            "state_byte": 1,
+            "state_metadata_ms": 0,
+        })
+        return dict(result)
+
+
+class GatewayMultiTransportRoutesTests(unittest.TestCase):
+    """Round 3 Tasks 3-5: per-gateway query-state fanout, manual
+    rediscover, and cancel-reconnect endpoints."""
+
+    def _make_routes(self, *, transports, gw_service=None, tracker=None,
+                     soft_rediscover_result=0, soft_rediscover_raises=False):
+        api_module = _import_api_module()
+        api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+        bp = _FakeBlueprint()
+        ctx = _GatewayRoutesContext(
+            transports=transports,
+            gw_service=gw_service,
+            tracker=tracker,
+            soft_rediscover_result=soft_rediscover_result,
+            soft_rediscover_raises=soft_rediscover_raises,
+        )
+        api_module.register_api_routes(bp, ctx)
+        return api_module, bp, ctx
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    # ---- /api/gateways/query-state ------------------------------------
+
+    def test_query_state_fanouts_over_all_transports(self):
+        gw = _FakeQueryStateGwService(results_by_mac={
+            "AA:AA:AA:AA:AA:01": {"ok": True, "state": "TX",   "state_byte": 2, "state_metadata_ms": 0},
+            "BB:BB:BB:BB:BB:02": {"ok": True, "state": "IDLE", "state_byte": 1, "state_metadata_ms": 0},
+        })
+        t1 = _FakeTransport("AA:AA:AA:AA:AA:01")
+        t2 = _FakeTransport("BB:BB:BB:BB:BB:02")
+        _, bp, _ = self._make_routes(transports=[t1, t2], gw_service=gw)
+
+        handler = bp.routes[("/api/gateways/query-state", ("POST",))]
+        out = handler()
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["gateways"]), 2)
+        self.assertEqual(len(gw.calls), 2)
+        self.assertIs(gw.calls[0]["transport"], t1)
+        self.assertIs(gw.calls[1]["transport"], t2)
+        states = {r["ident_mac"]: r["state"] for r in out["gateways"]}
+        self.assertEqual(states["AA:AA:AA:AA:AA:01"], "TX")
+        self.assertEqual(states["BB:BB:BB:BB:BB:02"], "IDLE")
+
+    def test_query_state_with_zero_transports_returns_empty_list(self):
+        gw = _FakeQueryStateGwService()
+        _, bp, _ = self._make_routes(transports=[], gw_service=gw)
+        out = bp.routes[("/api/gateways/query-state", ("POST",))]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["gateways"], [])
+        self.assertEqual(gw.calls, [])
+
+    # ---- /api/gateway/rediscover --------------------------------------
+
+    def test_rediscover_clears_cancelled_and_calls_soft_rediscover(self):
+        tracker = _FakeMissingTransportTracker()
+        tracker._cancelled.add("STALE")
+        _, bp, ctx = self._make_routes(
+            transports=[], tracker=tracker, soft_rediscover_result=1,
+        )
+        out = bp.routes[("/api/gateway/rediscover", ("POST",))]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["attached"], 1)
+        self.assertEqual(ctx.soft_rediscover_calls, 1)
+        self.assertEqual(tracker.clear_calls, 1)
+        self.assertEqual(tracker.evaluate_calls, 1)
+        # The pre-set "STALE" cancel was cleared.
+        self.assertEqual(tracker.cancelled_macs(), set())
+
+    def test_rediscover_returns_500_on_soft_rediscover_failure(self):
+        tracker = _FakeMissingTransportTracker()
+        _, bp, _ = self._make_routes(
+            transports=[], tracker=tracker, soft_rediscover_raises=True,
+        )
+        result = bp.routes[("/api/gateway/rediscover", ("POST",))]()
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 500)
+        self.assertFalse(payload["ok"])
+
+    # ---- /api/gateway/cancel-reconnect --------------------------------
+
+    def test_cancel_reconnect_with_specific_mac(self):
+        tracker = _FakeMissingTransportTracker()
+        _, bp, _ = self._make_routes(transports=[], tracker=tracker)
+        self._set_body({"ident_mac": "AA:AA:AA:AA:AA:01"})
+        out = bp.routes[("/api/gateway/cancel-reconnect", ("POST",))]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(tracker.cancel_calls, ["AA:AA:AA:AA:AA:01"])
+        self.assertIn("AA:AA:AA:AA:AA:01", tracker.cancelled_macs())
+
+    def test_cancel_reconnect_with_null_ident_mac_cancels_all(self):
+        tracker = _FakeMissingTransportTracker()
+        _, bp, _ = self._make_routes(transports=[], tracker=tracker)
+        self._set_body({"ident_mac": None})
+        out = bp.routes[("/api/gateway/cancel-reconnect", ("POST",))]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(tracker.cancel_calls, [None])
+
+    def test_cancel_reconnect_with_empty_body_cancels_all(self):
+        tracker = _FakeMissingTransportTracker()
+        _, bp, _ = self._make_routes(transports=[], tracker=tracker)
+        # Empty body — no ident_mac key → equivalent to null.
+        self._set_body({})
+        out = bp.routes[("/api/gateway/cancel-reconnect", ("POST",))]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(tracker.cancel_calls, [None])
+
+    def test_cancel_reconnect_rejects_non_string_ident_mac(self):
+        tracker = _FakeMissingTransportTracker()
+        _, bp, _ = self._make_routes(transports=[], tracker=tracker)
+        self._set_body({"ident_mac": 42})
+        result = bp.routes[("/api/gateway/cancel-reconnect", ("POST",))]()
+        self.assertIsInstance(result, tuple)
+        payload, status = result
+        self.assertEqual(status, 400)
+        # Tracker was not touched.
+        self.assertEqual(tracker.cancel_calls, [])
+
+
 class WebApiStaticGuardTests(unittest.TestCase):
     def test_web_api_has_no_free_get_specials_config_symbol(self):
         path = ROOT / "racelink" / "web" / "api.py"
@@ -905,6 +1363,256 @@ class WebApiStaticGuardTests(unittest.TestCase):
 
         free_names = used - imported - assigned - set(dir(__builtins__))
         self.assertNotIn("get_specials_config", free_names)
+
+
+# ---------------------------------------------------------------------
+# Per-device / per-group network-migration routes
+# (POST /api/devices/migrate-network, POST /api/groups/<id>/migrate-network)
+# ---------------------------------------------------------------------
+
+class _MigrationRouteContext(_FakeContext):
+    """Extends ``_FakeContext`` with the migration_service + group/
+    network repositories + a TaskManager that records but does not
+    actually run jobs (the body-validation paths return BEFORE the
+    runner fires, and the happy-path tests assert on the task meta
+    only — the service-level tests in test_rf_migration_service.py
+    cover the actual migration outcomes)."""
+
+    def __init__(self, *, devices=None, groups=None):
+        super().__init__()
+        self._fake_devs = list(devices or [])
+        self._fake_groups = list(groups or [])
+
+        # Tasks: record start + meta, never actually run the runner.
+        started: list = []
+
+        class _Tasks:
+            @staticmethod
+            def is_running():
+                return False
+
+            @staticmethod
+            def busy_response():
+                return ({"ok": False, "error": "busy"}, 409)
+
+            @staticmethod
+            def start(name, runner, *, meta=None):
+                started.append({"name": name, "meta": dict(meta or {})})
+                return {"id": f"task-{len(started)}", "name": name}
+
+            @staticmethod
+            def update(meta=None):
+                pass
+
+            @staticmethod
+            def snapshot():
+                return {}
+
+        self.tasks = _Tasks()
+        self.tasks_started = started
+
+        # SSE stub that records refreshes for assertions.
+        broadcasts: list = []
+
+        class _Sse:
+            @staticmethod
+            def ensure_transport_hooked(_rl):
+                pass
+
+            broadcasts_list = broadcasts
+
+            master = type("Master", (), {"snapshot": staticmethod(lambda: {})})()
+
+        # Provide both ``ctx.sse`` (object) and a recording helper.
+        self.sse = _Sse()
+        self.sse_broadcasts = broadcasts
+
+        # Migration service stub: records calls but returns immediately.
+        class _MigrationService:
+            calls: list = []
+
+            @staticmethod
+            def migrate_devices_to(**kw):
+                _MigrationService.calls.append({"fn": "devices", **kw})
+                return {"ok": True, "summary": {}, "per_device": [], "stranded": []}
+
+            @staticmethod
+            def migrate_group_to(**kw):
+                _MigrationService.calls.append({"fn": "group", **kw})
+                return {"ok": True, "summary": {}, "per_device": [], "stranded": [], "group_id": kw.get("group_id")}
+
+        # Network + group + device repos used by the block-mode pre-check
+        # and the group-route's member lookup.
+        class _Repo:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def list(self):
+                return list(self._items)
+
+        ctx_devs = self._fake_devs
+        ctx_groups = self._fake_groups
+
+        class _RL:
+            rf_migration_service = _MigrationService
+            device_repository = _Repo(ctx_devs)
+            group_repository = _Repo(ctx_groups)
+            uiPresetList = []
+
+            @staticmethod
+            def getDeviceFromAddress(mac):
+                target = str(mac or "").upper()
+                for d in ctx_devs:
+                    if str(getattr(d, "addr", "") or "").upper() == target:
+                        return d
+                return None
+
+        self.rl_instance = _RL()
+        self.migration_service = _MigrationService
+
+
+class MigrateNetworkRouteTests(unittest.TestCase):
+    """Tests for POST /api/groups/migrate-network — the single
+    consolidated entry point for moving one or more groups (with
+    their members) onto a target network. The previous per-device
+    + per-group endpoints were removed in favour of this bulk path,
+    matching the operator-facing UI consolidation (one
+    ManageGroupsDialog for both reorder + move)."""
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+
+    def _make(self, *, devices=None, groups=None):
+        bp = _FakeBlueprint()
+        ctx = _MigrationRouteContext(devices=devices or [], groups=groups or [])
+        self.api_module.register_api_routes(bp, ctx)
+        return bp, ctx
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    def _route(self, bp):
+        return bp.routes[("/api/groups/migrate-network", ("POST",))]
+
+    def test_missing_group_ids_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"target_network_id": "net-b"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("group_ids required", result[0]["error"])
+
+    def test_empty_group_ids_list_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"group_ids": [], "target_network_id": "net-b"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+
+    def test_missing_target_network_returns_400(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        bp, _ctx = self._make(groups=groups)
+        self._set_body({"group_ids": [0]})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("target_network_id required", result[0]["error"])
+
+    def test_bad_offline_mode_returns_400(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        bp, _ctx = self._make(groups=groups)
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "weird",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("offline_mode must be", result[0]["error"])
+
+    def test_unknown_group_id_returns_404(self):
+        bp, _ctx = self._make(groups=[])
+        self._set_body({
+            "group_ids": [99],
+            "target_network_id": "net-b",
+            "offline_mode": "skip",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 404)
+        self.assertIn("unknown group_id", result[0]["error"])
+
+    def test_block_mode_rejects_offline_member_with_structured_detail(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        offline = RL_Device("AABBCC112233", RL_Dev_Type.NODE_WLED_REV5,
+                             "x", groupId=0)
+        offline.link_online = False
+        bp, _ctx = self._make(groups=groups, devices=[offline])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertEqual(result[0]["detail"]["code"], "offline_block")
+        self.assertEqual(result[0]["detail"]["offline_macs"], ["AABBCC112233"])
+
+    def test_block_mode_passes_when_all_members_online(self):
+        groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
+        member = RL_Device("AABBCC112233", RL_Dev_Type.NODE_WLED_REV5,
+                            "x", groupId=0)
+        member.link_online = True
+        bp, ctx = self._make(groups=groups, devices=[member])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(ctx.tasks_started), 1)
+        # block-mode promotes to skip internally when no actual
+        # offline member is present.
+        self.assertEqual(ctx.tasks_started[0]["meta"]["offline_mode"], "skip")
+        self.assertEqual(ctx.tasks_started[0]["meta"]["group_ids"], [0])
+
+    def test_multiple_groups_in_single_call_starts_one_task(self):
+        groups = [
+            RL_DeviceGroup("A", static_group=0, dev_type=0),
+            RL_DeviceGroup("B", static_group=0, dev_type=0),
+        ]
+        a1 = RL_Device("AABBCC111111", RL_Dev_Type.NODE_WLED_REV5, "a1", groupId=0)
+        b1 = RL_Device("AABBCC222222", RL_Dev_Type.NODE_WLED_REV5, "b1", groupId=1)
+        a1.link_online = True
+        b1.link_online = True
+        bp, ctx = self._make(groups=groups, devices=[a1, b1])
+        self._set_body({
+            "group_ids": [0, 1],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        # Single TaskManager job for the multi-group case — one
+        # progress stream covering all groups.
+        self.assertEqual(len(ctx.tasks_started), 1)
+        self.assertEqual(ctx.tasks_started[0]["meta"]["group_ids"], [0, 1])
+        self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 2)
+
+    def test_empty_group_membership_still_starts_task(self):
+        """Operator can flip an empty group's network_id (e.g. to
+        pre-stage a group before populating it on the target)."""
+        groups = [RL_DeviceGroup("Empty", static_group=0, dev_type=0)]
+        bp, ctx = self._make(groups=groups, devices=[])
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-b",
+            "offline_mode": "block",
+        })
+        result = self._route(bp)()
+        self.assertTrue(result["ok"])
+        self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 0)
 
 
 if __name__ == "__main__":

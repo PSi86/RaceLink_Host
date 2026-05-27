@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="RaceLink">
+  <defs>
+    <linearGradient id="rl-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff2e6e"/>
+      <stop offset="1" stop-color="#1fe6d6"/>
+    </linearGradient>
+    <linearGradient id="rl-sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".18"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- brand tile -->
+  <rect width="256" height="256" rx="60" fill="url(#rl-grad)"/>
+  <!-- subtle top sheen for depth -->
+  <rect width="256" height="256" rx="60" fill="url(#rl-sheen)"/>
+
+  <!-- RL wordmark: heavy, tight, optically centred -->
+  <text x="128" y="129"
+        font-family="'Arial Black','Helvetica Neue',Arial,sans-serif"
+        font-size="150" font-weight="900"
+        fill="#ffffff" text-anchor="middle"
+        dominant-baseline="central" letter-spacing="-9">RL</text>
+</svg>

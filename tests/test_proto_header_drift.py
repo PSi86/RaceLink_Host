@@ -1,26 +1,37 @@
-"""Regression: ``racelink_proto.h`` must stay byte-identical across the
-three repos that consume it (B8).
+"""Regression: the shared RaceLink headers must stay byte-identical
+across the repos that consume them — but the matrix is asymmetric.
 
-The wire protocol is duplicated in three places by design (each
-firmware repo carries its own copy so it can be flashed
-standalone):
+Source of truth is the **WLED LoRa fork working tree**:
+``../WLED LoRa/WLED/usermods/racelink_wled/`` (relative to this repo's
+parent dir). The standalone ``RaceLink_WLED`` repo is a distribution
+mirror that publishes the same content; ``RaceLink_Gateway/src``
+carries copies because it builds a separate ESP32 firmware.
 
-* ``./racelink_proto.h``                       (Host = this repo)
-* ``../RaceLink_Gateway/src/racelink_proto.h``  (Gateway firmware)
-* ``../RaceLink_WLED/racelink_proto.h``         (WLED firmware)
+The Host repo carries only a **two-header subset** — the ones that
+have an actual Python consumer:
 
-Drift between any pair is a real bug — opcodes / structs / flags
-shift on the wire in ways that look plausible end-to-end until a
-specific combination of host build + firmware build deserialises
+* ``racelink_proto.h`` — parsed by ``gen_racelink_proto_py.py`` into
+  ``racelink/racelink_proto_auto.py`` and referenced from many host
+  modules (``protocol/packets.py``, ``domain/flags.py``,
+  ``transport/gateway_events.py``, ...).
+* ``racelink_indicators.h`` — guards the hand-authored Python mirror
+  ``racelink/domain/indicators.py`` against drift on the wire-stable
+  ``IND_*`` ids (append-only contract).
+
+The other two — ``racelink_headless.h`` and
+``racelink_transport_core.h`` — are FW-internal (Headless-Master logic
+and TX-pipeline / LBT / CAD on Gateway + Node side). They live in the
+three FW locations but have no Python consumer; the Host repo does
+NOT carry them, and this test does not require them there.
+
+Drift between any pair listed below is a real bug — opcodes / structs
+/ flags shift on the wire in ways that look plausible end-to-end until
+a specific combination of host build + firmware build deserialises
 the same bytes differently.
 
-Per the audit's B8 finding: the project had no automated check that
-fails when these diverge. This test fills that gap.
-
-The sibling repos may not be present (e.g. CI checks out only the
-Host). When a sibling is missing, the test logs and skips that
-comparison rather than failing — drift can only be checked when
-both files exist on disk.
+Sibling locations may be absent (e.g. CI checks out only the Host).
+When a sibling is missing, the comparison is skipped with a logged
+message rather than failing.
 """
 
 from __future__ import annotations
@@ -30,14 +41,37 @@ import pathlib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HOST_HEADER = ROOT / "racelink_proto.h"
 
-# Sibling repo paths, relative to the Host repo's parent. Adjust here
-# if the layout ever changes — the Host's ``docs/repo_split_map.md``
-# documents the canonical layout.
-SIBLING_HEADERS = {
-    "Gateway": ROOT.parent / "RaceLink_Gateway" / "src" / "racelink_proto.h",
-    "WLED":    ROOT.parent / "RaceLink_WLED" / "racelink_proto.h",
+# --- Header sets -------------------------------------------------------
+#
+# Host carries this subset (Pflicht — these MUST exist at Host top
+# level). Adding a header here means a Python consumer relies on it.
+HOST_HEADERS = (
+    "racelink_proto.h",
+    "racelink_indicators.h",
+)
+
+# FW-only headers — present in the canonical and the two FW siblings,
+# never in the Host repo.
+FW_ONLY_HEADERS = (
+    "racelink_headless.h",
+    "racelink_transport_core.h",
+)
+
+# Union — every header that lives anywhere in the matrix.
+ALL_HEADERS = HOST_HEADERS + FW_ONLY_HEADERS
+
+
+# --- Locations ---------------------------------------------------------
+#
+# Canonical lives in the WLED LoRa fork working tree. The standalone
+# RaceLink_WLED repo is a publish mirror; RaceLink_Gateway/src is a
+# build-time copy. All paths are resolved relative to ROOT.parent
+# (= ``C:\Users\psima\Dev`` in the typical layout).
+CANONICAL_DIR = ROOT.parent / "WLED LoRa" / "WLED" / "usermods" / "racelink_wled"
+FW_SIBLINGS = {
+    "WLED":    ROOT.parent / "RaceLink_WLED",
+    "Gateway": ROOT.parent / "RaceLink_Gateway" / "src",
 }
 
 
@@ -49,55 +83,97 @@ def _sha256(path: pathlib.Path) -> str:
 
 class ProtoHeaderDriftTests(unittest.TestCase):
 
-    def test_host_header_exists(self):
-        """The Host's own copy must always exist — it's the source of
-        truth for the auto-generated ``racelink_proto_auto.py``."""
-        self.assertTrue(
-            HOST_HEADER.is_file(),
-            f"Host racelink_proto.h not found at {HOST_HEADER}",
-        )
-
-    def test_sibling_headers_match_host_byte_for_byte(self):
-        """Every sibling repo's copy that is present on disk must
-        match the Host's copy. A diff is a hard failure — silent
-        drift produced subtle wire bugs in the past (the audit
-        documented one such case where the Gateway and WLED differed
-        on a struct ordering for one release).
-
-        Missing sibling repos are not an error — operators may check
-        out only the Host. Skipped comparisons get a printed message
-        so a CI run that should have covered all three is visible
-        in the log.
-        """
-        host_hash = _sha256(HOST_HEADER)
-        compared = []
-        for name, path in SIBLING_HEADERS.items():
-            if not path.is_file():
-                # Logged via ``addCleanup`` so the message survives
-                # the test passing (unittest swallows print() inside
-                # a passing test under some runners).
-                self.addCleanup(
-                    print,
-                    f"[proto-drift] sibling not present: {name} ({path})",
-                )
-                continue
-            sibling_hash = _sha256(path)
-            compared.append(name)
-            self.assertEqual(
-                sibling_hash, host_hash,
-                f"racelink_proto.h drift: Host vs {name} "
-                f"({path}) — sha256 differs.\n"
-                f"  Host:    {host_hash}\n"
-                f"  {name + ':':9} {sibling_hash}\n"
-                f"Re-sync the headers or update gen_racelink_proto_py.py.",
+    def test_host_headers_exist(self):
+        """The Host's own copies of the subset must always exist —
+        ``racelink_proto.h`` is the source for ``racelink_proto_auto.py``
+        and ``racelink_indicators.h`` guards the Python indicator mirror.
+        The FW-only headers are not required at Host level."""
+        for header in HOST_HEADERS:
+            host_path = ROOT / header
+            self.assertTrue(
+                host_path.is_file(),
+                f"Host {header} not found at {host_path}",
+            )
+        # Sanity: the FW-only headers should NOT linger in the Host
+        # repo (dead-weight from before this subset rule was clarified).
+        for header in FW_ONLY_HEADERS:
+            stale = ROOT / header
+            self.assertFalse(
+                stale.is_file(),
+                f"Host repo carries FW-only header {header} ({stale}) — "
+                f"delete it; the Host has no Python consumer.",
             )
 
-        # Smoke-print the set of repos actually compared — useful in
-        # CI logs to confirm the test exercised both siblings.
+    def test_host_subset_matches_canonical(self):
+        """Host's two-header subset must match the WLED-LoRa canonical
+        byte-for-byte. Skipped if the canonical tree is absent (e.g. CI
+        checkout with only the Host repo)."""
+        if not CANONICAL_DIR.is_dir():
+            self.skipTest(
+                f"Canonical tree not present at {CANONICAL_DIR} — "
+                f"skipping host-vs-canonical comparison.",
+            )
+        for header in HOST_HEADERS:
+            host_hash = _sha256(ROOT / header)
+            canon_hash = _sha256(CANONICAL_DIR / header)
+            self.assertEqual(
+                host_hash, canon_hash,
+                f"{header} drift: Host vs Canonical sha256 differs.\n"
+                f"  Host:      {host_hash}\n"
+                f"  Canonical: {canon_hash}\n"
+                f"Re-sync: copy {CANONICAL_DIR / header} -> {ROOT / header} "
+                f"(see racelink_proto.h sync workflow in CLAUDE.md / "
+                f"contributing.md).",
+            )
+
+    def test_fw_siblings_match_canonical(self):
+        """Every FW sibling (RaceLink_WLED, RaceLink_Gateway/src) must
+        carry all four shared headers byte-identical to the canonical.
+        Sibling-missing is a skipped comparison; canonical-missing
+        skips the whole assertion (handled in the previous test's
+        skipTest path is moot here — we re-check)."""
+        if not CANONICAL_DIR.is_dir():
+            self.skipTest(
+                f"Canonical tree not present at {CANONICAL_DIR} — "
+                f"skipping FW-sibling comparison.",
+            )
+        compared: list[str] = []
+        skipped: list[str] = []
+        for header in ALL_HEADERS:
+            canon_path = CANONICAL_DIR / header
+            if not canon_path.is_file():
+                # Canonical missing a header that we expect is a hard
+                # problem — fail rather than skip, because every other
+                # location would silently match a phantom.
+                self.fail(
+                    f"Canonical missing {header} at {canon_path} — "
+                    f"this header is declared in ALL_HEADERS but absent "
+                    f"from the source of truth.",
+                )
+            canon_hash = _sha256(canon_path)
+            for sibling_name, sibling_dir in FW_SIBLINGS.items():
+                sibling_path = sibling_dir / header
+                label = f"{sibling_name}/{header}"
+                if not sibling_path.is_file():
+                    skipped.append(label)
+                    continue
+                sibling_hash = _sha256(sibling_path)
+                compared.append(label)
+                self.assertEqual(
+                    sibling_hash, canon_hash,
+                    f"{header} drift: Canonical vs {sibling_name} differs.\n"
+                    f"  Canonical:   {canon_hash}\n"
+                    f"  {sibling_name + ':':12} {sibling_hash}\n"
+                    f"Re-sync: copy {canon_path} -> {sibling_path}.",
+                )
+
+        # Smoke-print the set of (sibling, header) pairs actually
+        # compared / skipped — useful in CI logs to confirm the test
+        # exercised the intended targets.
         self.addCleanup(
             print,
-            f"[proto-drift] compared Host against: "
-            f"{compared if compared else '(none — only Host present)'}",
+            f"[proto-drift] compared: {compared if compared else '(none)'}; "
+            f"skipped: {skipped if skipped else '(none)'}",
         )
 
 

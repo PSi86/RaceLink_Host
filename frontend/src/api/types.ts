@@ -17,6 +17,33 @@ export interface MasterSnapshot {
   last_event?: string | null
   last_event_ts?: number
   last_error?: string | null
+  // Stage 2 Part 4: per-network identifying fields. Optional so
+  // legacy single-master callsites still type-check during the
+  // transition to the multi-network UI (Stage 4).
+  network_id?: string
+  name?: string
+}
+
+/** Multi-network ``master`` payload (Stage 2 Part 4). Emitted by
+ *  ``GET /api/master`` and on every ``master`` SSE event. The
+ *  pre-Part-4 single-master clients read ``networks[0]`` as their
+ *  legacy ``MasterSnapshot`` — preserves the N=1 UX until Stage 4
+ *  ships the multi-network UI.
+ */
+export interface MasterMapSnapshot {
+  default_network_id: string
+  networks: MasterSnapshot[]
+}
+
+/** Round 3 Task 2: one row per currently-missing gateway, fed from
+ *  the ``gateway_missing`` SSE event the host's
+ *  ``MissingTransportTracker`` emits. The Reconnect-Banner renders
+ *  this list with countdowns and offers a "Cancel" button per row. */
+export interface MissingTransport {
+  ident_mac: string
+  network_id?: string | null
+  network_name?: string | null
+  next_retry_in_s?: number | null
 }
 
 export type TaskState = 'idle' | 'running' | 'done' | 'error' | string
@@ -50,6 +77,12 @@ export interface TaskMeta {
   // device selection since.
   macs?: string[]
   deviceState?: Record<string, FwDeviceState>
+  /** Per-device live message companion to ``deviceState``. Populated by
+   *  the OTA workflow on the ``error`` transition so the live row can
+   *  show the concrete failure ("Timeout waiting for CONFIG ACK …")
+   *  instead of the generic "error" label, without having to wait for
+   *  the final ``result.errors[]`` overlay. Keyed by uppercase MAC. */
+  deviceMessages?: Record<string, string>
   baseUrl?: string
 }
 
@@ -61,9 +94,24 @@ export interface TaskSnapshot {
   last_error?: string | null
   started_ts?: number | null
   ended_ts?: number | null
+  /** Server-computed elapsed seconds since ``started_ts``, recomputed
+   *  on every snapshot. Authoritative timer base for the WebUI — using
+   *  this instead of ``Date.now()/1000 - started_ts`` avoids the host /
+   *  browser clock-skew drift (the host may run without NTP, the
+   *  browser is NTP-synced — the difference shows up as a constant
+   *  offset on the firmware-update timer). Null until the task is
+   *  started. Frozen at the final value when state is ``done``/``error``. */
+  elapsed_s?: number | null
   rx_replies?: number
   rx_window_events?: number
   rx_count_delta_total?: number
+  /** Set ``true`` after the operator clicks Cancel; the worker thread
+   *  polls a server-side flag at its cooperative cancel points and
+   *  winds down. The corresponding result entry carries ``cancelled``
+   *  and (for fwupdate) ``cancelled_after``. Surfaced over SSE so the
+   *  dialog can immediately switch its primary action to a disabled
+   *  "Cancelling…" state without waiting for the next state flip. */
+  cancel_requested?: boolean
 }
 
 export interface GatewayErrorPayload {
@@ -76,6 +124,22 @@ export interface GatewayStatus {
   ready: boolean
   last_error?: GatewayErrorPayload | null
   failure_count?: number
+}
+
+/** Stage 3 wire-format ``P_RfConfig`` (the seven fields the LoRa
+ *  modem actually needs). Used by:
+ *    * ``Device.last_known_rf_config`` — last known per-node settings.
+ *    * ``Network.rf_config`` — operator-intended channel for the network.
+ *    * ``Channel.*`` (region table) — pre-defined operator-visible
+ *      channel slots (max 5 per region). */
+export interface RfConfig {
+  freq_hz: number
+  bw_khz_x10: number
+  sf: number
+  cr_den: number
+  sync_word: number
+  tx_power_dbm: number
+  preamble: number
 }
 
 export interface Device {
@@ -101,8 +165,28 @@ export interface Device {
   last_ack?: string | null
   caps: number
   specials?: Record<string, number>
+  // Battery classification baked into the DTO so the warning banner
+  // doesn't have to re-derive the rule on every device list refresh.
+  battery_class?: '2s' | '6s' | 'unknown'
+  battery_low?: boolean
+  // Stage 4: multi-network fields. ``network_id`` is ``null`` for
+  // legacy / unmigrated payloads; the WebUI treats that as the
+  // default network. ``last_known_rf_config`` is what the device
+  // reported on its last contact — drives the diff indicator in the
+  // Network Manager and the migration engine's pre-check.
+  network_id?: string | null
+  last_known_rf_config?: RfConfig | null
   // Special-key flat fields appended by ``serialize_device``
   [key: string]: unknown
+}
+
+export interface HostBatterySettings {
+  mV_2s: number
+  mV_6s: number
+}
+
+export interface HostSettings {
+  battery: HostBatterySettings
 }
 
 export interface Group {
@@ -112,6 +196,48 @@ export interface Group {
   dev_type: number
   device_count: number
   caps_in_group: Record<string, number>
+  // Stage 4: ``network_id`` carries the group's network anchor
+  // for the cross-network boundary enforcement (server-side
+  // validates on bulk-set; client-side disables cross-net
+  // selection in the multi-group picker). ``null`` for the
+  // ``Unconfigured`` sink and for pre-migration payloads.
+  network_id?: string | null
+}
+
+/** Stage 4: shipped channel-table entry (one slot in
+ *  :data:`rf_channels.REGION_CHANNELS`). The Network Manager dialog
+ *  renders these as dropdown options per region. */
+export interface Channel extends RfConfig {
+  id: number
+  name: string
+}
+
+/** Stage 4 Block 2: gateway-bind state machine snapshot (one entry
+ *  per attached gateway, keyed by ``ident_mac``). Emitted by
+ *  ``GET /api/gateways`` and via the SSE ``gateway_bound`` /
+ *  ``gateway_conflict`` / ``gateway_unbound`` events. The wizard
+ *  drives operator-facing resolve actions
+ *  (``POST /api/gateways/{ident_mac}/resolve``). */
+export type GatewayBindState = 'pending' | 'bound' | 'conflict' | 'unbound'
+
+export interface GatewayBindRecord {
+  ident_mac: string
+  state: GatewayBindState
+  network_id?: string | null
+  network_name?: string | null
+  rf_config_actual?: RfConfig | null
+  rf_config_expected?: RfConfig | null
+  conflict_fields?: string[]
+  migration_pending?: boolean
+  last_evaluated_ts?: number
+  /** Wizard continuation token — sent back on resolve so a stale
+   *  dialog answer doesn't override a re-evaluated record. */
+  token: string
+}
+
+export interface GatewaysResponse {
+  ok: boolean
+  gateways: GatewayBindRecord[]
 }
 
 export interface DevicesResponse {
@@ -126,9 +252,32 @@ export interface GroupsResponse {
 
 export interface MasterResponse {
   ok: boolean
-  master: MasterSnapshot
+  // Stage 2 Part 4: ``master`` is now the multi-network payload.
+  // Legacy callsites that need the single-master shape read
+  // ``master.networks[0]`` (see ``stores/gateway.ts``).
+  master: MasterMapSnapshot
   task: TaskSnapshot
   gateway: GatewayStatus
+}
+
+/** Stage 2 Part 4 — ``GET /api/networks`` read-only listing. Stage 3
+ *  introduces CRUD; for now this surfaces the operator's persisted
+ *  networks plus their live :class:`MasterSnapshot`. */
+export interface NetworkSummary {
+  id: string
+  name: string
+  gateway_mac: string | null
+  region: string | null
+  channel_id: number | string | null
+  rf_config: Record<string, unknown> | null
+  created_ts: number | null
+  live?: MasterSnapshot | null
+}
+
+export interface NetworksResponse {
+  ok: boolean
+  default_network_id: string | null
+  networks: NetworkSummary[]
 }
 
 export interface GatewayResponse {
@@ -398,7 +547,7 @@ export interface FwUploadResponse {
   file: FwUploadInfo
 }
 
-export type FwTargetMode = 'selected' | 'filtered' | 'all'
+export type FwTargetMode = 'selected' | 'filtered' | 'all' | 'type'
 
 export interface FwStartBody {
   macs: string[]
@@ -532,10 +681,30 @@ export interface SceneAction {
   offset?: SceneOffsetConfig
 }
 
+/**
+ * Scene-level broadcast scope (network targeting override).
+ *
+ * - ``mode: 'auto'`` (default) — runtime derives scope from action targets.
+ * - ``mode: 'explicit'`` — operator-pinned set of network ids; per-action
+ *   target pickers in the editor restrict to in-scope networks.
+ *
+ * Missing field is treated as ``{mode: 'auto'}`` for back-compat with
+ * pre-scope-feature scenes.
+ */
+export type SceneNetworkScopeMode = 'auto' | 'explicit'
+
+export interface SceneNetworkScope {
+  mode: SceneNetworkScopeMode
+  /** Present only when ``mode === 'explicit'``. Non-empty, deduplicated. */
+  network_ids?: string[]
+}
+
 export interface Scene {
   key: string
   label: string
   stop_on_error?: boolean
+  /** Operator-pinned broadcast scope. Defaults to ``{mode: 'auto'}``. */
+  network_scope?: SceneNetworkScope
   actions: SceneAction[]
   created_ts?: number
   updated_ts?: number
@@ -653,4 +822,12 @@ export interface SceneCostResponse {
   per_action: SceneCostPerAction[]
   lora?: Record<string, unknown>
   error?: string
+  /** Scope-feature: networks the scene's broadcasts will actually reach.
+   * Auto-mode scenes derive this from action targets; explicit-mode
+   * scenes return the operator-pinned list (filtered for stale ids).
+   * Empty array means no resolvable broadcast scope (sync-only scene or
+   * all-stale explicit scope). */
+  resolved_network_ids?: string[]
+  /** Scope-feature: matches ``scene.network_scope.mode``. */
+  network_scope_mode?: SceneNetworkScopeMode
 }

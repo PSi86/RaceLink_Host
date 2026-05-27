@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def try_parse_legacy_repr(raw: Any) -> list[dict] | None:
@@ -111,14 +111,23 @@ def load_records(raw: Any, *, default: Any = None, source: str = "") -> list[dic
 def dump_state(
     devices: Iterable[Any],
     groups: Iterable[Any],
+    networks: Iterable[Any] = (),
     *,
     schema_version: int = CURRENT_SCHEMA_VERSION,
 ) -> str:
-    """Serialize the combined atomic state payload (P1-5 / P2-7)."""
+    """Serialize the combined atomic state payload (P1-5 / P2-7).
+
+    Schema v2 (Stage 2) adds the ``networks`` list. Callers that have
+    no networks yet (legacy paths) can omit the argument; the payload
+    then carries an empty list and the v1→v2 migration in
+    :mod:`racelink.state.migrations` synthesises a default network on
+    the next load.
+    """
     payload = {
         "schema_version": int(schema_version),
         "devices": [_as_record(d) for d in devices],
         "groups": [_as_record(g) for g in groups],
+        "networks": [_as_record(n) for n in networks],
     }
     return json.dumps(payload, ensure_ascii=True)
 
@@ -128,20 +137,28 @@ def load_state(
     *,
     default_devices: Any = None,
     default_groups: Any = None,
+    default_networks: Any = None,
     source: str = "",
-) -> tuple[list[dict], list[dict], int]:
+) -> tuple[list[dict], list[dict], list[dict], int]:
     """Decode the combined atomic state payload.
 
-    Returns ``(devices, groups, schema_version)``. A schema_version of ``0`` means
-    the payload was missing or malformed -- callers should treat that as "no
-    combined state yet" and fall back to the legacy per-key format.
+    Returns ``(devices, groups, networks, schema_version)``. A
+    ``schema_version`` of ``0`` means the payload was missing or
+    malformed -- callers should treat that as "no combined state yet"
+    and fall back to the legacy per-key format.
+
+    Schema v2 (Stage 2) introduced ``networks``; a v1 payload yields
+    an empty networks list and the v1→v2 migration in
+    :mod:`racelink.state.migrations` synthesises the default network.
     """
+    empty_defaults = (
+        _normalize_records(default_devices),
+        _normalize_records(default_groups),
+        _normalize_records(default_networks),
+        0,
+    )
     if raw is None:
-        return (
-            _normalize_records(default_devices),
-            _normalize_records(default_groups),
-            0,
-        )
+        return empty_defaults
 
     payload: Any
     if isinstance(raw, dict):
@@ -149,32 +166,20 @@ def load_state(
     else:
         text = str(raw).strip()
         if text == "":
-            return (
-                _normalize_records(default_devices),
-                _normalize_records(default_groups),
-                0,
-            )
+            return empty_defaults
         try:
             payload = json.loads(text)
         except Exception as ex:
             # swallow-ok: best-effort fallback; caller proceeds with safe default
             _log_decode_failure(source, ex, text)
-            return (
-                _normalize_records(default_devices),
-                _normalize_records(default_groups),
-                0,
-            )
+            return empty_defaults
 
     if not isinstance(payload, dict):
         logger.warning(
             "RaceLink: combined state%s is not an object; falling back to legacy keys",
             f" ({source})" if source else "",
         )
-        return (
-            _normalize_records(default_devices),
-            _normalize_records(default_groups),
-            0,
-        )
+        return empty_defaults
 
     try:
         version = int(payload.get("schema_version", 0) or 0)
@@ -184,6 +189,7 @@ def load_state(
 
     devices_raw = payload.get("devices", default_devices)
     groups_raw = payload.get("groups", default_groups)
+    networks_raw = payload.get("networks", default_networks)
     try:
         devices = _normalize_records(devices_raw)
     except TypeError:
@@ -194,5 +200,10 @@ def load_state(
     except TypeError:
         logger.warning("RaceLink: combined state 'groups' is not list-like; using default")
         groups = _normalize_records(default_groups)
+    try:
+        networks = _normalize_records(networks_raw)
+    except TypeError:
+        logger.warning("RaceLink: combined state 'networks' is not list-like; using default")
+        networks = _normalize_records(default_networks)
 
-    return devices, groups, max(0, version)
+    return devices, groups, networks, max(0, version)

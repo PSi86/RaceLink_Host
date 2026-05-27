@@ -14,6 +14,7 @@ import { apiPost } from '@/api/client'
 import { useGroupsStore } from '@/stores/groups'
 import { useGatewayStore } from '@/stores/gateway'
 import { useToast } from '@/composables/useToast'
+import { useTaskNavigationGuard } from '@/composables/useTaskNavigationGuard'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
@@ -43,6 +44,16 @@ const resultLine = computed(() => {
 
 const startDisabled = computed(() => submitting.value || gateway.busy)
 const selectableGroups = computed(() => groups.selectableGroups)
+
+// Lighter lockdown for the discover sweep: outside-click + Esc + browser
+// navigation are blocked while the RX window is open, but the scan is
+// short (5-30 s) and benign — no Wi-Fi-touching, no half-flashed state
+// to worry about — so we deliberately do not expose a Cancel button.
+// The operator either waits for the sweep to land naturally or accepts
+// the navigation-guard prompt.
+useTaskNavigationGuard(() => gateway.discoverBusy, {
+  reason: 'A device discovery scan is currently running. Leaving now will lose the result list (the scan completes server-side). Continue anyway?',
+})
 
 watch(
   () => props.open,
@@ -89,7 +100,7 @@ async function onSubmit(ev: Event) {
 
 <template>
   <Dialog :open="open" @update:open="(v) => emit('update:open', v)">
-    <DialogContent>
+    <DialogContent :lock-close="gateway.discoverBusy">
       <DialogHeader>
         <DialogTitle>Discover Devices</DialogTitle>
         <DialogDescription>
@@ -126,8 +137,16 @@ async function onSubmit(ev: Event) {
         <p v-if="resultLine" class="text-sm text-muted-foreground">{{ resultLine }}</p>
 
         <DialogFooter>
-          <Button type="button" variant="secondary" @click="close">Close</Button>
-          <Button type="submit" :disabled="startDisabled">
+          <Button
+            type="button"
+            variant="secondary"
+            :disabled="gateway.discoverBusy"
+            :title="gateway.discoverBusy ? 'Wait for the scan to finish' : 'Close the dialog'"
+            @click="close"
+          >
+            Close
+          </Button>
+          <Button variant="run" type="submit" :disabled="startDisabled">
             {{ submitting ? 'Starting…' : 'Start' }}
           </Button>
         </DialogFooter>

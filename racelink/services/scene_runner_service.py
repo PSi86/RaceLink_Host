@@ -24,10 +24,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..transport.broadcast_target import BroadcastTarget
 from .dispatch_planner import (
     ActionDispatchPlan,
     plan_action_dispatch,
 )
+from .scene_network_scope import scene_network_ids
 from .scenes_service import (
     KIND_DELAY,
     KIND_OFFSET_GROUP,
@@ -150,6 +152,24 @@ class SceneRunnerService:
         self._rl_presets_service = rl_presets_service
         self._sleep = sleep
         self._clock_ms = clock_ms
+        # Set by run() for the duration of one scene execution and
+        # cleared in the matching finally clause. Provides the broadcast
+        # scope (computed via :func:`scene_network_ids` — honours the
+        # scene's explicit ``network_scope`` field if set, else walks
+        # action targets). Applied to ALL broadcast opcodes — SYNC,
+        # PRESET, CONTROL, OFFSET — when ``target_group == 255``. The
+        # runner is single-threaded per scene, so this attribute does
+        # not require locking — concurrent run() calls on the same
+        # instance would already corrupt other runner state.
+        self._current_broadcast_scope: Optional[BroadcastTarget] = None
+        # Companion flag: True when the scene's network_scope is
+        # explicit but every id soft-filtered out (e.g. the scope
+        # referenced a now-deleted network). In that case we must NOT
+        # fall back to "all attached" for SYNC broadcasts — the
+        # operator-resolved choice is "send to nobody, mark degraded".
+        # Distinguishes the explicit-empty case from auto-empty (the
+        # latter still falls back to all_attached for back-compat).
+        self._broadcast_is_explicit_empty: bool = False
 
     @property
     def rl_presets_service(self):
@@ -211,56 +231,100 @@ class SceneRunnerService:
         # semantic explicitly opt out per scene.
         stop_on_error = bool(scene.get("stop_on_error", True))
 
+        # Compute the broadcast scope this scene's broadcast actions
+        # (SYNC, PRESET, CONTROL, OFFSET with target_group == 255)
+        # should fan out to. ``scene_network_ids`` honours the scene's
+        # explicit ``network_scope`` field if set (operator override),
+        # otherwise unions every non-sync action's resolved network
+        # membership.
+        #
+        # Three outcomes:
+        #   * scope_ids non-empty → broadcast_scope = BroadcastTarget(...)
+        #     (the normal case).
+        #   * scope_ids empty AND scope was auto/missing → broadcast_scope
+        #     = None (SYNC falls back to all_attached with a deprecation
+        #     warning — preserves pre-scope-feature behaviour).
+        #   * scope_ids empty AND scope was explicit (every id stale) →
+        #     broadcast_scope = None BUT ``_broadcast_is_explicit_empty``
+        #     is True. The dispatch path checks this flag and refuses to
+        #     fan out — sending the SYNC to all_attached here would be a
+        #     silent scope widening, exactly what the operator's
+        #     explicit choice was meant to prevent.
+        scope_ids = scene_network_ids(scene, controller=self.controller)
+        raw_scope = scene.get("network_scope") if isinstance(scene, dict) else None
+        explicit_mode = (
+            isinstance(raw_scope, dict) and raw_scope.get("mode") == "explicit"
+        )
+        broadcast_scope = (
+            BroadcastTarget.from_ids(scope_ids) if scope_ids else None
+        )
+        explicit_empty = explicit_mode and not scope_ids
+
+        prev_broadcast_scope = self._current_broadcast_scope
+        prev_explicit_empty = self._broadcast_is_explicit_empty
+        self._current_broadcast_scope = broadcast_scope
+        self._broadcast_is_explicit_empty = explicit_empty
+
         scene_actions = list(scene["actions"])
         results: List[ActionResult] = []
         aborted_at_index: Optional[int] = None
-        for index, action in enumerate(scene_actions):
-            self._emit_progress(progress_cb, {
-                "scene_key": scene_key,
-                "index": index,
-                "kind": action.get("kind"),
-                "state": "started",
-            })
-            result = self._dispatch(index, action)
-            results.append(result)
-            self._emit_progress(progress_cb, {
-                "scene_key": scene_key,
-                "index": index,
-                "kind": result.kind,
-                "state": result.state,
-                "error": result.error,
-                "duration_ms": result.duration_ms,
-            })
+        try:
+            for index, action in enumerate(scene_actions):
+                self._emit_progress(progress_cb, {
+                    "scene_key": scene_key,
+                    "index": index,
+                    "kind": action.get("kind"),
+                    "state": "started",
+                })
+                result = self._dispatch(index, action)
+                results.append(result)
+                self._emit_progress(progress_cb, {
+                    "scene_key": scene_key,
+                    "index": index,
+                    "kind": result.kind,
+                    "state": result.state,
+                    "error": result.error,
+                    "duration_ms": result.duration_ms,
+                })
 
-            # Abort the rest of the scene on first failure when
-            # stop_on_error is on. ``degraded`` does NOT trigger abort
-            # — degraded means "ran with caveats" (e.g. unknown device
-            # target collapsed to a no-op); the runner saw a sensible
-            # outcome. Only outright ``ok=False`` terminates.
-            if stop_on_error and not result.ok and not result.degraded:
-                aborted_at_index = index
-                # Append "skipped" placeholders for every remaining
-                # action so the UI / SSE consumer can render the abort
-                # cleanly without needing to reason about the absence.
-                for skipped_idx in range(index + 1, len(scene_actions)):
-                    skipped_action = scene_actions[skipped_idx]
-                    skipped_result = ActionResult(
-                        index=skipped_idx,
-                        kind=skipped_action.get("kind") or "unknown",
-                        ok=False,
-                        error="skipped: aborted",
-                        duration_ms=0,
-                    )
-                    results.append(skipped_result)
-                    self._emit_progress(progress_cb, {
-                        "scene_key": scene_key,
-                        "index": skipped_idx,
-                        "kind": skipped_result.kind,
-                        "state": "skipped",
-                        "error": skipped_result.error,
-                        "duration_ms": 0,
-                    })
-                break
+                # Abort the rest of the scene on first failure when
+                # stop_on_error is on. ``degraded`` does NOT trigger abort
+                # — degraded means "ran with caveats" (e.g. unknown device
+                # target collapsed to a no-op); the runner saw a sensible
+                # outcome. Only outright ``ok=False`` terminates.
+                if stop_on_error and not result.ok and not result.degraded:
+                    aborted_at_index = index
+                    # Append "skipped" placeholders for every remaining
+                    # action so the UI / SSE consumer can render the abort
+                    # cleanly without needing to reason about the absence.
+                    for skipped_idx in range(index + 1, len(scene_actions)):
+                        skipped_action = scene_actions[skipped_idx]
+                        skipped_result = ActionResult(
+                            index=skipped_idx,
+                            kind=skipped_action.get("kind") or "unknown",
+                            ok=False,
+                            error="skipped: aborted",
+                            duration_ms=0,
+                        )
+                        results.append(skipped_result)
+                        self._emit_progress(progress_cb, {
+                            "scene_key": scene_key,
+                            "index": skipped_idx,
+                            "kind": skipped_result.kind,
+                            "state": "skipped",
+                            "error": skipped_result.error,
+                            "duration_ms": 0,
+                        })
+                    break
+        finally:
+            # Clear scene-scoped state so a follow-up run() (or a
+            # nested call from a future container kind) starts from a
+            # clean slate. ``prev_broadcast_scope`` will be None in
+            # normal usage; the restore exists so reentrant calls —
+            # should they ever happen — don't leak state across
+            # boundaries.
+            self._current_broadcast_scope = prev_broadcast_scope
+            self._broadcast_is_explicit_empty = prev_explicit_empty
 
         # ``ok`` reflects whether *every* action succeeded — an aborted
         # run with skipped placeholders is not ``ok``.
@@ -359,6 +423,44 @@ class SceneRunnerService:
             return None
         return lookup
 
+    def _target_for_op(self, op) -> Optional[BroadcastTarget]:
+        """Return the scene's broadcast scope when ``op`` is a true
+        broadcast (target_group == 255); otherwise ``None``.
+
+        Group / device-pinned ops (target_group != 255 or a unicast
+        device send) get ``None`` because their underlying service
+        method routes via ``transport_for_group`` / per-device
+        transport — passing a target there would be misleading and
+        would override the per-group routing.
+
+        For broadcast ops the scope comes from
+        ``self._current_broadcast_scope`` which run() computed at
+        scene start. ``None`` is also returned when the scope is empty
+        — the service then falls back to its single-transport route
+        (which on N≥2 gateways returns False, surfacing as a
+        send_failed action). Callers that must distinguish "no scope"
+        from "explicit-empty scope" should consult
+        :meth:`_broadcast_blocked` first.
+        """
+        if getattr(op, "target_group", None) != 255:
+            return None
+        return self._current_broadcast_scope
+
+    def _broadcast_blocked(self, op) -> bool:
+        """True when ``op`` is a broadcast (target_group == 255) AND
+        the scene's explicit scope resolved to an empty set (every
+        listed network is stale). The dispatch path must skip the
+        service call in this case so the SYNC fallback to all_attached
+        cannot silently widen the broadcast back to fleet-wide. The
+        op is recorded as a degraded action instead.
+
+        Returns False for auto-mode empty scope (the SYNC fallback to
+        all_attached is the intended back-compat behaviour there).
+        """
+        if getattr(op, "target_group", None) != 255:
+            return False
+        return self._broadcast_is_explicit_empty
+
     def _dispatch_op(self, op) -> bool:
         """Translate one ``WireOp`` into the matching service call.
 
@@ -370,20 +472,47 @@ class SceneRunnerService:
         """
         sender = op.sender
         payload = dict(op.payload)
+        # Broadcast-blocked check: when the scene's explicit scope
+        # resolved empty (all listed networks stale), broadcast ops
+        # are degraded WITHOUT calling the underlying service. This
+        # prevents the SYNC fallback from silently widening back to
+        # all_attached, which would defeat the whole point of the
+        # operator's explicit-scope choice.
+        if self._broadcast_blocked(op):
+            logger.warning(
+                "scene runner: broadcast op (sender=%s) skipped — "
+                "scene's explicit network_scope resolved to empty "
+                "(every listed network is stale)",
+                sender,
+            )
+            return False
         if sender == "send_offset":
             return bool(self.control_service.send_offset(
-                targetGroup=op.target_group, **payload,
+                targetGroup=op.target_group,
+                target=self._target_for_op(op),
+                **payload,
             ))
         if sender == "send_control":
-            return bool(self.control_service.send_control(**payload))
+            return bool(self.control_service.send_control(
+                target=self._target_for_op(op),
+                **payload,
+            ))
         if sender == "send_wled_preset":
-            return bool(self.control_service.send_wled_preset(**payload))
+            return bool(self.control_service.send_wled_preset(
+                target=self._target_for_op(op),
+                **payload,
+            ))
         if sender == "send_sync":
             ts24 = int(self._clock_ms()) & 0xFFFFFF
+            # SYNC is always broadcast (recv3=FFFFFF); pass the scene-
+            # level scope unconditionally. The empty-explicit guard
+            # above already routed away from this path so we never
+            # widen back to all_attached on a degenerate scope.
             self.sync_service.send_sync(
                 ts24,
                 payload.get("brightness", 0),
                 trigger_armed=bool(payload.get("trigger_armed", False)),
+                target=self._current_broadcast_scope,
             )
             return True
         if sender == "send_startblock":

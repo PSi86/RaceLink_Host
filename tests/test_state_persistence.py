@@ -48,51 +48,64 @@ class CombinedStateTests(unittest.TestCase):
     def test_dump_and_load_state_roundtrip(self):
         devices = [{"addr": "AA", "groupId": 1}]
         groups = [{"name": "All", "static_group": 1, "dev_type": 0}]
+        networks = [{"id": "n1", "name": "Default", "region": "EU868"}]
 
-        raw = dump_state(devices, groups)
-        loaded_devices, loaded_groups, version = load_state(raw)
+        raw = dump_state(devices, groups, networks)
+        loaded_devices, loaded_groups, loaded_networks, version = load_state(raw)
 
         self.assertEqual(loaded_devices, devices)
         self.assertEqual(loaded_groups, groups)
+        self.assertEqual(loaded_networks, networks)
         self.assertEqual(version, CURRENT_SCHEMA_VERSION)
 
     def test_load_state_missing_returns_zero_version(self):
-        devices, groups, version = load_state(None, default_devices=[], default_groups=[])
+        devices, groups, networks, version = load_state(
+            None, default_devices=[], default_groups=[], default_networks=[],
+        )
         self.assertEqual(devices, [])
         self.assertEqual(groups, [])
+        self.assertEqual(networks, [])
         self.assertEqual(version, 0)
 
     def test_load_state_malformed_returns_zero_and_warns(self):
         with self.assertLogs("racelink.state.persistence", level="WARNING"):
-            devices, groups, version = load_state(
+            devices, groups, networks, version = load_state(
                 "{not json",
                 default_devices=[{"addr": "DEF"}],
                 default_groups=[{"name": "DEF"}],
+                default_networks=[{"id": "fallback"}],
                 source="rl_state_v1",
             )
         self.assertEqual(devices, [{"addr": "DEF"}])
         self.assertEqual(groups, [{"name": "DEF"}])
+        self.assertEqual(networks, [{"id": "fallback"}])
         self.assertEqual(version, 0)
 
     def test_load_state_accepts_dict_payload(self):
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "devices": [{"addr": "CC"}],
             "groups": [{"name": "G"}],
+            "networks": [{"id": "n1", "name": "Default"}],
         }
-        devices, groups, version = load_state(payload)
+        devices, groups, networks, version = load_state(payload)
         self.assertEqual(devices, [{"addr": "CC"}])
         self.assertEqual(groups, [{"name": "G"}])
-        self.assertEqual(version, 1)
+        self.assertEqual(networks, [{"id": "n1", "name": "Default"}])
+        self.assertEqual(version, 2)
 
     def test_migrate_state_is_noop_for_current_version(self):
-        devices = [{"addr": "AA"}]
-        groups = [{"name": "G"}]
-        out_dev, out_grp, out_ver = migrate_state(
-            devices, groups, from_version=CURRENT_SCHEMA_VERSION
+        # A v2 payload with networks already present must round-trip
+        # unchanged through migrate_state.
+        devices = [{"addr": "AA", "network_id": "n1"}]
+        groups = [{"name": "G", "network_id": "n1"}]
+        networks = [{"id": "n1", "name": "Default"}]
+        out_dev, out_grp, out_net, out_ver = migrate_state(
+            devices, groups, networks, from_version=CURRENT_SCHEMA_VERSION,
         )
         self.assertEqual(out_dev, devices)
         self.assertEqual(out_grp, groups)
+        self.assertEqual(out_net, networks)
         self.assertEqual(out_ver, CURRENT_SCHEMA_VERSION)
 
 

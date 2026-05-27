@@ -56,14 +56,29 @@ def _package_data_sources() -> list[tuple[Path, str]]:
     the SPA shell now lives at ``racelink/static/dist/index.html`` and
     its hashed JS/CSS bundles under ``racelink/static/dist/assets/``.
     Both are discovered by the recursive walk over ``static/``.
+
+    Filtered (not needed at runtime, would only bloat the wheel):
+
+    * ``*.map`` — JavaScript / CSS source maps. Browser DevTools
+      consume them when stepping through the bundle, irrelevant to
+      the Flask-served SPA. Dropping the four maps in the 2026-05-22
+      dist saves ~3.3 MB / ≈ 62 % of the wheel size.
+    * ``.vite/`` directory — Vite's build manifest, used by SSR / dev
+      tooling. The production ``index.html`` already references the
+      hashed asset paths directly.
     """
     sources: list[tuple[Path, str]] = []
     package_root = ROOT / "racelink"
-    sources.extend(
-        (path, f"racelink/static/{path.relative_to(package_root / 'static').as_posix()}")
-        for path in sorted((package_root / "static").rglob("*"))
-        if path.is_file()
-    )
+    static_root = package_root / "static"
+    for path in sorted(static_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix == ".map":
+            continue
+        rel = path.relative_to(static_root)
+        if ".vite" in rel.parts:
+            continue
+        sources.append((path, f"racelink/static/{rel.as_posix()}"))
     return sources
 
 
@@ -115,12 +130,18 @@ def _entry_points_text() -> str:
 
 
 def _top_level_text() -> str:
-    return "controller\nracelink\n"
+    return "racelink\n"
 
 
 def _iter_sources() -> list[tuple[Path, str]]:
-    sources = [(ROOT / "controller.py", "controller.py")]
-    sources.extend((path, path.relative_to(ROOT).as_posix()) for path in sorted((ROOT / "racelink").rglob("*.py")))
+    sources: list[tuple[Path, str]] = []
+    # ``_build_backend.py`` is only consumed by the PEP-517 build hook —
+    # at runtime nobody imports it. Skip so the wheel doesn't carry
+    # build-time code into the deployed install.
+    for path in sorted((ROOT / "racelink").rglob("*.py")):
+        if path.name == "_build_backend.py":
+            continue
+        sources.append((path, path.relative_to(ROOT).as_posix()))
     sources.extend(_package_data_sources())
     return sources
 

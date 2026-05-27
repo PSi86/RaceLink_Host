@@ -2,6 +2,7 @@ import unittest
 
 from racelink.domain import RL_Device
 from racelink.services.gateway_service import GatewayService
+from racelink.services.pending_requests import PendingMatcher
 from racelink.state.repository import DeviceRepository, GroupRepository
 from racelink.transport import EV_STATE_CHANGED, GATEWAY_STATE_IDLE, LP
 
@@ -20,6 +21,12 @@ _RX_WINDOW_CLOSED_TRANSITION = {
 
 class FakeTransport:
     def __init__(self):
+        # Stage 3 Part C: every transport carries an ident_mac (set by
+        # ``discover_and_open`` / ``enumerate_all``) so the matcher's
+        # ``gateway_id`` filter has a stable anchor. Pin a synthetic
+        # value here so this fake satisfies the Stage-3 contract
+        # without any test having to remember the field exists.
+        self.ident_mac = "TEST-GW"
         self.listeners = []
         self.tx_listeners = []
         self.sent_config = []
@@ -46,6 +53,11 @@ class FakeTransport:
         self.sent_set_group.append({"recv3": recv3, "group_id": group_id})
 
     def emit(self, ev):
+        # Stage 3 Part C: mirror the real transport's ``_emit`` tag —
+        # every event leaving a transport carries its ident_mac so
+        # downstream matcher / pending_expect lookups route correctly.
+        if isinstance(ev, dict) and self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         for cb in list(self.listeners):
             cb(ev)
 
@@ -57,14 +69,18 @@ class FakeController:
     def __init__(self):
         self.dev = RL_Device("AABBCCDDEEFF", 1, "Node")
         self.transport = FakeTransport()
-        self._pending_expect = None
+        # Stage 2 Part 3: pending-expect dict is keyed by gateway_id.
+        # Tests stamp under the legacy ``None`` slot for backwards-
+        # compat with the existing single-gateway assertions.
+        self._pending_expect = {}
         self._pending_config = {}
-        self._transport_hooks_installed = False
+        self._transport_hooks_installed_for: set[int] = set()
         self.applied = []
         self.group_assignments = []
         self._device_repository = DeviceRepository([self.dev])
         self._group_repository = GroupRepository([object(), object(), object(), object()])
         self.discovery_active = False
+        self._transports = [self.transport]
 
     # Mirror the real controller's pending-config helpers (A3). Tests
     # remain single-threaded so a real lock is not required, but the
@@ -79,27 +95,41 @@ class FakeController:
     def take_pending_config(self, recv3_hex: str):
         return self._pending_config.pop(recv3_hex, None)
 
-    # A5: same pattern for the unicast pending-expect slot.
-    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts):
-        self._pending_expect = {
+    # A5 + Stage 2 Part 3: same pattern for the unicast pending-expect
+    # slot, now keyed by gateway_id so tests cover the multi-transport
+    # behaviour. ``None`` keeps the legacy single-gateway code path.
+    def set_pending_expect(self, dev, rule, opcode7, sender_last3, ts, *, gateway_id=None):
+        self._pending_expect[gateway_id] = {
             "dev": dev,
             "rule": rule,
             "opcode7": int(opcode7),
             "sender_last3": str(sender_last3 or "").upper(),
             "ts": float(ts),
+            "gateway_id": gateway_id,
         }
 
-    def read_pending_expect(self):
-        return self._pending_expect
+    def read_pending_expect(self, gateway_id=None):
+        entry = self._pending_expect.get(gateway_id)
+        if entry is not None:
+            return entry
+        if gateway_id is None and len(self._pending_expect) == 1:
+            return next(iter(self._pending_expect.values()))
+        return None
 
     def clear_pending_expect_if(self, expected) -> bool:
-        if self._pending_expect is expected:
-            self._pending_expect = None
+        if expected is None:
+            return False
+        gw_id = expected.get("gateway_id") if isinstance(expected, dict) else None
+        if self._pending_expect.get(gw_id) is expected:
+            self._pending_expect.pop(gw_id, None)
             return True
         return False
 
-    def clear_pending_expect(self) -> None:
-        self._pending_expect = None
+    def clear_pending_expect(self, gateway_id=None) -> None:
+        if gateway_id is None:
+            self._pending_expect.clear()
+        else:
+            self._pending_expect.pop(gateway_id, None)
 
     def _to_hex_str(self, value):
         if isinstance(value, (bytes, bytearray)):
@@ -130,6 +160,13 @@ class FakeController:
     def is_discovery_active(self):
         return bool(self.discovery_active)
 
+    def transport_for_device(self, addr):
+        # Default: route via the single test transport so the Stage-3
+        # cross-net guard in on_transport_event always validates ev_gw
+        # against this transport's ident_mac. Tests that need a different
+        # answer can monkey-patch this method on the instance.
+        return self.transport
+
 
 class GatewayServiceTests(unittest.TestCase):
     def test_send_and_wait_for_ack_marks_device_online(self):
@@ -147,7 +184,9 @@ class GatewayServiceTests(unittest.TestCase):
             )
             controller.transport.emit(_RX_WINDOW_CLOSED_TRANSITION)
 
-        events, got_closed = service.send_and_wait_for_reply(bytes.fromhex("DDEEFF"), LP.OPC_CONFIG, send_fn)
+        events, got_closed = service.send_and_wait_with_retries(
+            bytes.fromhex("DDEEFF"), LP.OPC_CONFIG, send_fn, attempts=1
+        )
 
         self.assertTrue(got_closed)
         self.assertEqual(len(events), 1)
@@ -179,8 +218,9 @@ class GatewayServiceTests(unittest.TestCase):
             )
 
         t0 = time.monotonic()
-        events, completed = service.send_and_wait_for_reply(
-            bytes.fromhex("DDEEFF"), LP.OPC_SET_GROUP, send_fn, timeout_s=5.0
+        events, completed = service.send_and_wait_with_retries(
+            bytes.fromhex("DDEEFF"), LP.OPC_SET_GROUP, send_fn,
+            attempts=1, per_attempt_timeout_s=5.0,
         )
         elapsed = time.monotonic() - t0
 
@@ -214,18 +254,25 @@ class GatewayServiceTests(unittest.TestCase):
     def test_pending_window_closed_marks_device_offline(self):
         controller = FakeController()
         service = GatewayService(controller)
-        controller._pending_expect = {
+        # Stage 2 Part 3: legacy slot is keyed by ``None``. The
+        # pending_window_closed event we drive below has no
+        # ``gateway_id`` tag (mirroring the pre-Part-3 single-gateway
+        # path) so the lookup falls through to the legacy slot.
+        controller._pending_expect[None] = {
             "dev": controller.dev,
             "rule": type("Rule", (), {"name": "STATUS"})(),
             "opcode7": LP.OPC_STATUS,
             "sender_last3": "DDEEFF",
+            "gateway_id": None,
         }
 
         service.pending_window_closed(dict(_RX_WINDOW_CLOSED_TRANSITION))
 
         self.assertFalse(controller.dev.link_online)
         self.assertEqual(controller.dev.link_error, "Missing reply (STATUS)")
-        self.assertIsNone(controller._pending_expect)
+        # Stage 2 Part 3: the CAS-clear drops the matching slot from
+        # the per-gateway dict — the dict itself stays (now empty).
+        self.assertEqual(controller._pending_expect, {})
 
     def test_send_stream_passes_raw_payload_to_transport(self):
         controller = FakeController()
@@ -242,30 +289,22 @@ class GatewayServiceTests(unittest.TestCase):
             )
             controller.transport.emit(_RX_WINDOW_CLOSED_TRANSITION)
 
-        # Plan Phase C (revised): send_stream uses send_and_collect with
-        # idle/max timeouts. Wrap send_fn to emit the ACK synchronously.
-        original_collect = service.send_and_collect
+        # Phase 2 (Option D): send_stream uses send_and_match directly with
+        # a structured PendingMatcher. Wrap send_fn to emit the ACK
+        # synchronously so the matcher hits ``expected_count`` on the spot.
+        original_match = service.send_and_match
 
-        def wrapped_collect(
-            send_fn,
-            collect_pred,
-            *,
-            expected=None,
-            idle_timeout_s=0.6,
-            max_timeout_s=5.0,
-        ):
+        # Stage 3 Part C: ``send_and_match`` now accepts an explicit
+        # ``transport`` kwarg so multi-network call sites can route
+        # through a specific transport. Mirror the new signature
+        # (**kwargs is forward-compatible with future additions).
+        def wrapped_match(send_fn, matcher, **kwargs):
             def wrapped_send():
                 send_fn()
                 emit_ack_and_close()
-            return original_collect(
-                wrapped_send,
-                collect_pred,
-                expected=expected,
-                idle_timeout_s=idle_timeout_s,
-                max_timeout_s=max_timeout_s,
-            )
+            return original_match(wrapped_send, matcher, **kwargs)
 
-        service.send_and_collect = wrapped_collect
+        service.send_and_match = wrapped_match
 
         result = service.send_stream(b"\x01\x02\x03", device=controller.dev, retries=0)
 
@@ -415,8 +454,8 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertEqual(controller.dev.groupId, 0)
         self.assertEqual(controller.group_assignments, [])
 
-    def test_send_and_collect_exits_on_expected_count(self):
-        """Broadcast collector returns immediately once ``expected`` is hit."""
+    def test_send_and_match_exits_on_expected_count(self):
+        """Collector returns immediately once ``expected_count`` is hit."""
         import time
 
         controller = FakeController()
@@ -433,23 +472,22 @@ class GatewayServiceTests(unittest.TestCase):
                     }
                 )
 
-        def pred(ev):
-            return ev.get("opc") == LP.OPC_ACK and int(ev.get("ack_of", -1)) == LP.OPC_STREAM
-
-        t0 = time.monotonic()
-        replies = service.send_and_collect(
-            send_fn,
-            pred,
-            expected=2,
+        matcher = PendingMatcher(
+            sender_filter=None,
+            expected_ack_of=int(LP.OPC_STREAM) & 0x7F,
+            expected_count=2,
             idle_timeout_s=0.6,
             max_timeout_s=5.0,
         )
+        t0 = time.monotonic()
+        replies, reason = service.send_and_match(send_fn, matcher)
         elapsed = time.monotonic() - t0
 
         self.assertEqual(len(replies), 2)
+        self.assertEqual(reason, "count")
         self.assertLess(elapsed, 0.2, f"expected-count early-exit took {elapsed:.3f}s")
 
-    def test_send_and_collect_terminates_on_idle_after_partial_replies(self):
+    def test_send_and_match_terminates_on_idle_after_partial_replies(self):
         """Idle-timeout: after last match + idle window, return even without expected."""
         import threading
         import time
@@ -473,24 +511,23 @@ class GatewayServiceTests(unittest.TestCase):
                     )
             threading.Thread(target=late, daemon=True).start()
 
-        def pred(ev):
-            return ev.get("opc") == LP.OPC_ACK
-
-        t0 = time.monotonic()
-        replies = service.send_and_collect(
-            send_fn,
-            pred,
-            expected=3,  # 3 expected but only 2 arrive
+        matcher = PendingMatcher(
+            sender_filter=None,
+            expected_ack_of=int(LP.OPC_STREAM) & 0x7F,
+            expected_count=3,  # 3 expected but only 2 arrive
             idle_timeout_s=0.12,
             max_timeout_s=5.0,
         )
+        t0 = time.monotonic()
+        replies, reason = service.send_and_match(send_fn, matcher)
         elapsed = time.monotonic() - t0
 
         self.assertEqual(len(replies), 2)
+        self.assertEqual(reason, "idle")
         # Last arrival at ~0.04 s + 0.12 s idle ~= 0.16 s, well under max.
         self.assertLess(elapsed, 0.5, f"idle termination took {elapsed:.3f}s")
 
-    def test_send_and_collect_hits_hard_ceiling_when_no_reply(self):
+    def test_send_and_match_hits_hard_ceiling_when_no_reply(self):
         """No reply at all: return after ``max_timeout_s``, not earlier."""
         import time
 
@@ -500,20 +537,18 @@ class GatewayServiceTests(unittest.TestCase):
         def send_fn():
             pass  # no emissions
 
-        def pred(ev):
-            return True
-
-        t0 = time.monotonic()
-        replies = service.send_and_collect(
-            send_fn,
-            pred,
-            expected=None,
+        matcher = PendingMatcher(
+            sender_filter=None,
+            expected_count=2**31,  # idle-only termination
             idle_timeout_s=0.6,
             max_timeout_s=0.15,
         )
+        t0 = time.monotonic()
+        replies, reason = service.send_and_match(send_fn, matcher)
         elapsed = time.monotonic() - t0
 
         self.assertEqual(replies, [])
+        self.assertEqual(reason, "no_reply")
         # Should respect the ceiling approximately.
         self.assertGreaterEqual(elapsed, 0.10)
         self.assertLess(elapsed, 0.6)
@@ -540,8 +575,9 @@ class GatewayServiceTests(unittest.TestCase):
             )
 
         t0 = time.monotonic()
-        service.send_and_wait_for_reply(
-            bytes.fromhex("DDEEFF"), LP.OPC_SET_GROUP, send_fn, timeout_s=2.0
+        service.send_and_wait_with_retries(
+            bytes.fromhex("DDEEFF"), LP.OPC_SET_GROUP, send_fn,
+            attempts=1, per_attempt_timeout_s=2.0,
         )
         elapsed = time.monotonic() - t0
         self.assertLess(elapsed, 0.1)
@@ -698,6 +734,153 @@ class SendAndWaitWithRetriesTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(call_count[0], 1, "attempts=1 means no retries")
+
+    def test_wait_for_identify_resolves_when_identify_arrives(self):
+        """N2: an IDENTIFY_REPLY for the waiting MAC must release the
+        wait. Order doesn't matter — the event-set inside the handler
+        and the ``wait`` call can race, the Event-based gate must
+        handle both orders."""
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        # Identify already-arrived case (set before wait).
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+        service._join_auto_restore_workers(timeout=2.0)
+        self.assertTrue(service.wait_for_identify("AABBCCDDEEFF", timeout_s=0.1))
+        self.assertTrue(service.wait_for_identify("aa:bb:cc:dd:ee:ff", timeout_s=0.1),
+                        "MAC key normalisation should strip separators")
+
+    def test_clear_identify_forgets_past_event(self):
+        """After ``clear_identify``, a fresh ``wait_for_identify``
+        must time out — otherwise an OTA-restart could be released
+        by an identify event from a previous reboot."""
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+        service._join_auto_restore_workers(timeout=2.0)
+        service.clear_identify("AABBCCDDEEFF")
+        self.assertFalse(service.wait_for_identify("AABBCCDDEEFF", timeout_s=0.05))
+
+    def test_wait_for_auto_restore_blocks_until_worker_done(self):
+        """N3: a pending auto-restore worker for a MAC must keep
+        ``wait_for_auto_restore`` blocked until the worker finishes.
+        ``FakeController.setNodeGroupId`` returns immediately, so the
+        wait should complete in well under the timeout."""
+        controller = FakeController()
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        # Trigger the auto-restore by emitting an IDENTIFY_REPLY with
+        # groupId=0 for the known device. The worker will run
+        # ``setNodeGroupId`` and complete.
+        service.on_transport_event(
+            {
+                "opc": LP.OPC_DEVICES,
+                "reply": "IDENTIFY_REPLY",
+                "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                "groupId": 0,
+                "caps": 1,
+                "version": 7,
+            }
+        )
+
+        # The wait must succeed within a few seconds — the worker
+        # only calls a synchronous FakeController.setNodeGroupId.
+        import time
+        t0 = time.monotonic()
+        ok = service.wait_for_auto_restore("AABBCCDDEEFF", timeout_s=5.0)
+        elapsed = time.monotonic() - t0
+
+        self.assertTrue(ok)
+        self.assertLess(elapsed, 5.0)
+        # Confirm the worker actually ran.
+        self.assertEqual(controller.group_assignments,
+                         [("AABBCCDDEEFF", 3, True, True)])
+
+    def test_wait_for_auto_restore_returns_true_when_no_worker_inflight(self):
+        """No worker has ever been spawned for this MAC → the wait
+        must short-circuit to True instead of blocking on a missing
+        future."""
+        controller = FakeController()
+        service = GatewayService(controller)
+        self.assertTrue(service.wait_for_auto_restore("123456789ABC", timeout_s=0.1))
+
+    def test_status_reply_from_correct_gateway_marks_online(self):
+        """STATUS_REPLY whose ``gateway_id`` matches the device's bound
+        transport ident_mac promotes link_online — baseline for the
+        cross-net guard below."""
+        controller = FakeController()
+        service = GatewayService(controller)
+        controller.dev.link_online = False
+
+        service.on_transport_event({
+            "opc": LP.OPC_STATUS,
+            "reply": "STATUS_REPLY",
+            "sender3": bytes.fromhex("DDEEFF"),
+            "gateway_id": controller.transport.ident_mac,
+            "flags": 0,
+            "configByte": 0,
+            "effectId": 0,
+            "brightness": 0,
+            "vbat_mV": 0,
+            "node_rssi": -60,
+            "node_snr": 7,
+            "host_rssi": -60,
+            "host_snr": 7,
+        })
+
+        self.assertTrue(controller.dev.link_online)
+
+    def test_status_reply_from_foreign_gateway_marks_offline(self):
+        """STATUS_REPLY whose ``gateway_id`` differs from the device's
+        bound transport ident_mac is a cross-network heartbeat —
+        typically a node still on its old radio mid-migration. Promote
+        offline instead of online so the UI tells the truth."""
+        controller = FakeController()
+        service = GatewayService(controller)
+        # Bind the device to a transport whose ident_mac is GW-A; the
+        # incoming STATUS_REPLY claims gateway_id GW-B.
+        controller.transport.ident_mac = "GW-A"
+        controller.dev.link_online = True  # pretend a previous frame promoted us
+
+        service.on_transport_event({
+            "opc": LP.OPC_STATUS,
+            "reply": "STATUS_REPLY",
+            "sender3": bytes.fromhex("DDEEFF"),
+            "gateway_id": "GW-B",
+            "flags": 0,
+            "configByte": 0,
+            "effectId": 0,
+            "brightness": 0,
+            "vbat_mV": 0,
+            "node_rssi": -60,
+            "node_snr": 7,
+            "host_rssi": -60,
+            "host_snr": 7,
+        })
+
+        self.assertFalse(controller.dev.link_online)
 
 
 if __name__ == "__main__":

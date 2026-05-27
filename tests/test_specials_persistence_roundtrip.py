@@ -111,7 +111,7 @@ class PersistenceRoundTripTests(unittest.TestCase):
         # ``dump_state`` mirrors ``save_to_db``'s payload composition.
         raw = dump_state([dev], [], schema_version=1)
 
-        loaded_devices, _, _ = load_state(raw)
+        loaded_devices, _, _, _ = load_state(raw)
         self.assertEqual(len(loaded_devices), 1)
         loaded_record = loaded_devices[0]
 
@@ -144,7 +144,7 @@ class PersistenceRoundTripTests(unittest.TestCase):
             },
         )
         raw = dump_state([dev], [], schema_version=1)
-        loaded_devices, _, _ = load_state(raw)
+        loaded_devices, _, _, _ = load_state(raw)
         loaded_record = loaded_devices[0]
 
         state = build_specials_state(
@@ -167,7 +167,7 @@ class PersistenceRoundTripTests(unittest.TestCase):
             specials={"wled_seg0_start": 0, "wled_seg0_stop": 200},
         )
         raw = dump_state([dev], [], schema_version=1)
-        loaded_devices, _, _ = load_state(raw)
+        loaded_devices, _, _, _ = load_state(raw)
         loaded_record = loaded_devices[0]
 
         # Pass the FULL record (the iter-pre-10 mistaken shape).

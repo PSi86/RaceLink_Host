@@ -1,21 +1,24 @@
-"""Host-side request/reply matching registry (plan Transport Redesign B).
+"""Host-side request/reply matching registry — unified matcher (Option D).
 
-The Gateway firmware no longer closes an RX window to signal "the reply you
-were waiting for is done" -- it sits in Continuous RX and forwards every
-matching frame. The Host therefore owns the "is this frame my awaited reply?"
-decision. :class:`PendingRequestRegistry` is the data structure that tracks
-outstanding unicast request/response exchanges and unblocks the waiting
-caller as soon as a matching reply event arrives.
+The Gateway firmware sits in Continuous RX and forwards every matching frame to
+the Host, so the Host owns the "is this frame an awaited reply?" decision.
+:class:`PendingMatcher` describes a single outstanding receive expectation
+(unicast 1-reply, multi-sender N-reply collector, or wildcard discovery), and
+:class:`PendingMatcherRegistry` is the data structure that routes inbound
+frames to the matchers that want them.
 
-The matching key is ``(sender_last3, opcode-or-ack-of)``:
+Replaces two earlier mechanisms that lived side-by-side
+(``PendingRequestRegistry`` for single-sender unicast and an
+``add_listener``-backed collector for N-reply broadcasts). See the plan at
+``.claude/plans/aktuell-teste-ich-den-lazy-willow.md`` for the design rationale
+and migration sequence.
 
-* ``RESP_ACK``  -> the reply is ``OPC_ACK`` with ``ack_of == opcode7``.
-* ``RESP_SPECIFIC`` -> the reply is the protocol's declared response opcode.
-
-A single registry instance is shared across the GatewayService for all its
-outstanding unicast waits. Broadcast collectors (discovery, stream, group
-status) do **not** use the registry; they use the separate wall-clock
-collector because they expect N replies from unknown senders.
+A single registry instance is shared across the GatewayService for all
+outstanding waits; the ``GatewayService.on_transport_event`` hook funnels each
+inbound event through :meth:`PendingMatcherRegistry.try_match`. The waiter's
+:meth:`PendingMatcher.wait` (or the high-level :meth:`GatewayService.send_and_match`)
+blocks on the matcher's condition until the matcher is done, the idle window
+closes, or the hard ceiling elapses.
 """
 
 from __future__ import annotations
@@ -24,7 +27,18 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+
+
+def _gw_short(gateway_id: Optional[str]) -> str:
+    """Compact gateway suffix for matcher log lines — ``XXXX`` (last
+    4 hex of ident_mac) or ``?`` pre-handshake. Matches the bracket
+    style used by ``controller.format_gateway_label`` so multi-line
+    debug traces correlate by suffix without cross-referencing."""
+    if not gateway_id:
+        return "?"
+    cleaned = str(gateway_id).upper().replace(":", "")
+    return cleaned[-4:] or "?"
 
 from ..transport.gateway_events import LP
 
@@ -32,208 +46,352 @@ logger = logging.getLogger(__name__)
 
 # Policy codes mirror racelink.protocol.rules (kept as ints so this module
 # does not need to import the rules module and we avoid a circular import).
+# Retained for callers that still think in policy terms — the matcher itself
+# distinguishes via ``expected_ack_of`` vs ``expected_opcode``.
 RESP_ACK = 1
 RESP_SPECIFIC = 2
 
 
 @dataclass
-class PendingRequest:
-    """State for a single outstanding unicast request.
+class PendingMatcher:
+    """One outstanding receive expectation.
 
-    ``expected_key2`` is an optional secondary discriminator on the
-    parsed reply event. When set, ``matches()`` also requires
-    ``ev.get(<discriminator_field>) == expected_key2``. The discriminator
-    field is selected by the policy:
+    Filters (all set fields must hold for an event to match):
 
-    * ``RESP_SPECIFIC`` — discriminator field is ``ev["option"]`` (the
-      payload byte that GET_CONFIG_REPLY echoes back). This is the
-      case the discriminator was added for: two GET_CONFIG requests
-      for different options would otherwise wake on FIFO order without
-      regard to which option's reply actually arrived.
+    * ``sender_filter`` — accepted sender-last3 set. ``None`` = wildcard (any
+      sender). A singleton frozenset enables fast-bucket lookup in the
+      registry; larger sets fall back to the broadcast list.
+    * ``expected_opcode`` — for ``RESP_SPECIFIC``-style replies (e.g.
+      ``OPC_DEVICES`` reply, ``GET_CONFIG_REPLY``). ``None`` = wildcard.
+    * ``expected_ack_of`` — for ``RESP_ACK``-style replies: the original
+      request's opcode7 that an ``OPC_ACK`` will echo back via ``ack_of``.
+      When set the matcher only accepts ``OPC_ACK`` frames whose
+      ``ack_of`` equals this value.
+    * ``discriminator_field`` / ``discriminator_value`` — optional final
+      filter on a parsed event field (today only ``"option"`` for
+      GET_CONFIG_REPLY to prevent concurrent reads on the same device but
+      for different options from waking each other).
 
-    Existing callers that pass ``expected_key2=None`` (the default)
-    behave exactly as before — no per-candidate filter applied.
+    Collection semantics:
+
+    * ``expected_count`` — how many matching events to collect before the
+      matcher is "done". 1 = traditional unicast request/reply. >1 = group
+      collector.
+    * ``idle_timeout_s`` — after the first match, the matcher is considered
+      idle-complete if no further match arrives within this many seconds.
+      0.0 disables idle-mode (only ``max_timeout_s`` applies — original
+      unicast semantics).
+    * ``max_timeout_s`` — hard ceiling from the moment the matcher is
+      registered. Always applies.
+
+    The registry mutates ``collected`` / ``last_match_ts`` / ``done`` under
+    the matcher's internal condition; callers should only read these fields
+    inside ``with matcher._cond:`` or after ``wait`` has returned.
     """
 
-    sender_last3: bytes
-    expected_key: int  # opcode7 for RESP_ACK (matched against ack_of) or response_opcode for RESP_SPECIFIC
-    policy: int
-    timeout_s: float
-    expected_key2: Optional[int] = None
-    done: threading.Event = field(default_factory=threading.Event)
-    reply: Optional[dict] = None
+    # --- filters ---
+    sender_filter: Optional[frozenset[bytes]] = None
+    expected_opcode: Optional[int] = None
+    expected_ack_of: Optional[int] = None
+    discriminator_field: Optional[str] = None
+    discriminator_value: Optional[Any] = None
+    # Multi-network filter. ``None`` means "wildcard — accept events
+    # from any transport". Stage 3 promotes ``gateway_id`` to a hard
+    # requirement at registration time for *concrete-sender* matchers
+    # (i.e. ``sender_filter`` is not ``None``): every unicast or
+    # multi-sender N-reply wait must name the transport whose RX
+    # feed is authorised to satisfy it, so that cross-transport
+    # replies cannot accidentally clear an in-flight unicast. Pure
+    # wildcard matchers (discovery / fleet-wide broadcasts where
+    # ``sender_filter is None``) may still omit it — they collect
+    # from any transport by design. The enforcement happens in
+    # :meth:`PendingMatcherRegistry.register`.
+    gateway_id: Optional[str] = None
+
+    # --- collection semantics ---
+    expected_count: int = 1
+    idle_timeout_s: float = 0.0
+    max_timeout_s: float = 1.0
+
+    # --- state (registry-managed) ---
+    collected: list[dict] = field(default_factory=list)
+    last_match_ts: Optional[float] = None
     registered_ts: float = field(default_factory=time.monotonic)
 
+    # --- sync primitives (private) ---
+    _cond: threading.Condition = field(default_factory=threading.Condition, repr=False)
+    _done: bool = field(default=False, repr=False)
+
     def matches(self, ev: dict) -> bool:
+        """Full filter evaluation. Registry pre-filters via bucket lookup."""
         try:
-            sender3 = ev.get("sender3")
-            if not isinstance(sender3, (bytes, bytearray)):
-                return False
-            if bytes(sender3) != self.sender_last3:
-                return False
+            # Gateway-id filter (Stage 2). When set, only events from the
+            # matching transport count. The transport tags every event it
+            # emits with ``gateway_id`` (its ident_mac); an event without
+            # that tag is treated as "comes from the legacy single
+            # transport" and matches a None filter, but never a concrete
+            # gateway_id filter.
+            if self.gateway_id is not None:
+                ev_gw = ev.get("gateway_id")
+                if ev_gw is None or str(ev_gw) != str(self.gateway_id):
+                    return False
+            # Sender filter
+            if self.sender_filter is not None:
+                s3 = ev.get("sender3")
+                if not isinstance(s3, (bytes, bytearray)):
+                    return False
+                if bytes(s3) not in self.sender_filter:
+                    return False
             opc = int(ev.get("opc", -1)) & 0x7F
-            if self.policy == RESP_ACK:
-                if opc != int(LP.OPC_ACK) or int(ev.get("ack_of", -1)) != self.expected_key:
+            # ACK-of filter (implies opc == OPC_ACK)
+            if self.expected_ack_of is not None:
+                if opc != int(LP.OPC_ACK):
                     return False
-            elif self.policy == RESP_SPECIFIC:
-                if opc != self.expected_key:
+                if int(ev.get("ack_of", -1)) != int(self.expected_ack_of):
                     return False
-            else:
-                return False
-            if self.expected_key2 is not None:
-                # Currently only RESP_SPECIFIC uses a discriminator
-                # (the OPC_GET_CONFIG ``option`` byte). Generalises
-                # cleanly if other reply types ever carry a sub-key.
-                ev_key2 = ev.get("option")
-                if ev_key2 is None:
+            elif self.expected_opcode is not None:
+                # Specific-reply opcode filter
+                if opc != int(self.expected_opcode):
                     return False
-                if int(ev_key2) != int(self.expected_key2):
+            # Discriminator (e.g. "option" for GET_CONFIG_REPLY, "reply" for IDENTIFY).
+            # Numeric values are int-coerced for robustness against codec
+            # variants that surface ints as strings; non-numeric values
+            # (e.g. the "reply" marker string) compare for equality as-is.
+            if self.discriminator_field is not None:
+                ev_val = ev.get(self.discriminator_field)
+                if ev_val is None:
                     return False
+                if isinstance(self.discriminator_value, int):
+                    try:
+                        if int(ev_val) != int(self.discriminator_value):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                else:
+                    if ev_val != self.discriminator_value:
+                        return False
             return True
         except Exception:
-            # swallow-ok: malformed event dispatched to us -> "not a match"
+            # swallow-ok: a malformed event is "not a match"
             return False
 
+    @property
+    def done(self) -> bool:
+        """True if the matcher has collected ``expected_count`` events or
+        was otherwise marked done."""
+        return self._done or len(self.collected) >= self.expected_count
 
-class PendingRequestRegistry:
-    """Thread-safe registry of outstanding unicast request/response waits.
+    def wait(self, *, on_send_complete: Optional[float] = None) -> str:
+        """Block until done, idle window closes, or max_timeout elapses.
 
-    Each ``register`` call returns a :class:`PendingRequest` whose ``done``
-    event is set (by :meth:`try_match`) as soon as a matching reply arrives.
-    The caller waits on ``done`` and calls :meth:`cancel` in a ``finally``
-    block regardless of outcome.
+        Returns the termination reason: ``"count"`` (expected reached),
+        ``"idle"`` (silence after first match), ``"max_timeout"`` (ceiling
+        with at least one match), ``"no_reply"`` (ceiling without any match).
+
+        ``on_send_complete`` is the monotonic-time anchor for the hard
+        ceiling. If ``None``, the matcher's ``registered_ts`` is used. Callers
+        that want the hard ceiling to start counting only after their
+        ``send_fn`` returned should pass ``time.monotonic()`` taken right
+        after the send.
+        """
+        t_anchor = on_send_complete if on_send_complete is not None else self.registered_ts
+        hard_deadline = t_anchor + float(self.max_timeout_s)
+
+        with self._cond:
+            while True:
+                if self.done:
+                    return "count"
+                now = time.monotonic()
+                if now >= hard_deadline:
+                    return "max_timeout" if self.last_match_ts is not None else "no_reply"
+                if self.last_match_ts is not None and self.idle_timeout_s > 0.0:
+                    idle_deadline = self.last_match_ts + float(self.idle_timeout_s)
+                    effective = min(idle_deadline, hard_deadline)
+                    wait_s = effective - now
+                    if wait_s <= 0.0:
+                        return "idle"
+                else:
+                    wait_s = hard_deadline - now
+                self._cond.wait(timeout=max(0.0, wait_s))
+
+
+class PendingMatcherRegistry:
+    """Thread-safe registry of outstanding matchers.
+
+    Lookup strategy:
+
+    * **Unicast fast-path**: matchers with ``len(sender_filter) == 1`` and
+      a concrete ``expected_ack_of`` / ``expected_opcode`` are placed in a
+      dict bucket keyed by ``(sender_last3, key)``. O(1) lookup on inbound
+      events whose ``sender3`` + ``opc``/``ack_of`` hit the same key.
+    * **Broadcast slow-path**: all other matchers (wildcard sender, multi-
+      sender set, wildcard opcode) live in a list; ``try_match`` does a
+      linear scan after the unicast bucket misses. The list is expected to
+      stay small (≤ a handful of outstanding ops at any one time).
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # Multiple waits against the same (sender, key) are unlikely in
-        # practice, but we keep a list to handle pathological reentrancy.
-        self._by_key: dict[tuple[bytes, int, int], list[PendingRequest]] = {}
+        self._unicast: dict[tuple[bytes, int], list[PendingMatcher]] = {}
+        self._broadcast: list[PendingMatcher] = []
 
-    def register(
-        self,
-        *,
-        sender_last3: bytes,
-        expected_key: int,
-        policy: int,
-        timeout_s: float,
-        expected_key2: Optional[int] = None,
-    ) -> PendingRequest:
-        req = PendingRequest(
-            sender_last3=bytes(sender_last3),
-            expected_key=int(expected_key),
-            policy=int(policy),
-            timeout_s=float(timeout_s),
-            expected_key2=None if expected_key2 is None else int(expected_key2),
-        )
-        key = (req.sender_last3, req.policy, req.expected_key)
+    @staticmethod
+    def _unicast_key(m: PendingMatcher) -> Optional[tuple[bytes, int]]:
+        """Returns the fast-bucket lookup key if the matcher qualifies."""
+        if m.sender_filter is None or len(m.sender_filter) != 1:
+            return None
+        # Prefer ack_of (ACK path) because it discriminates within a single
+        # sender far better than opc (which is always OPC_ACK for that path).
+        key = m.expected_ack_of if m.expected_ack_of is not None else m.expected_opcode
+        if key is None:
+            return None
+        sender = next(iter(m.sender_filter))
+        return (sender, int(key) & 0x7F)
+
+    def register(self, m: PendingMatcher) -> PendingMatcher:
+        """Insert ``m`` into the appropriate bucket. Returns ``m`` for chaining.
+
+        Stage 3 contract: a matcher with a concrete ``sender_filter``
+        (unicast or multi-sender N-reply) MUST carry a concrete
+        ``gateway_id`` so a sibling transport's RX feed cannot
+        accidentally satisfy it. Wildcard matchers
+        (``sender_filter is None`` — discovery / fleet broadcasts)
+        may still omit ``gateway_id``. Violations are a programming
+        error, not an operator-visible failure mode, so we raise
+        :class:`ValueError` at the registration call rather than
+        silently miss-routing.
+        """
+        if m.sender_filter is not None and m.gateway_id is None:
+            raise ValueError(
+                "PendingMatcher with a concrete sender_filter must carry "
+                "gateway_id (Stage 3 requirement). Pass the transport's "
+                "ident_mac into the matcher constructor, or send through "
+                "GatewayService.send_and_wait_with_retries / send_and_match "
+                "which stamp it automatically from the routed transport."
+            )
         with self._lock:
-            self._by_key.setdefault(key, []).append(req)
-            pending_total = sum(len(b) for b in self._by_key.values())
+            uk = self._unicast_key(m)
+            if uk is not None:
+                self._unicast.setdefault(uk, []).append(m)
+            else:
+                self._broadcast.append(m)
+            pending_total = sum(len(b) for b in self._unicast.values()) + len(self._broadcast)
         logger.debug(
-            "registry.register sender=%s policy=%d expected_key=0x%02X%s timeout=%.3fs pending_total=%d",
-            req.sender_last3.hex().upper(),
-            req.policy,
-            req.expected_key,
-            "" if req.expected_key2 is None else f" expected_key2=0x{req.expected_key2:02X}",
-            req.timeout_s,
+            "[%s] matcher.register sender_filter=%s opcode=%s ack_of=%s expected=%d "
+            "idle=%.2fs max=%.2fs pending_total=%d",
+            _gw_short(m.gateway_id),
+            "any" if m.sender_filter is None else [s.hex().upper() for s in m.sender_filter],
+            m.expected_opcode,
+            m.expected_ack_of,
+            m.expected_count,
+            m.idle_timeout_s,
+            m.max_timeout_s,
             pending_total,
         )
-        return req
+        return m
 
-    def cancel(self, req: PendingRequest) -> None:
-        """Remove ``req`` from the registry; safe to call multiple times."""
-        key = (req.sender_last3, req.policy, req.expected_key)
+    def cancel(self, m: PendingMatcher) -> None:
+        """Remove ``m`` from its bucket; idempotent."""
         removed = False
         with self._lock:
-            bucket = self._by_key.get(key)
-            if bucket:
-                try:
-                    bucket.remove(req)
-                    removed = True
-                except ValueError:
-                    pass
-                if not bucket:
-                    self._by_key.pop(key, None)
-            pending_total = sum(len(b) for b in self._by_key.values())
-        if removed:
-            elapsed = time.monotonic() - req.registered_ts
-            logger.debug(
-                "registry.cancel sender=%s policy=%d expected_key=0x%02X elapsed=%.3fs done=%s pending_total=%d",
-                req.sender_last3.hex().upper(),
-                req.policy,
-                req.expected_key,
-                elapsed,
-                req.done.is_set(),
-                pending_total,
-            )
-
-    def try_match(self, ev: dict) -> Optional[PendingRequest]:
-        """If ``ev`` satisfies any pending request, complete it and return it.
-
-        Returns the matched request (with ``reply`` and ``done`` set) or
-        ``None`` when nothing matched. The matched request is removed from the
-        registry so the caller's ``finally: cancel()`` is idempotent.
-        """
-        try:
-            sender3 = ev.get("sender3")
-            if not isinstance(sender3, (bytes, bytearray)):
-                return None
-            sender_bytes = bytes(sender3)
-            opc = int(ev.get("opc", -1)) & 0x7F
-        except Exception:
-            # swallow-ok: malformed event -> nobody can be waiting for it
-            return None
-
-        candidates: list[tuple[tuple[bytes, int, int], PendingRequest]] = []
-        with self._lock:
-            # ACK path: key = (sender, RESP_ACK, ack_of)
-            ack_of = ev.get("ack_of")
-            if opc == int(LP.OPC_ACK) and ack_of is not None:
-                key = (sender_bytes, RESP_ACK, int(ack_of) & 0x7F)
-                for req in list(self._by_key.get(key, ())):
-                    candidates.append((key, req))
-            # Specific-reply path: key = (sender, RESP_SPECIFIC, response_opcode)
-            key_spec = (sender_bytes, RESP_SPECIFIC, opc)
-            for req in list(self._by_key.get(key_spec, ())):
-                candidates.append((key_spec, req))
-
-        for key, req in candidates:
-            if not req.matches(ev):
-                continue
-            req.reply = dict(ev)
-            req.done.set()
-            elapsed = time.monotonic() - req.registered_ts
-            with self._lock:
-                bucket = self._by_key.get(key)
-                if bucket is not None:
+            uk = self._unicast_key(m)
+            if uk is not None:
+                bucket = self._unicast.get(uk)
+                if bucket:
                     try:
-                        bucket.remove(req)
+                        bucket.remove(m)
+                        removed = True
                     except ValueError:
                         pass
                     if not bucket:
-                        self._by_key.pop(key, None)
+                        self._unicast.pop(uk, None)
+            else:
+                try:
+                    self._broadcast.remove(m)
+                    removed = True
+                except ValueError:
+                    pass
+            pending_total = sum(len(b) for b in self._unicast.values()) + len(self._broadcast)
+        if removed:
+            elapsed = time.monotonic() - m.registered_ts
             logger.debug(
-                "registry.try_match HIT sender=%s policy=%d expected_key=0x%02X elapsed=%.3fs",
-                req.sender_last3.hex().upper(),
-                req.policy,
-                req.expected_key,
+                "[%s] matcher.cancel collected=%d done=%s elapsed=%.3fs pending_total=%d",
+                _gw_short(m.gateway_id),
+                len(m.collected),
+                m.done,
                 elapsed,
+                pending_total,
             )
-            return req
 
-        # Diagnostic: record when a reply-looking event passed through without
-        # matching any waiter. Useful for spotting "ACK arrived but too late"
-        # or "ACK for wrong opcode" situations.
-        if opc == int(LP.OPC_ACK):
+    def try_match(self, ev: dict) -> Optional[PendingMatcher]:
+        """Find the first matcher that accepts ``ev``. Append to its
+        collected list, update timestamps, signal its condition. Returns
+        the matched matcher (with state updated) or ``None``.
+
+        Lookup order: unicast bucket (fast) → broadcast list (linear). The
+        first matching matcher consumes the event; we do not fan out to
+        multiple matchers on the same event (this preserves today's "ACK
+        matches exactly one waiter" semantics).
+        """
+        try:
+            sender3 = ev.get("sender3")
+            opc = int(ev.get("opc", -1)) & 0x7F
+            ack_of = ev.get("ack_of")
+        except Exception:
+            # swallow-ok: malformed event - nobody can match it
+            return None
+
+        candidates: list[PendingMatcher] = []
+        with self._lock:
+            if isinstance(sender3, (bytes, bytearray)):
+                s3b = bytes(sender3)
+                # ACK path: ack_of is the discriminator in the bucket key.
+                if opc == int(LP.OPC_ACK) and ack_of is not None:
+                    candidates.extend(self._unicast.get((s3b, int(ack_of) & 0x7F), ()))
+                # Specific-reply path: opc is the discriminator.
+                candidates.extend(self._unicast.get((s3b, opc), ()))
+            # Broadcast list — small, linear scan.
+            candidates.extend(self._broadcast)
+
+        matched_any_candidate = len(candidates) > 0
+        for m in candidates:
+            if not m.matches(ev):
+                continue
+            with m._cond:
+                m.collected.append(dict(ev))
+                m.last_match_ts = time.monotonic()
+                if len(m.collected) >= m.expected_count:
+                    m._done = True
+                m._cond.notify_all()
             logger.debug(
-                "registry.try_match MISS opc=ACK sender=%s ack_of=%s pending_keys=%d",
-                sender_bytes.hex().upper(),
-                ev.get("ack_of"),
+                "[%s] matcher.try_match HIT collected=%d/%d expected_ack_of=%s expected_opcode=%s",
+                _gw_short(m.gateway_id),
+                len(m.collected),
+                m.expected_count,
+                m.expected_ack_of,
+                m.expected_opcode,
+            )
+            return m
+
+        # Diagnostic: only log when a matcher in the unicast bucket had the
+        # right key but its full filter rejected the event — that is the
+        # genuinely interesting "ACK arrived but with wrong discriminator"
+        # case. When no candidates existed at all the event simply has no
+        # waiter (e.g. unsolicited STATUS_REPLY, untracked broadcast); no
+        # log noise.
+        if opc == int(LP.OPC_ACK) and matched_any_candidate:
+            # gateway_id comes off the event because no single matcher
+            # matched — the candidates list may carry mixed identities.
+            logger.debug(
+                "[%s] matcher.try_match NO_MATCH opc=ACK sender=%s ack_of=%s "
+                "candidates=%d (had right bucket key, full filter failed)",
+                _gw_short(ev.get("gateway_id")),
+                bytes(sender3).hex().upper() if isinstance(sender3, (bytes, bytearray)) else "?",
+                ack_of,
                 len(candidates),
             )
         return None
 
     def pending_count(self) -> int:
         with self._lock:
-            return sum(len(bucket) for bucket in self._by_key.values())
+            return sum(len(b) for b in self._unicast.values()) + len(self._broadcast)

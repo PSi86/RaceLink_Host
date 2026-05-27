@@ -122,7 +122,7 @@ class InstalledArtifactSmokeTests(unittest.TestCase):
                 flask.stream_with_context = lambda fn: fn
                 sys.modules["flask"] = flask
 
-                import controller
+                from racelink import controller
                 from racelink.app import create_runtime
                 from racelink.integrations.standalone import build_standalone_runtime, create_standalone_app
                 from racelink.web import register_rl_blueprint

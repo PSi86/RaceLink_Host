@@ -123,7 +123,7 @@ async function onSubmit(ev: Event) {
 
         <DialogFooter>
           <Button type="button" variant="secondary" @click="close">Close</Button>
-          <Button type="submit" :disabled="startDisabled">
+          <Button variant="run" type="submit" :disabled="startDisabled">
             {{ submitting ? 'Starting…' : 'Re-sync' }}
           </Button>
         </DialogFooter>

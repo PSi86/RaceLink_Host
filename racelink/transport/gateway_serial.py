@@ -14,6 +14,7 @@ import serial.tools.list_ports
 from .framing import mac_last3_from_hex, u16le
 from .gateway_events import (
     EV_ERROR,
+    EV_RF_CHANGED,
     EV_STATE_CHANGED,
     EV_STATE_REPORT,
     EV_TX_DONE,
@@ -21,21 +22,35 @@ from .gateway_events import (
     GATEWAY_STATE_NAME,
     GATEWAY_STATE_RX_WINDOW,
     GATEWAY_STATE_UNKNOWN,
+    GW_CMD_GET_RF_CONFIG,
+    GW_CMD_SET_RF_CONFIG,
     GW_CMD_STATE_REQUEST,
+    GW_RF_PERSIST_NVS,
+    GW_RF_VOLATILE,
     LP,
+    RF_CHANGE_REASON_NAME,
     TX_REJECT_REASON_NAME,
     TX_REJECT_UNKNOWN,
 )
+
+# P_RfConfig wire layout lives in racelink/protocol/packets.py as
+# RF_CONFIG_STRUCT (single source of truth shared with the LoRa-side
+# OPC_RF_CONFIG codec). USB-CDC and LoRa carry the same 12 B body shape.
 from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
+    RF_CONFIG_STRUCT,
     build_config_body,
     build_control_body,
     build_get_config_body,
     build_get_devices_body,
+    build_get_rf_config_body,
+    build_indicate_body,
     build_offset_body,
     build_preset_body,
+    build_rf_config_body,
     build_set_group_body,
     build_sync_body,
+    unpack_rf_config_body,
 )
 
 logger = logging.getLogger("racelink_transport")
@@ -216,7 +231,7 @@ class GatewaySerialTransport:
         port_label = getattr(self.ser, "port", None) or self.port or "?"
         try:
             setter(True)
-            logger.debug("USB low-latency mode enabled on %s", port_label)
+            logger.debug("%s USB low-latency mode enabled on %s", self._log_label(), port_label)
         except (NotImplementedError, OSError, Exception) as e:
             # Windows / macOS / non-USB-serial port → method either raises
             # NotImplementedError or fails silently with OSError. Log at
@@ -331,6 +346,99 @@ class GatewaySerialTransport:
 
         return False
 
+    @staticmethod
+    def enumerate_all(exclude_ports=None) -> list[tuple[str, str | None]]:
+        """Probe every USB port and return ``[(port_device, ident_mac), ...]``
+        for every responding RaceLink gateway.
+
+        Unlike :meth:`discover_and_open` which stops at the first hit and
+        binds it to ``self``, this method enumerates the full set so
+        Stage 3's multi-transport controller can attach every connected
+        gateway. The probe protocol is the same (send identify payload,
+        match ``RaceLink_Gateway_v4`` prefix in the reply) — extracted
+        into a classmethod so both call sites share the wire contract.
+
+        Ports that fail to open / time out / aren't gateways are skipped
+        silently. ``ident_mac`` is ``None`` when the reply doesn't carry
+        a parseable MAC string.
+
+        ``exclude_ports`` (Round 5 follow-up): iterable of device paths
+        the caller already owns. Production ``open()`` does NOT use
+        ``exclusive``/``flock``, so probing a port that's currently in
+        use by an attached transport corrupts that transport's USB
+        stream — the IDENTIFY probe payload arrives on the gateway's
+        normal command channel and the active reader sees garbage,
+        eventually firing EV_ERROR. The 5-second cascade pattern
+        observed in bench-test #6 (B detached → A detached 5s later)
+        was driven by ``MissingTransportTracker``'s poll calling
+        ``enumerate_all`` while A was still happily attached.
+        """
+        excluded = set(exclude_ports or ())
+        found: list[tuple[str, str | None]] = []
+        payload = struct.pack(">BBBB", 0x00, 0x01, 1, 0xFF)
+        ident = b"RaceLink_Gateway_v4"
+        for p in serial.tools.list_ports.comports():
+            if p.device in excluded:
+                continue
+            try:
+                # Mirror the is-USB filter from discover_and_open.
+                desc = (getattr(p, "description", "") or "").upper()
+                if "USB" not in desc:
+                    continue
+            except Exception:
+                # swallow-ok: portinfo without description -> skip
+                continue
+            tmp = serial.Serial(timeout=0.5)
+            tmp.baudrate = 921600
+            try:
+                tmp.port = p.device
+                try:
+                    tmp.exclusive = True  # type: ignore[attr-defined]
+                except Exception:
+                    # swallow-ok: exclusive flag unsupported on some platforms.
+                    pass
+                tmp.open()
+                time.sleep(0.5)
+                tmp.reset_input_buffer()
+                tmp.write(payload)
+                resp = tmp.read(len(ident) + 17)
+                if not resp or not resp.startswith(ident):
+                    tmp.close()
+                    continue
+                mac_ascii = ""
+                try:
+                    mac_ascii = resp[len(ident):].decode("ascii", errors="ignore").strip().strip("\x00")
+                except Exception:
+                    # swallow-ok: best-effort MAC extraction; tuple still useful with port only.
+                    mac_ascii = ""
+                found.append((p.device, mac_ascii or None))
+            except serial.SerialException:
+                # swallow-ok: busy port / not-a-gateway -> skip silently
+                continue
+            finally:
+                try:
+                    if getattr(tmp, "is_open", False):
+                        tmp.close()
+                except Exception:
+                    # swallow-ok: best-effort close
+                    pass
+        return found
+
+    def _log_label(self) -> str:
+        """Compact bracket label for log prefixing — ``[XXXX]`` derived
+        from the last 4 hex chars of ``ident_mac``, or ``[? port]``
+        when the handshake hasn't run yet. Matches the bracket style
+        used by ``controller.format_gateway_label`` so reader can
+        correlate transport-level and service-level lines by suffix.
+        """
+        mac = (self.ident_mac or "").upper().replace(":", "")
+        if mac:
+            return f"[{mac[-4:]}]"
+        port = self.port or "?"
+        # Trim long /dev/ttyUSBx paths to "ttyUSBx" for brevity.
+        port_short = port.rsplit("/", 1)[-1]
+        return f"[? {port_short}]"
+
     def open(self):
         if not self.port:
             raise RuntimeError("GatewaySerialTransport: no port set")
@@ -398,6 +506,15 @@ class GatewaySerialTransport:
             pass
 
     def _emit_tx(self, ev: dict):
+        # Stage 2 Part 3: tag every outgoing event with this transport's
+        # identity so the GatewayService / PendingMatcher can route across
+        # multiple attached gateways. ``ident_mac`` may be ``None`` until
+        # the IDENTIFY handshake completes — in that case downstream
+        # gateway_id=None filters (single-transport legacy path) still
+        # match. ``setdefault`` so a caller that has already tagged the
+        # event keeps its value.
+        if self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         for cb in list(self._tx_listeners):
             try:
                 cb(ev)
@@ -412,7 +529,7 @@ class GatewaySerialTransport:
                 )
 
     def _handle_disconnect(self, msg: str) -> None:
-        logger.warning(msg)
+        logger.warning("%s %s", self._log_label(), msg)
         self._emit({"type": EV_ERROR, "data": msg})
         self._stop = True
         try:
@@ -491,7 +608,8 @@ class GatewaySerialTransport:
                 disconnect_msg = f"USB TX failed: {e}"
             else:
                 logger.debug(
-                    "TX M2N type=0x%02X dir=%s opc=0x%02X recv3=%s len=%d body=%s",
+                    "%s TX M2N type=0x%02X dir=%s opc=0x%02X recv3=%s len=%d body=%s",
+                    self._log_label(),
                     type_full,
                     "M2N" if (type_full & 0x80) == LP.DIR_M2N else "N2M",
                     type_full & 0x7F,
@@ -525,9 +643,10 @@ class GatewaySerialTransport:
                         detail=f"no EV_TX_DONE/EV_TX_REJECTED in {wait_timeout:.2f}s",
                     )
                     logger.warning(
-                        "TX outcome timeout (%.0f ms, type=0x%02X opc=0x%02X) — "
+                        "%s TX outcome timeout (%.0f ms, type=0x%02X opc=0x%02X) — "
                         "no EV_TX_DONE / EV_TX_REJECTED arrived. Likely gateway "
                         "or USB stall; consider a STATE_REQUEST to verify.",
+                        self._log_label(),
                         wait_timeout * 1000,
                         type_full,
                         type_full & 0x7F,
@@ -582,6 +701,19 @@ class GatewaySerialTransport:
         body = build_preset_body(group_id=group_id, flags=flags, preset_id=preset_id, brightness=brightness)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_PRESET), recv3, body)
 
+    def send_indicate(self, recv3: bytes, indicator_type: int, duration_sec: int) -> SendOutcome:
+        """Send an OPC_INDICATE packet (2 B fixed body).
+
+        Receivers expand ``indicator_type`` via the shared
+        ``racelink_indicators.h`` catalog and overlay the segment for
+        ``duration_sec`` seconds, then restore the pre-indicator state via
+        their snapshot logic. ``duration_sec == 0`` cancels any active
+        indicator without showing a new one. ``recv3`` may be unicast or
+        the broadcast sentinel ``b"\\xFF\\xFF\\xFF"`` for fleet-wide notify.
+        """
+        body = build_indicate_body(indicator_type=indicator_type, duration_sec=duration_sec)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_INDICATE), recv3, body)
+
     def send_control(self, recv3: bytes, group_id: int, flags: int, **params) -> SendOutcome:
         """Send an OPC_CONTROL packet (variable-length body, 3..21 B).
 
@@ -610,6 +742,34 @@ class GatewaySerialTransport:
         """
         body = build_get_config_body(option=option)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_CONFIG), recv3, body)
+
+    def send_rf_config(self, recv3: bytes, rf_config: dict) -> SendOutcome:
+        """Send an ``OPC_RF_CONFIG`` packet (12 B P_RfConfig body) to a node.
+
+        Unicast-only by design — broadcasting an RF config change would
+        knock every reachable node off-channel simultaneously. The
+        firmware rejects ``recv3 == FF:FF:FF`` defensively; callers
+        must pass a concrete 3-byte ``recv3``.
+
+        On the node side: validate → persist NVS → ACK_OK → ``delay(50)``
+        → ``ESP.restart()`` onto the new config. The link drops briefly
+        during reboot; callers (``gateway_service.set_node_rf_config``)
+        treat the ACK as the success signal.
+        """
+        body = build_rf_config_body(rf_config)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_RF_CONFIG), recv3, body)
+
+    def send_get_rf_config_to_node(self, recv3: bytes) -> SendOutcome:
+        """Send an ``OPC_GET_RF_CONFIG`` packet (1 B reserved body) to a node.
+
+        Unicast-only (analogous to OPC_GET_CONFIG). The node replies
+        with a 12 B ``P_RfConfig`` body carrying its currently active
+        (NVS-persisted) RF settings; the reply is parsed by
+        ``parse_reply_event`` into a wire-format dict matching
+        ``unpack_rf_config_body``.
+        """
+        body = build_get_rf_config_body(reserved=0)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_RF_CONFIG), recv3, body)
 
     def send_sync(self, recv3: bytes = b"\xFF\xFF\xFF", ts24: int = 0, brightness: int = 0,
                   flags: int = 0) -> SendOutcome:
@@ -688,7 +848,75 @@ class GatewaySerialTransport:
             except serial.SerialException as e:
                 self._handle_disconnect(f"USB STATE_REQUEST write failed: {e}")
                 return False
-        logger.debug("TX GW_CMD_STATE_REQUEST (1 byte)")
+        logger.debug("%s TX GW_CMD_STATE_REQUEST (1 byte)", self._log_label())
+        return True
+
+    # ---- RF-config commands (USB-only, no LoRa wire) ---------------------
+
+    def send_get_rf_config(self) -> bool:
+        """Write a 1-byte GW_CMD_GET_RF_CONFIG frame to the gateway.
+
+        Replies arrive asynchronously as ``EV_RF_CHANGED(reason, P_RfConfig)``;
+        ``gateway_service.query_gateway_rf_config`` composes this with a
+        wait-for-reply round-trip. Returns ``False`` if the USB write
+        itself failed (the transport is then disconnecting).
+        """
+        frame = bytes([0x00, 0x01, GW_CMD_GET_RF_CONFIG])
+        with self._tx_lock:
+            try:
+                self.ser.write(frame)
+                try:
+                    self.ser.flush()
+                except Exception:
+                    # swallow-ok: best-effort flush; write succeeded.
+                    pass
+            except serial.SerialException as e:
+                self._handle_disconnect(f"USB GET_RF_CONFIG write failed: {e}")
+                return False
+        logger.debug("%s TX GW_CMD_GET_RF_CONFIG (1 byte)", self._log_label())
+        return True
+
+    def send_set_rf_config(self, rf_config: dict, *, persist: bool) -> bool:
+        """Write a GW_CMD_SET_RF_CONFIG frame to the gateway.
+
+        ``rf_config`` keys (all required): ``freq_hz``, ``bw_khz_x10``,
+        ``sf``, ``cr_den``, ``sync_word``, ``tx_power_dbm``, ``preamble``.
+        ``persist=True`` writes NVS and reboots; ``persist=False`` is
+        volatile (no NVS write, no reboot) for the channel-scan workflow.
+
+        Reply via ``EV_RF_CHANGED(reason, P_RfConfig)``. Returns ``False``
+        if the USB write itself failed.
+        """
+        persist_flag = GW_RF_PERSIST_NVS if persist else GW_RF_VOLATILE
+        body = RF_CONFIG_STRUCT.pack(
+            int(rf_config["freq_hz"]) & 0xFFFFFFFF,
+            int(rf_config["bw_khz_x10"]) & 0xFFFF,
+            int(rf_config["sf"]) & 0xFF,
+            int(rf_config["cr_den"]) & 0xFF,
+            int(rf_config["sync_word"]) & 0xFF,
+            int(rf_config["tx_power_dbm"]),  # signed int8
+            int(rf_config["preamble"]) & 0xFFFF,
+        )
+        # Frame: [0x00][LEN=14][CMD=0x02][persist_flag (1B)][P_RfConfig (12B)]
+        payload = bytes([persist_flag]) + body
+        frame_len = 1 + len(payload)  # TYPE byte + payload
+        frame = bytes([0x00, frame_len, GW_CMD_SET_RF_CONFIG]) + payload
+        with self._tx_lock:
+            try:
+                self.ser.write(frame)
+                try:
+                    self.ser.flush()
+                except Exception:
+                    # swallow-ok: best-effort flush
+                    pass
+            except serial.SerialException as e:
+                self._handle_disconnect(f"USB SET_RF_CONFIG write failed: {e}")
+                return False
+        logger.info(
+            "%s TX GW_CMD_SET_RF_CONFIG persist=%s freq=%d sf=%d bw=%d sw=0x%02X",
+            self._log_label(), persist, rf_config["freq_hz"], rf_config["sf"],
+            rf_config["bw_khz_x10"], rf_config["sync_word"],
+        )
         return True
 
     # ---- RX reader thread + frame dispatch -------------------------------
@@ -755,6 +983,15 @@ class GatewaySerialTransport:
                         )
 
     def _emit(self, ev: dict):
+        # Stage 2 Part 3: tag every emitted RX event with the transport's
+        # identity. PendingMatcher's ``gateway_id`` filter uses this to
+        # reject events from sibling transports. ``setdefault`` keeps any
+        # pre-tagged value (e.g. tests that craft synthetic events).
+        # ``ident_mac`` is ``None`` until the discover/identify handshake
+        # completes — events emitted before that point stay untagged
+        # and are still matched by the legacy wildcard path.
+        if self.ident_mac:
+            ev.setdefault("gateway_id", self.ident_mac)
         if len(self._q) < self._qmax:
             self._q.append(ev)
 
@@ -871,6 +1108,37 @@ class GatewaySerialTransport:
                 "state_byte": int(state_byte),
                 "state": GATEWAY_STATE_NAME.get(int(state_byte), "UNKNOWN"),
                 "state_metadata_ms": int(metadata_ms),
+                "ts": now,
+            }
+            self._emit(ev)
+            return
+
+        if type_byte == EV_RF_CHANGED:
+            # Body: [reason (1 B), P_RfConfig (12 B)]. Tolerate short
+            # bodies (older firmware that pre-dates the per-event format
+            # might omit fields) by reporting whatever was present and
+            # leaving the missing fields as None / 0.
+            reason = data[0] if len(data) >= 1 else 0
+            rf_config = None
+            if len(data) >= 1 + RF_CONFIG_STRUCT.size:
+                try:
+                    freq, bw_x10, sf, cr, sw, txp, pre = RF_CONFIG_STRUCT.unpack_from(data, 1)
+                    rf_config = {
+                        "freq_hz":      int(freq),
+                        "bw_khz_x10":   int(bw_x10),
+                        "sf":           int(sf),
+                        "cr_den":       int(cr),
+                        "sync_word":    int(sw),
+                        "tx_power_dbm": int(txp),  # signed int8 -> python int
+                        "preamble":     int(pre),
+                    }
+                except struct.error:
+                    rf_config = None
+            ev = {
+                "type": EV_RF_CHANGED,
+                "reason": int(reason),
+                "reason_name": RF_CHANGE_REASON_NAME.get(int(reason), "unknown"),
+                "rf_config": rf_config,
                 "ts": now,
             }
             self._emit(ev)

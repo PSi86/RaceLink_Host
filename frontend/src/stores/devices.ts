@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { apiGet, apiPost } from '@/api/client'
 import type { Device, DevicesResponse } from '@/api/types'
 import { useGroupsStore } from '@/stores/groups'
+import { useNetworksStore } from '@/stores/networks'
 
 function hasWledCapability(dev: Device): boolean {
   const caps = Array.isArray(dev.dev_type_caps) ? dev.dev_type_caps : []
@@ -29,12 +30,25 @@ export const useDevicesStore = defineStore('devices', () => {
   const sort = ref<DeviceSortState>({ key: null, dir: 1 })
 
   const groups = useGroupsStore()
+  const networks = useNetworksStore()
 
   const filteredDevices = computed(() => {
     let rows = devices.value.slice()
     const gid = groups.selGroupId
     if (gid !== null) {
       rows = rows.filter((d) => groupMatchesSelection(d, gid))
+    }
+    // Stage 4 Block 1: per-network filter. ``null`` = "All
+    // Networks" (no filter); a concrete network id keeps only
+    // devices on that network. The default-network sentinel
+    // (``defaultNetworkId``) covers legacy / unmigrated payloads
+    // whose ``network_id`` field is ``null``.
+    const nid = networks.selectedNetworkId
+    if (nid !== null) {
+      rows = rows.filter((d) => {
+        const devNid = d.network_id ?? networks.defaultNetworkId
+        return devNid === nid
+      })
     }
     if (sort.value.key) {
       const key = sort.value.key
@@ -82,6 +96,10 @@ export const useDevicesStore = defineStore('devices', () => {
     selected.value = new Set(filteredDevices.value.map((d) => d.addr))
   }
 
+  function setSelection(macs: Iterable<string>) {
+    selected.value = new Set(macs)
+  }
+
   function setSort(key: keyof Device) {
     if (sort.value.key === key) {
       sort.value = { key, dir: (sort.value.dir === 1 ? -1 : 1) as 1 | -1 }
@@ -94,6 +112,12 @@ export const useDevicesStore = defineStore('devices', () => {
     return apiPost('/api/devices/update-meta', { macs, groupId })
   }
 
+  async function bulkRename(macs: string[], names: Record<string, string>) {
+    // Empty-string values are the explicit reset marker — the backend
+    // restores the IDENTIFY-default "WLED <mac12>" for those entries.
+    return apiPost('/api/devices/update-meta', { macs, names })
+  }
+
   return {
     devices,
     filteredDevices,
@@ -102,7 +126,9 @@ export const useDevicesStore = defineStore('devices', () => {
     load,
     toggle,
     selectAll,
+    setSelection,
     setSort,
     bulkSetGroup,
+    bulkRename,
   }
 })

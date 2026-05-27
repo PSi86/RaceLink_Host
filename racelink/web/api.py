@@ -17,12 +17,20 @@ from flask import jsonify, request
 logger = logging.getLogger(__name__)
 
 from ..domain import (
+    default_device_name,
     rl_preset_select_options,
     serialize_rl_preset_editor_schema,
     state_scope,
     wled_preset_select_options,
 )
 from ..domain.flags import USER_FLAG_DEFS
+from ..domain.indicators import DEFAULT_INDICATE_DURATION_SEC, IndicatorType
+from ..domain.network_boundary import (
+    NetworkBoundaryViolation,
+    SceneScopeViolation,
+    validate_group_membership,
+    validate_scene_scope_consistency,
+)
 from ..domain.node_config import serialize_node_config_schema
 from ..services import OTAWorkflowService, SpecialsService
 from ..services.scene_cost_estimator import estimate_scene, lora_parameters
@@ -69,6 +77,7 @@ def _apply_device_meta_updates(
     macs: list,
     new_group,
     new_name,
+    names: dict | None = None,
     progress_cb=None,
 ) -> dict:
     """Apply rename + regroup updates (plan P2-4, deadlock-fix; 2026-04-29 bulk-task refactor).
@@ -112,8 +121,22 @@ def _apply_device_meta_updates(
             dev = ctx.rl_instance.getDeviceFromAddress(mac)
             if dev is None:
                 continue
-            if new_name and isinstance(new_name, str) and len(macs) == 1:
-                dev.name = new_name
+            # Bulk-rename path: per-MAC names supplied by the
+            # ``BulkRenameDialog`` after pattern expansion. An empty
+            # string is the explicit reset marker — restore the default
+            # ``"WLED <mac12>"`` shape used by the IDENTIFY path.
+            if names is not None and mac in names:
+                raw = names.get(mac)
+                resolved = raw.strip() if isinstance(raw, str) else ""
+                dev.name = resolved if resolved else default_device_name(mac)
+                changed += 1
+            elif new_name is not None and isinstance(new_name, str) and len(macs) == 1:
+                # Single-rename inline-edit path. Empty input is the
+                # reset marker — same semantics as the bulk path so the
+                # operator can revert an individual device by clearing
+                # its inline-edit field.
+                stripped = new_name.strip()
+                dev.name = stripped if stripped else default_device_name(mac)
                 changed += 1
             if new_group is None:
                 continue
@@ -251,9 +274,24 @@ def _prepare_discover_target(ctx, *, target_gid, new_group_name):
     logic can be unit-tested without a Flask request context.
     """
     created_gid = None
+    # Stage 3 Part B: inherit the default network_id so discover-
+    # created groups participate in the boundary check on subsequent
+    # bulk-set operations.
+    net_repo = getattr(ctx.rl_instance, "network_repository", None)
+    default_network_id = None
+    if net_repo is not None:
+        try:
+            items = list(net_repo.list())
+            if items:
+                default_network_id = str(getattr(items[0], "id", "") or "") or None
+        except Exception:
+            logger.exception("_prepare_discover_target: default network lookup raised")
     with ctx.rl_lock:
         if new_group_name:
-            group = ctx.RL_DeviceGroup(str(new_group_name), static_group=0, dev_type=0)
+            group = ctx.RL_DeviceGroup(
+                str(new_group_name), static_group=0, dev_type=0,
+                network_id=default_network_id,
+            )
             if ctx.group_repo is not None:
                 created_gid = ctx.group_repo.append(group)
             else:
@@ -353,6 +391,7 @@ def register_api_routes(bp, ctx):
     rl_presets_service = ctx.services.get("rl_presets")
     scenes_service = ctx.services.get("scenes")
     scene_runner_service = ctx.services.get("scene_runner")
+    host_settings_service = ctx.services.get("host_settings")
     specials_service = SpecialsService(rl_instance=ctx.rl_instance)
     ota_workflows = OTAWorkflowService(
         host_wifi_service=host_wifi_service,
@@ -364,7 +403,10 @@ def register_api_routes(bp, ctx):
     @bp.route("/api/devices", methods=["GET"])
     def api_devices():
         with ctx.rl_lock:
-            rows = [serialize_device(device) for device in ctx.devices()]
+            rows = [
+                serialize_device(device, battery_helper=host_settings_service)
+                for device in ctx.devices()
+            ]
         return jsonify({"ok": True, "devices": rows})
 
     @bp.route("/api/specials", methods=["GET"])
@@ -388,6 +430,10 @@ def register_api_routes(bp, ctx):
                 "dev_type": 0,
                 "device_count": int(counts.get(0, 0)),
                 "caps_in_group": dict(caps_counts.get(0, {})),
+                # Stage 4: Unconfigured is the cross-network sink —
+                # devices of any network can land here. Surface as
+                # ``null`` so the WebUI knows not to render a badge.
+                "network_id": None,
             }]
             for gid, group in enumerate(ctx.groups()):
                 name = getattr(group, "name", f"Group {gid}")
@@ -400,18 +446,614 @@ def register_api_routes(bp, ctx):
                     "dev_type": int(getattr(group, "dev_type", 0) or 0),
                     "device_count": int(counts.get(gid, 0)),
                     "caps_in_group": dict(caps_counts.get(gid, {})),
+                    "network_id": (
+                        str(getattr(group, "network_id", "") or "") or None
+                    ),
                 })
         return jsonify({"ok": True, "groups": rows})
 
     @bp.route("/api/master", methods=["GET"])
     def api_master():
+        # Stage 2 Part 4: the ``master`` field carries the multi-network
+        # payload ``{networks: [...], default_network_id: "..."}``. At
+        # N=1 attached gateway the array has a single entry, which the
+        # legacy frontend reads as ``networks[0]`` to preserve the
+        # single-master UX. Stage 4 introduces a proper multi-network
+        # UI driven by the same payload.
         gateway = _gateway_status(ctx)
         return jsonify({
             "ok": True,
-            "master": ctx.sse.master.snapshot(),
+            "master": ctx.sse.masters.snapshot(),
             "task": ctx.tasks.snapshot(),
             "gateway": gateway,
         })
+
+    @bp.route("/api/networks", methods=["GET"])
+    def api_networks():
+        """Read-only listing of the operator's configured RaceLink
+        networks plus their current live state (Stage 2 Part 4).
+
+        Stage 3 adds CRUD; for now this exposes the repository so the
+        WebUI can render network badges / filters on the device table.
+        Each row carries the persisted metadata (id, name,
+        gateway_mac, region, channel_id, rf_config) plus the live
+        :class:`MasterState` snapshot for the same network id.
+        """
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        masters_snap = ctx.sse.masters.snapshot() if ctx.sse else {"networks": [], "default_network_id": None}
+        live_by_id = {
+            row.get("network_id"): row
+            for row in masters_snap.get("networks", [])
+            if isinstance(row, dict) and row.get("network_id")
+        }
+        rows = []
+        if net_repo is not None:
+            try:
+                items = list(net_repo.list())
+            except Exception:
+                logger.exception("/api/networks: repo iteration raised")
+                items = []
+            for net in items:
+                nid = str(getattr(net, "id", "") or "")
+                rows.append({
+                    "id": nid,
+                    "name": str(getattr(net, "name", "") or ""),
+                    "gateway_mac": getattr(net, "gateway_mac", None),
+                    "region": getattr(net, "region", None),
+                    "channel_id": getattr(net, "channel_id", None),
+                    "rf_config": getattr(net, "rf_config", None),
+                    "created_ts": getattr(net, "created_ts", None),
+                    "live": live_by_id.get(nid),
+                })
+        return jsonify({
+            "ok": True,
+            "networks": rows,
+            "default_network_id": masters_snap.get("default_network_id"),
+        })
+
+    @bp.route("/api/networks/<network_id>", methods=["PUT"])
+    def api_network_update(network_id: str):
+        """Stage 4 Block 3: rename a network and/or change its
+        region+channel binding.
+
+        Body shape: ``{name?: str, region?: str, channel_id?:
+        int|null, rf_config?: dict|null}``. Channel-driven updates
+        rewrite ``rf_config`` to the channel-table entry's seven
+        wire fields (so the network and the bound gateway speak
+        the same RF); explicit ``rf_config`` overrides the channel
+        lookup for the Advanced-Mode operator who types raw values.
+
+        Returns HTTP 400 on validation failure (unknown channel id,
+        bad region, separation conflict). Persists on success.
+        """
+        from ..domain.rf_channels import channel_rf_config, list_channels
+        from ..domain.rf_policy import (
+            format_conflict, validate_networks_separation,
+        )
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        net = net_repo.get_by_id(network_id)
+        if net is None:
+            return jsonify({"ok": False, "error": f"unknown network_id {network_id!r}"}), 404
+
+        body = request.get_json(silent=True) or {}
+        # Name --------------------------------------------------------
+        new_name = body.get("name", None)
+        if new_name is not None:
+            new_name = str(new_name).strip()
+            if not new_name:
+                return jsonify({"ok": False, "error": "name cannot be empty"}), 400
+        # Region ------------------------------------------------------
+        new_region = body.get("region", None)
+        if new_region is not None:
+            new_region = str(new_region).strip()
+            if not list_channels(new_region):
+                return jsonify({
+                    "ok": False,
+                    "error": f"unknown region {new_region!r}",
+                }), 400
+        effective_region = new_region or getattr(net, "region", None) or "EU868"
+        # Channel + rf_config ----------------------------------------
+        new_channel_id = body.get("channel_id", "__missing__")
+        explicit_rf_config = body.get("rf_config", "__missing__")
+        new_rf_config = None
+        if explicit_rf_config != "__missing__":
+            if explicit_rf_config is None:
+                new_rf_config = None
+            elif isinstance(explicit_rf_config, dict):
+                # Best-effort coercion; the bind/migration validators
+                # also normalise the dict before consuming it.
+                new_rf_config = dict(explicit_rf_config)
+            else:
+                return jsonify({
+                    "ok": False,
+                    "error": "rf_config must be an object",
+                }), 400
+        elif new_channel_id != "__missing__":
+            if new_channel_id is None:
+                new_rf_config = None
+            else:
+                try:
+                    ch_id_int = int(new_channel_id)
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": "channel_id must be an integer"}), 400
+                resolved = channel_rf_config(effective_region, ch_id_int)
+                if resolved is None:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"unknown channel_id {ch_id_int} in region {effective_region!r}",
+                    }), 400
+                new_rf_config = resolved
+        # Speculatively apply on a shallow snapshot so the separation
+        # check sees the would-be state, then run the validator across
+        # every network. Reject before mutating if the policy fails.
+        if new_rf_config is not None:
+            class _SpecView:
+                def __init__(self, real, rf_config):
+                    self._real = real
+                    self.rf_config = rf_config
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+            spec = _SpecView(net, new_rf_config)
+            others = [n for n in net_repo.list() if n is not net]
+            conflicts = validate_networks_separation([spec, *others])
+            if conflicts:
+                return jsonify({
+                    "ok": False,
+                    "error": format_conflict(conflicts[0]),
+                    "detail": {"code": "rf_separation", "conflicts": conflicts},
+                }), 400
+        # Commit ------------------------------------------------------
+        if new_name is not None:
+            net.name = new_name
+        if new_region is not None:
+            net.region = new_region
+        if new_channel_id != "__missing__":
+            try:
+                net.channel_id = int(new_channel_id) if new_channel_id is not None else None
+            except (TypeError, ValueError):
+                net.channel_id = None
+        if new_rf_config is not None or explicit_rf_config is None and new_channel_id is None:
+            net.rf_config = dict(new_rf_config) if new_rf_config is not None else None
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_update: save_to_db failed")
+        # Push the refreshed list to every connected SSE client so
+        # the WebUI's networks store + DeviceTable badge re-render
+        # without a manual refresh.
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({
+            "ok": True,
+            "network": {
+                "id": str(net.id),
+                "name": str(net.name),
+                "region": getattr(net, "region", None),
+                "channel_id": getattr(net, "channel_id", None),
+                "rf_config": getattr(net, "rf_config", None),
+                "gateway_mac": getattr(net, "gateway_mac", None),
+            },
+        })
+
+    @bp.route("/api/networks/<network_id>", methods=["DELETE"])
+    def api_network_delete(network_id: str):
+        """Stage 4 Block 3: delete a network record.
+
+        Refuses when:
+          * the network is the only one left (the device repo and
+            v1→v2 migration both assume at least one network exists);
+          * any device still references it via ``network_id``;
+          * any group still references it via ``network_id``.
+
+        On success the WebUI re-fetches /api/networks via the
+        broadcast refresh and the gateway-bind state machine will
+        re-evaluate any transport whose ident_mac matched the
+        deleted network's ``gateway_mac``.
+        """
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        net = net_repo.get_by_id(network_id)
+        if net is None:
+            return jsonify({"ok": False, "error": f"unknown network_id {network_id!r}"}), 404
+        with ctx.rl_lock:
+            if len(net_repo.list()) <= 1:
+                return jsonify({
+                    "ok": False,
+                    "error": "cannot delete the last network — at least one must exist",
+                }), 400
+            device_refs = [
+                str(getattr(d, "addr", "") or "")
+                for d in ctx.devices()
+                if str(getattr(d, "network_id", "") or "") == str(network_id)
+            ]
+            if device_refs:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"{len(device_refs)} device(s) still reference this "
+                        "network. Migrate or re-assign them first."
+                    ),
+                    "detail": {"code": "devices_attached", "device_macs": device_refs[:8]},
+                }), 400
+            group_refs = [
+                str(getattr(g, "name", "") or "")
+                for g in ctx.groups()
+                if str(getattr(g, "network_id", "") or "") == str(network_id)
+            ]
+            if group_refs:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"{len(group_refs)} group(s) still belong to this "
+                        "network. Reassign them first."
+                    ),
+                    "detail": {"code": "groups_attached", "group_names": group_refs[:8]},
+                }), 400
+            net_repo.remove(net)
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_delete: save_to_db failed")
+        # Drop the bind record for the (possibly now-orphaned) gateway
+        # so the next attach cycle starts clean.
+        bind_service = getattr(rl, "gateway_bind_service", None)
+        gw_mac = str(getattr(net, "gateway_mac", "") or "")
+        if bind_service is not None and gw_mac:
+            try:
+                bind_service.forget(gw_mac)
+            except Exception:
+                logger.exception(
+                    "api_network_delete: bind_service.forget raised",
+                )
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({"ok": True, "deleted_id": str(network_id)})
+
+    @bp.route("/api/channels", methods=["GET"])
+    def api_channels():
+        """Stage 4: shipped region/channel lookup table.
+
+        Returns ``{"ok": True, "regions": {"EU868": [{id, name,
+        freq_hz, ...}, ...], "US915": [...]}}``. Drives the WebUI's
+        Network Manager channel dropdown + the Channel Scan
+        wizard's channel-selection checkbox list. The table is a
+        compile-time constant on the server (see
+        :mod:`racelink.domain.rf_channels`); it doesn't need
+        per-request server work and the WebUI can cache the response
+        for the session.
+        """
+        from ..domain.rf_channels import REGION_CHANNELS
+        return jsonify({
+            "ok": True,
+            "regions": {
+                region: [dict(ch) for ch in channels]
+                for region, channels in REGION_CHANNELS.items()
+            },
+        })
+
+    @bp.route("/api/gateways", methods=["GET"])
+    def api_gateways_list():
+        """Stage 3 Part D: snapshot of the bind-state machine.
+
+        Returns ``{"ok": True, "gateways": [{ident_mac, state, ...},
+        ...]}``. Drives the WebUI's per-gateway status bar + opens
+        the bind wizard when any record is in ``conflict`` or
+        ``unbound``.
+        """
+        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
+        if bind_service is None:
+            return jsonify({"ok": True, "gateways": []})
+        return jsonify({"ok": True, **bind_service.snapshot()})
+
+    @bp.route("/api/networks/<network_id>/migrate", methods=["POST"])
+    def api_network_migrate(network_id: str):
+        """Stage 3 Part E: kick off the RF-migration task for one
+        network.
+
+        Body: ``{target_rf_config: {...}, force_offline?: bool}``.
+        Returns ``{ok, task}`` immediately; live progress streams on
+        the existing SSE ``task`` channel. The migration engine
+        re-evaluates the bind service when done so the WebUI's
+        ``gateway_bound``/``gateway_conflict`` indicators close out
+        automatically.
+        """
+        migration = getattr(ctx.rl_instance, "rf_migration_service", None)
+        if migration is None:
+            return jsonify({"ok": False, "error": "migration service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        target = body.get("target_rf_config")
+        if not isinstance(target, dict):
+            return jsonify({
+                "ok": False,
+                "error": "target_rf_config required (object with the P_RfConfig fields)",
+            }), 400
+        force_offline = bool(body.get("force_offline", False))
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            # Surface phase + per-device telemetry through the task
+            # meta channel so the WebUI's migration wizard can render
+            # a per-phase progress bar.
+            ctx.tasks.update(meta=dict(payload))
+
+        def _runner():
+            return migration.migrate_network_to(
+                network_id=network_id,
+                target_rf_config=target,
+                force_offline=force_offline,
+                progress_cb=_progress,
+            )
+
+        task = ctx.tasks.start(
+            "rf_migration", _runner,
+            meta={
+                "stage": "INIT",
+                "network_id": network_id,
+                "force_offline": force_offline,
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/groups/migrate-network", methods=["POST"])
+    def api_groups_migrate_network():
+        """Move one or more groups (with all their members) onto a
+        target network. Single TaskManager job; one combined progress
+        stream for the multi-group case.
+
+        Body shape::
+
+            {
+              "group_ids": [int, int, ...],
+              "target_network_id": "net-uuid",
+              "offline_mode": "block" | "skip" | "force"
+            }
+
+        Offline-mode semantics (mirrors the existing group-move
+        ``_apply_device_meta_updates`` pattern):
+
+        * ``block`` (default) — synchronous pre-check across every
+          requested group's members; HTTP 400 with structured
+          ``detail.offline_macs`` if any are offline.
+        * ``skip`` — metadata flip only for offline devices; wire
+          push for online ones. Channel Scan recovers offline
+          devices later.
+        * ``force`` — attempt the wire push for offline devices too;
+          metadata flips regardless of wire outcome.
+
+        Per-device + per-group metadata flips happen regardless of
+        partial wire failure — operator intent ("these groups now
+        belong to network B") governs. Stragglers surface in
+        ``result["stranded"]``.
+
+        Single-group move = list with one id; the body validation
+        rejects an empty list with HTTP 400.
+        """
+        migration = getattr(ctx.rl_instance, "rf_migration_service", None)
+        if migration is None:
+            return jsonify({"ok": False, "error": "migration service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        raw_gids = body.get("group_ids")
+        if not isinstance(raw_gids, list) or not raw_gids:
+            return jsonify({
+                "ok": False,
+                "error": "group_ids required (non-empty list of group ids)",
+            }), 400
+        target_network_id = body.get("target_network_id")
+        if not isinstance(target_network_id, str) or not target_network_id.strip():
+            return jsonify({
+                "ok": False,
+                "error": "target_network_id required",
+            }), 400
+        offline_mode = str(body.get("offline_mode") or "block").lower().strip()
+        if offline_mode not in {"block", "skip", "force"}:
+            return jsonify({
+                "ok": False,
+                "error": "offline_mode must be 'block', 'skip' or 'force'",
+            }), 400
+
+        # Dedupe + coerce the group_ids list early so the block-check
+        # and the runner see the same set.
+        clean_gids: list = []
+        seen_gids: set = set()
+        for raw in raw_gids:
+            try:
+                gid = int(raw) & 0xFF
+            except (TypeError, ValueError):
+                continue
+            if gid in seen_gids:
+                continue
+            seen_gids.add(gid)
+            clean_gids.append(gid)
+        if not clean_gids:
+            return jsonify({
+                "ok": False,
+                "error": "group_ids must contain at least one integer",
+            }), 400
+
+        # Resolve members across every requested group + offline
+        # pre-check. Unknown ids → 404 fast (mirrors the service's
+        # validate stage).
+        member_macs: list = []
+        offline_macs: list = []
+        seen_macs: set = set()
+        with ctx.rl_lock:
+            groups_list = list(ctx.rl_instance.group_repository.list() or ())
+            unknown: list = [
+                gid for gid in clean_gids
+                if not (0 <= gid < len(groups_list))
+            ]
+            if unknown:
+                return jsonify({
+                    "ok": False,
+                    "error": f"unknown group_id(s): {unknown}",
+                }), 404
+            gid_set = set(clean_gids)
+            for dev in (ctx.rl_instance.device_repository.list() or ()):
+                if int(getattr(dev, "groupId", 0) or 0) not in gid_set:
+                    continue
+                mac = str(getattr(dev, "addr", "") or "").upper()
+                if not mac or mac in seen_macs:
+                    continue
+                seen_macs.add(mac)
+                member_macs.append(mac)
+                if not bool(getattr(dev, "link_online", False)):
+                    offline_macs.append(mac)
+
+        # Empty-membership case is allowed (single-group migration of
+        # an empty group still flips group.network_id so the operator
+        # can populate it on the target). Block-mode with offline
+        # members still rejects.
+        if offline_mode == "block" and offline_macs:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"{len(offline_macs)} of {len(member_macs)} group member(s) "
+                    "offline — bring them online first, or pass "
+                    "offline_mode='skip' / 'force'."
+                ),
+                "detail": {
+                    "code": "offline_block",
+                    "offline_macs": offline_macs,
+                },
+            }), 400
+        if offline_mode == "block":
+            offline_mode = "skip"
+
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            meta = dict(payload)
+            meta["group_ids"] = list(clean_gids)
+            ctx.tasks.update(meta=meta)
+
+        def _runner():
+            outcome = migration.migrate_groups_to(
+                target_network_id=target_network_id,
+                group_ids=clean_gids,
+                offline_mode=offline_mode,
+                progress_cb=_progress,
+            )
+            _sse_refresh(
+                ctx,
+                {state_scope.DEVICES, state_scope.DEVICE_MEMBERSHIP, state_scope.GROUPS},
+            )
+            return outcome
+
+        task = ctx.tasks.start(
+            "migrate_groups_to_network", _runner,
+            meta={
+                "stage": "INIT",
+                "group_ids": list(clean_gids),
+                "total": len(member_macs),
+                "target_network_id": target_network_id,
+                "offline_mode": offline_mode,
+                "message": (
+                    f"Migrating {len(clean_gids)} group"
+                    f"{'s' if len(clean_gids) != 1 else ''} "
+                    f"({len(member_macs)} device"
+                    f"{'s' if len(member_macs) != 1 else ''}) "
+                    f"→ network {target_network_id}…"
+                ),
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/gateways/<ident_mac>/channel-scan", methods=["POST"])
+    def api_gateway_channel_scan(ident_mac: str):
+        """Stage 3 Part F: walk a region's channel table on this
+        gateway and report who answers per channel.
+
+        Body: ``{region: str, channel_ids?: [int], identify_dwell_s?: float}``.
+        Returns ``{ok, task}`` immediately; live per-channel
+        progress streams on the existing SSE ``task`` channel. The
+        task result carries the per-channel responders + the
+        union (``all_known``, ``all_unknown``) the WebUI's
+        wizard renders.
+        """
+        scan = getattr(ctx.rl_instance, "channel_scan_service", None)
+        if scan is None:
+            return jsonify({"ok": False, "error": "channel scan service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        region = str(body.get("region") or "").strip()
+        if not region:
+            return jsonify({"ok": False, "error": "region required"}), 400
+        channel_ids = body.get("channel_ids")
+        if channel_ids is not None and not isinstance(channel_ids, list):
+            return jsonify({"ok": False, "error": "channel_ids must be a list"}), 400
+        try:
+            dwell = float(body.get("identify_dwell_s", 2.0))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "identify_dwell_s must be a number"}), 400
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(ctx.rl_instance)
+
+        def _progress(payload):
+            ctx.tasks.update(meta=dict(payload))
+
+        def _runner():
+            return scan.scan_region(
+                gateway_id=ident_mac,
+                region=region,
+                channel_ids=channel_ids,
+                identify_dwell_s=dwell,
+                progress_cb=_progress,
+            )
+
+        task = ctx.tasks.start(
+            "channel_scan", _runner,
+            meta={
+                "stage": "INIT",
+                "ident_mac": ident_mac,
+                "region": region,
+                "channel_ids": channel_ids,
+                "identify_dwell_s": dwell,
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/gateways/<ident_mac>/resolve", methods=["POST"])
+    def api_gateway_resolve(ident_mac: str):
+        """Stage 3 Part D: operator response to a ``gateway_conflict``
+        / ``gateway_unbound`` wizard. Body shape:
+
+            {
+                "action": "accept_gateway" | "accept_host"
+                          | "create_network" | "rebind",
+                "params": {...action-specific...},
+            }
+
+        ``params`` carries the ``token`` from the inbound SSE event
+        so a stale wizard cannot override a re-evaluated record.
+        """
+        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
+        if bind_service is None:
+            return jsonify({"ok": False, "error": "bind service unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip()
+        if not action:
+            return jsonify({"ok": False, "error": "action required"}), 400
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        result = bind_service.resolve(ident_mac, action, params)
+        status = 200 if result.get("ok") else 400
+        return jsonify(result), status
 
     @bp.route("/api/gateway", methods=["GET"])
     def api_gateway_status():
@@ -470,8 +1112,408 @@ def register_api_routes(bp, ctx):
         # here is for the synchronous caller (the WebUI fetch).
         return jsonify(result)
 
+    @bp.route("/api/gateways/query-state", methods=["POST"])
+    def api_gateways_query_state():
+        """Round 3 Task 4: fan out STATE_REQUEST to every attached
+        transport and return one result per gateway. The new MasterBar
+        ↻-button uses this so all per-gateway pills refresh at once.
+
+        Returns ``{ok: True, gateways: [{ident_mac, state, ...}, ...]}``.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_state", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        transports = list(getattr(rl, "transports", None) or ())
+        results = []
+        for t in transports:
+            r = query(transport=t)
+            if isinstance(r, dict):
+                r = dict(r)
+                r["ident_mac"] = (getattr(t, "ident_mac", "") or "").upper() or None
+            results.append(r)
+        return jsonify({"ok": True, "gateways": results})
+
+    @bp.route("/api/gateway/rediscover", methods=["POST"])
+    def api_gateway_rediscover():
+        """Round 3 Task 3: manual re-discover trigger. Runs
+        ``soft_rediscover`` synchronously and clears the tracker's
+        cancel list so a previously-cancelled MAC becomes pollable
+        again. Operator entry-point lives in the Pair Assistant.
+        """
+        rl = ctx.rl_instance
+        soft = getattr(rl, "soft_rediscover", None)
+        tracker = getattr(rl, "missing_transport_tracker", None)
+        if not callable(soft) or tracker is None:
+            return jsonify({
+                "ok": False,
+                "error": "controller does not support soft rediscover",
+            }), 503
+        try:
+            tracker.clear_cancelled()
+            attached = int(soft())
+        except Exception as ex:
+            logger.exception("api_gateway_rediscover: soft_rediscover failed")
+            return jsonify({
+                "ok": False,
+                "error": f"{type(ex).__name__}: {ex}",
+            }), 500
+        # evaluate_and_arm broadcasts the post-rediscover state.
+        try:
+            tracker.evaluate_and_arm()
+        except Exception:
+            pass  # swallow-ok: re-arm already logs internally
+        return jsonify({
+            "ok": True,
+            "attached": attached,
+            "missing": tracker.snapshot(),
+        })
+
+    @bp.route("/api/gateway/cancel-reconnect", methods=["POST"])
+    def api_gateway_cancel_reconnect():
+        """Round 3 Task 5: operator-driven suppression of the
+        reconnect poll for a specific ident_mac (or all currently-
+        missing transports when body's ``ident_mac`` is null/absent).
+        Re-enable later with ``/api/gateway/rediscover``.
+        """
+        rl = ctx.rl_instance
+        tracker = getattr(rl, "missing_transport_tracker", None)
+        if tracker is None:
+            return jsonify({
+                "ok": False,
+                "error": "missing_transport_tracker unavailable",
+            }), 503
+        body = request.get_json(silent=True) or {}
+        ident_mac = body.get("ident_mac")
+        if ident_mac is not None and not isinstance(ident_mac, str):
+            return jsonify({
+                "ok": False,
+                "error": "ident_mac must be a string or null",
+            }), 400
+        try:
+            tracker.cancel(ident_mac if ident_mac else None)
+        except Exception as ex:
+            logger.exception("api_gateway_cancel_reconnect: tracker.cancel failed")
+            return jsonify({
+                "ok": False,
+                "error": f"{type(ex).__name__}: {ex}",
+            }), 500
+        return jsonify({
+            "ok": True,
+            "cancelled": sorted(tracker.cancelled_macs()),
+            "missing": tracker.snapshot(),
+        })
+
+    @bp.route("/api/onboarding/repair", methods=["POST"])
+    def api_onboarding_repair():
+        """Run a single-gateway onboarding repair (Stage 1.5).
+
+        Body shape:
+            {
+                "case": "A" | "B" | "C",
+                "params": { ... }   # case-specific, see below
+            }
+
+        Case A params: {"target_macs": [str, ...] | null, "run_discover": bool?}
+        Case B params: {
+            "old_rf_config": {...},
+            "new_rf_config": {...},
+            "target_macs": [str, ...] | null
+        }
+        Case C params: {"device_rf_config": {...}}
+
+        Long-running cases (B and C reboot the gateway) run inside a
+        TaskManager job; the response carries the task handle and the
+        live progress streams over the existing ``task`` SSE channel.
+        Case A stays inline (typical wall-clock < 2 s per device).
+        """
+        rl = ctx.rl_instance
+        onboarding = getattr(rl, "onboarding_service", None)
+        if onboarding is None:
+            return jsonify({"ok": False, "error": "onboarding_service unavailable"}), 503
+
+        body = request.get_json(silent=True) or {}
+        case = str(body.get("case", "")).strip().upper()
+        params = body.get("params") or {}
+        if case not in ("A", "B", "C"):
+            return jsonify({"ok": False, "error": "case must be 'A', 'B', or 'C'"}), 400
+
+        # Common per-case payload validation. Bad payloads die early so
+        # we never block on a TaskManager job for a malformed request.
+        if case == "B":
+            for key in ("old_rf_config", "new_rf_config"):
+                if not isinstance(params.get(key), dict):
+                    return jsonify({"ok": False, "error": f"params.{key} dict required"}), 400
+        if case == "C":
+            if not isinstance(params.get("device_rf_config"), dict):
+                return jsonify({"ok": False, "error": "params.device_rf_config dict required"}), 400
+
+        # Case A: synchronous (short; no gateway reboot).
+        if case == "A":
+            result = onboarding.case_a_re_pair(
+                target_macs=params.get("target_macs"),
+                run_discover=bool(params.get("run_discover", True)),
+            )
+            return jsonify({"ok": result.get("ok", False), "result": result})
+
+        # Cases B / C: wrap in a TaskManager job so the reboot wait
+        # doesn't tie up the Flask thread.
+        if ctx.tasks.is_running():
+            return ctx.tasks.busy_response()
+        ctx.sse.ensure_transport_hooked(rl)
+
+        def _progress(progress):
+            ctx.tasks.update(meta={**progress, "case": case})
+
+        if case == "B":
+            def _runner():
+                return onboarding.case_b_migrate(
+                    old_rf_config=params["old_rf_config"],
+                    new_rf_config=params["new_rf_config"],
+                    target_macs=params.get("target_macs"),
+                    progress_cb=_progress,
+                )
+            task = ctx.tasks.start("onboarding_case_b", _runner, meta={"case": "B"})
+        else:  # case == "C"
+            def _runner():
+                return onboarding.case_c_align_gateway(
+                    device_rf_config=params["device_rf_config"],
+                    progress_cb=_progress,
+                )
+            task = ctx.tasks.start("onboarding_case_c", _runner, meta={"case": "C"})
+
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/devices/<mac>/rf_config", methods=["GET"])
+    def api_device_rf_config_get(mac):
+        """Read back a node's currently active LoRa PHY config via OPC_GET_RF_CONFIG.
+
+        Returns ``{"ok": bool, "rf_config": {...}}`` on success. 404 if
+        the device is not in the host repo, 504 on transport timeout,
+        503 if gateway_service is unavailable.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_node_rf_config", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return jsonify({"ok": False, "error": "mac must be 12 hex chars"}), 400
+        with ctx.rl_lock:
+            dev = rl.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
+        result = query(mac_str)
+        if not result.get("ok"):
+            return jsonify(result), 504
+        return jsonify(result)
+
+    @bp.route("/api/devices/<mac>/rf_config", methods=["POST"])
+    def api_device_rf_config_post(mac):
+        """Push a new LoRa PHY config to a node via OPC_RF_CONFIG.
+
+        Expected JSON body:
+            { "rf_config": {freq_hz, bw_khz_x10, sf, cr_den, sync_word,
+                            tx_power_dbm, preamble} }
+
+        The node validates the payload, persists to NVS, ACKs, then
+        reboots onto the new config. The reboot drops the link briefly;
+        the success signal is the ACK.
+
+        Returns ``{"ok": bool, "ack_status": int}``; 400 on validation
+        rejection / payload errors, 504 on timeout, 503 if service
+        unavailable, 404 if device unknown.
+        """
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        setter = getattr(gw, "set_node_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+
+        mac_str = str(mac or "").strip().upper()
+        if len(mac_str) != 12:
+            return jsonify({"ok": False, "error": "mac must be 12 hex chars"}), 400
+
+        with ctx.rl_lock:
+            dev = rl.getDeviceFromAddress(mac_str)
+        if not dev:
+            return jsonify({"ok": False, "error": "device not found"}), 404
+
+        payload = request.get_json(silent=True) or {}
+        rf_config = payload.get("rf_config")
+        if not isinstance(rf_config, dict):
+            return jsonify({"ok": False, "error": "rf_config dict required"}), 400
+        required = ("freq_hz", "bw_khz_x10", "sf", "cr_den", "sync_word",
+                    "tx_power_dbm", "preamble")
+        missing = [k for k in required if k not in rf_config]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": f"rf_config missing fields: {missing}",
+            }), 400
+
+        result = setter(mac_str, rf_config)
+        if result.get("ok"):
+            return jsonify(result)
+        if result.get("error") == "timeout":
+            return jsonify(result), 504
+        # ack_status != 0 = node-side rejection (validation / NVS). 400
+        # to surface "bad parameters" semantics to the operator.
+        if "ack_status" in result:
+            return jsonify(result), 400
+        return jsonify(result), 503
+
+    def _resolve_transport_by_ident(ident_mac: str):
+        """Walk the controller's transport list and return the one whose
+        ``ident_mac`` matches. Case-insensitive. Returns ``None`` if no
+        attached gateway carries that MAC."""
+        rl = ctx.rl_instance
+        transports = list(getattr(rl, "transports", None) or [])
+        target = str(ident_mac or "").upper()
+        for t in transports:
+            if str(getattr(t, "ident_mac", "") or "").upper() == target:
+                return t
+        return None
+
+    def _rf_config_get(transport):
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        query = getattr(gw, "query_gateway_rf_config", None) if gw is not None else None
+        if not callable(query):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+        result = query(transport=transport) if transport is not None else query()
+        if not result.get("ok"):
+            # 504 = gateway timeout (USB connected but no reply within bound).
+            return jsonify(result), 504
+        return jsonify(result)
+
+    def _rf_config_set(transport):
+        rl = ctx.rl_instance
+        gw = getattr(rl, "gateway_service", None)
+        setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            return jsonify({"ok": False, "error": "gateway_service unavailable"}), 503
+
+        payload = request.get_json(silent=True) or {}
+        rf_config = payload.get("rf_config")
+        if not isinstance(rf_config, dict):
+            return jsonify({"ok": False, "error": "rf_config dict required"}), 400
+
+        required = ("freq_hz", "bw_khz_x10", "sf", "cr_den", "sync_word",
+                    "tx_power_dbm", "preamble")
+        missing = [k for k in required if k not in rf_config]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": f"rf_config missing fields: {missing}",
+            }), 400
+
+        persist = bool(payload.get("persist", True))
+        kwargs = {"persist": persist}
+        if transport is not None:
+            kwargs["transport"] = transport
+        result = setter(rf_config, **kwargs)
+        if result.get("ok"):
+            return jsonify(result)
+        # reason-based status code: range / NVS rejections are 400 (caller
+        # gave bad input); transport timeouts are 504.
+        reason = result.get("reason")
+        if reason is None:
+            return jsonify(result), 504
+        return jsonify(result), 400
+
+    @bp.route("/api/gateway/rf_config", methods=["GET"])
+    def api_gateway_rf_config_get():
+        """Legacy single-gateway read of the LoRa PHY config — defaults
+        to the controller's primary transport slot. New code should use
+        ``GET /api/gateways/<ident_mac>/rf_config`` for explicit
+        addressing on multi-gateway deployments.
+
+        Sends GW_CMD_GET_RF_CONFIG; replies via EV_RF_CHANGED. Returns
+        ``{"ok": bool, "rf_config": {...}}`` on success.
+
+        Body fields (P_RfConfig wire layout):
+            freq_hz, bw_khz_x10, sf, cr_den, sync_word, tx_power_dbm,
+            preamble.
+        """
+        return _rf_config_get(transport=None)
+
+    @bp.route("/api/gateway/rf_config", methods=["POST"])
+    def api_gateway_rf_config_set():
+        """Legacy single-gateway write of the LoRa PHY config — defaults
+        to the controller's primary transport slot. New code should use
+        ``POST /api/gateways/<ident_mac>/rf_config`` for explicit
+        addressing on multi-gateway deployments.
+
+        Expected JSON body:
+            {
+                "rf_config": {
+                    "freq_hz": 867700000,
+                    "bw_khz_x10": 1250,
+                    "sf": 7, "cr_den": 5, "sync_word": 18,
+                    "tx_power_dbm": 14, "preamble": 8
+                },
+                "persist": true  # optional, default true
+            }
+
+        ``persist=true`` writes NVS and reboots the gateway. ``persist=false``
+        live-reconfigures without persisting (channel-scan mode). The reply
+        echoes the EV_RF_CHANGED reason; HTTP 400 for validation rejections,
+        504 for transport timeouts.
+        """
+        return _rf_config_set(transport=None)
+
+    @bp.route("/api/gateways/<ident_mac>/rf_config", methods=["GET"])
+    def api_gateway_rf_config_get_for(ident_mac: str):
+        """Per-gateway read of the LoRa PHY config (multi-gateway).
+
+        Same response shape as ``/api/gateway/rf_config``. Returns 404
+        if no attached transport carries ``ident_mac``.
+        """
+        transport = _resolve_transport_by_ident(ident_mac)
+        if transport is None:
+            return jsonify({
+                "ok": False,
+                "error": f"no attached gateway with ident_mac={ident_mac!r}",
+            }), 404
+        return _rf_config_get(transport=transport)
+
+    @bp.route("/api/gateways/<ident_mac>/rf_config", methods=["POST"])
+    def api_gateway_rf_config_set_for(ident_mac: str):
+        """Per-gateway write of the LoRa PHY config (multi-gateway).
+
+        Same request/response shape as ``/api/gateway/rf_config``.
+        Returns 404 if no attached transport carries ``ident_mac``.
+        """
+        transport = _resolve_transport_by_ident(ident_mac)
+        if transport is None:
+            return jsonify({
+                "ok": False,
+                "error": f"no attached gateway with ident_mac={ident_mac!r}",
+            }), 404
+        return _rf_config_set(transport=transport)
+
     @bp.route("/api/task", methods=["GET"])
     def api_task():
+        return jsonify({"ok": True, "task": ctx.tasks.snapshot()})
+
+    @bp.route("/api/task/cancel", methods=["POST"])
+    def api_task_cancel():
+        """Cooperative cancel for the currently running long task.
+
+        Sets the task's cancel flag and returns immediately. The worker
+        polls :meth:`TaskManager.is_cancel_requested` at its own cancel
+        points and winds down — for OTA that means "skip remaining
+        devices after the current one completes". The dialog stays open
+        through the WebUI lockdown until the resulting summary lands.
+        """
+        signalled = ctx.tasks.request_cancel()
+        if not signalled:
+            return jsonify({"ok": False, "error": "no task running"}), 200
         return jsonify({"ok": True, "task": ctx.tasks.snapshot()})
 
     @bp.route("/api/options", methods=["GET"])
@@ -575,24 +1617,69 @@ def register_api_routes(bp, ctx):
 
         def do_status():
             updated = 0
+            retried = 0
+            retried_success = 0
+            status_service = getattr(ctx.rl_instance, "status_service", None)
             if selection:
-                if hasattr(ctx.rl_instance, "getStatusSelection"):
-                    updated = int(ctx.rl_instance.getStatusSelection(selection) or 0)
-                else:
-                    for mac in selection:
-                        dev = ctx.rl_instance.getDeviceFromAddress(mac)
-                        if dev:
-                            updated += int(ctx.rl_instance.getStatus(targetDevice=dev) or 0)
-            elif group_id is not None:
-                updated = int(ctx.rl_instance.getStatus(groupFilter=int(group_id)) or 0)
+                # Selection-based "Get Status" is already a per-device
+                # series of unicasts — no retry pass needed (each
+                # device gets its full idle-timeout window already).
+                for mac in selection:
+                    dev = ctx.rl_instance.getDeviceFromAddress(mac)
+                    if dev:
+                        updated += int(ctx.rl_instance.getStatus(targetDevice=dev) or 0)
             else:
-                updated = int(ctx.rl_instance.getStatus(groupFilter=255) or 0)
-            return {"updated": updated, "groupId": group_id, "selectionCount": len(selection) if selection else 0}
+                group_filter = int(group_id) if group_id is not None else 255
+                if status_service is not None:
+                    result = status_service.get_status(group_filter=group_filter) or {}
+                    updated = int(result.get("updated") or 0)
+                    retried = int(result.get("retried") or 0)
+                    rr = result.get("retried_responders")
+                    if isinstance(rr, set):
+                        retried_success = len(rr)
+                else:
+                    updated = int(ctx.rl_instance.getStatus(groupFilter=group_filter) or 0)
+            return {
+                "updated": updated,
+                "retried": retried,
+                "retried_success": retried_success,
+                "groupId": group_id,
+                "selectionCount": len(selection) if selection else 0,
+            }
 
         task = ctx.tasks.start("status", do_status, meta={"groupId": group_id, "selectionCount": len(selection) if selection else 0})
         if not task:
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/host-settings", methods=["GET"])
+    def api_host_settings_get():
+        if host_settings_service is None:
+            return jsonify({"ok": False, "error": "host-settings service unavailable"}), 500
+        return jsonify({
+            "ok": True,
+            "battery": host_settings_service.get_battery_thresholds(),
+        })
+
+    @bp.route("/api/host-settings", methods=["POST"])
+    def api_host_settings_post():
+        if host_settings_service is None:
+            return jsonify({"ok": False, "error": "host-settings service unavailable"}), 500
+        body = request.get_json(silent=True) or {}
+        battery = body.get("battery") or {}
+        try:
+            updated = host_settings_service.set_battery_thresholds(
+                mv_2s=battery.get("mV_2s"),
+                mv_6s=battery.get("mV_6s"),
+            )
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        # The DTO bakes ``battery_low`` from the live threshold, so a
+        # change requires the frontend to re-fetch /api/devices. Reuse
+        # the existing ``devices`` SSE topic instead of inventing a new
+        # one — the banner reads ``battery_low`` from devices.
+        _sse_refresh(ctx, {state_scope.DEVICES})
+        return jsonify({"ok": True, "battery": updated})
 
     @bp.route("/api/devices/update-meta", methods=["POST"])
     def api_devices_update_meta():
@@ -618,14 +1705,17 @@ def register_api_routes(bp, ctx):
         macs = body.get("macs") or []
         new_group = body.get("groupId", None)
         new_name = body.get("name", None)
+        raw_names = body.get("names")
+        names = raw_names if isinstance(raw_names, dict) else None
 
         # Pure rename: keep the synchronous path. No RF I/O, no need
         # for the TaskManager wrapper.
         if new_group is None:
             result = _apply_device_meta_updates(
-                ctx, macs=macs, new_group=None, new_name=new_name,
+                ctx, macs=macs, new_group=None, new_name=new_name, names=names,
             )
-            scopes = {state_scope.DEVICES} if new_name is not None else {state_scope.NONE}
+            renamed = new_name is not None or names is not None
+            scopes = {state_scope.DEVICES} if renamed else {state_scope.NONE}
             try:
                 ctx.rl_instance.save_to_db({"manual": True}, scopes=scopes)
             except Exception as ex:
@@ -637,13 +1727,49 @@ def register_api_routes(bp, ctx):
             _sse_refresh(ctx, scopes)
             return jsonify({"ok": True, **result})
 
+        # Stage 3 Part B: hard-enforce the network boundary before
+        # we kick off the task. Catches both "selected devices span
+        # multiple networks" and "target group is on a different
+        # network". Moving to Unconfigured (id 0) short-circuits the
+        # check inside the validator. The check runs under the same
+        # ``rl_lock`` shape the runner uses for in-memory mutations
+        # so a concurrent device delete cannot race us into a stale
+        # decision.
+        with ctx.rl_lock:
+            try:
+                target_group_id = int(new_group)
+            except (TypeError, ValueError):
+                target_group_id = -1
+            groups_list = ctx.groups()
+            target_group = (
+                groups_list[target_group_id]
+                if 0 <= target_group_id < len(groups_list)
+                else None
+            )
+            devices_for_check = [
+                ctx.rl_instance.getDeviceFromAddress(m) for m in macs
+            ]
+            devices_for_check = [d for d in devices_for_check if d is not None]
+        try:
+            validate_group_membership(
+                devices_for_check,
+                target_group,
+                target_group_id=target_group_id,
+            )
+        except NetworkBoundaryViolation as ex:
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
+
         # Group change: wrap in a TaskManager job for live progress.
         if ctx.tasks.is_running():
             return ctx.tasks.busy_response()
         ctx.sse.ensure_transport_hooked(ctx.rl_instance)
 
         scopes_set = {state_scope.DEVICE_MEMBERSHIP}
-        if new_name is not None:
+        if new_name is not None or names is not None:
             scopes_set.add(state_scope.DEVICES)
         target_group = int(new_group)
 
@@ -659,7 +1785,7 @@ def register_api_routes(bp, ctx):
         def _runner():
             outcome = _apply_device_meta_updates(
                 ctx, macs=macs, new_group=new_group, new_name=new_name,
-                progress_cb=_progress,
+                names=names, progress_cb=_progress,
             )
             try:
                 ctx.rl_instance.save_to_db({"manual": True}, scopes=scopes_set)
@@ -713,11 +1839,29 @@ def register_api_routes(bp, ctx):
         dev_type = int(body.get("dev_type", body.get("device_type", 0)) or 0)
         if not name:
             return jsonify({"ok": False, "error": "name required"}), 400
+        # Stage 3 Part B: new groups inherit the default network id
+        # so the boundary validator has a concrete network anchor for
+        # every membership check. Pre-Stage-4 there is no operator UI
+        # to pick a different network at create time; the v1→v2
+        # migration ensures the default network always exists.
+        net_repo = getattr(ctx.rl_instance, "network_repository", None)
+        default_network_id = None
+        if net_repo is not None:
+            try:
+                items = list(net_repo.list())
+                if items:
+                    default_network_id = str(getattr(items[0], "id", "") or "") or None
+            except Exception:
+                logger.exception("api_groups_create: default network lookup raised")
         with ctx.rl_lock:
+            new_group = ctx.RL_DeviceGroup(
+                name, static_group=0, dev_type=dev_type,
+                network_id=default_network_id,
+            )
             if ctx.group_repo is not None:
-                gid = ctx.group_repo.append(ctx.RL_DeviceGroup(name, static_group=0, dev_type=dev_type))
+                gid = ctx.group_repo.append(new_group)
             else:
-                ctx.rl_grouplist.append(ctx.RL_DeviceGroup(name, static_group=0, dev_type=dev_type))
+                ctx.rl_grouplist.append(new_group)
                 gid = len(ctx.rl_grouplist) - 1
             _save_groups_quietly("create")
         _sse_refresh(ctx, {state_scope.GROUPS})
@@ -744,6 +1888,121 @@ def register_api_routes(bp, ctx):
             _save_groups_quietly("rename")
         _sse_refresh(ctx, {state_scope.GROUPS})
         return jsonify({"ok": True})
+
+    @bp.route("/api/groups/resort", methods=["POST"])
+    def api_groups_resort():
+        """Re-order user groups.
+
+        Body: ``{order: [<group_id>, ...], carry_scene_references: bool}``.
+        The ``order`` list contains every current group id exactly once,
+        in the desired new sequence. Group 0 (Unconfigured) and any
+        static group keep their existing index — the dialog enforces
+        this client-side and the route rejects any payload that moves
+        them.
+
+        Behaviour:
+        * The group repository is reordered.
+        * Every device's ``groupId`` is rewritten through the
+          ``{old_gid: new_gid}`` mapping so the host's view of "which
+          group is each device in" tracks the new ids.
+        * When ``carry_scene_references`` is true (default), the same
+          mapping is applied to every scene's group references via
+          :meth:`SceneService.remap_group_ids` — operator intent
+          ("scene targets the same physical group") is preserved.
+        * When false, scene group ids stay numerically frozen, which
+          means they now target whatever group ended up in those
+          slots. Operator-footgun by design.
+        """
+        body = request.get_json(silent=True) or {}
+        raw_order = body.get("order")
+        carry_refs = bool(body.get("carry_scene_references", True))
+
+        if not isinstance(raw_order, list):
+            return jsonify({
+                "ok": False, "error": "order must be a list of group ids",
+            }), 400
+        try:
+            new_order = [int(g) for g in raw_order]
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False, "error": "order entries must be integers",
+            }), 400
+
+        scenes_changed = 0
+        mapping: dict[int, int] = {}
+        with ctx.rl_lock:
+            groups_list = ctx.groups()
+            current_ids = list(range(len(groups_list)))
+            if sorted(new_order) != current_ids:
+                return jsonify({
+                    "ok": False,
+                    "error": "order must be a permutation of all current group ids",
+                }), 400
+
+            # Group 0 (Unconfigured) is the anchor; any static group
+            # must keep its index too.
+            for new_idx, old_gid in enumerate(new_order):
+                old_group = groups_list[old_gid]
+                if old_gid == 0 and new_idx != 0:
+                    return jsonify({
+                        "ok": False,
+                        "error": "group 0 (Unconfigured) must stay at the top",
+                    }), 400
+                if getattr(old_group, "static_group", 0) and new_idx != old_gid:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"static group {old_gid} cannot be moved",
+                    }), 400
+
+            mapping = {old_gid: new_idx for new_idx, old_gid in enumerate(new_order)}
+            if all(old == new for old, new in mapping.items()):
+                # Identity permutation — nothing to do. Return success
+                # without re-broadcasting SSE so the operator-facing
+                # event stream stays calm.
+                return jsonify({"ok": True, "scenes_changed": 0, "mapping": {}})
+
+            new_groups = [groups_list[old_gid] for old_gid in new_order]
+            if ctx.group_repo is not None:
+                ctx.group_repo.replace_all(new_groups)
+            else:
+                ctx.rl_grouplist[:] = new_groups
+
+            for device in ctx.devices():
+                try:
+                    cur = int(getattr(device, "groupId", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                new_gid = mapping.get(cur, cur)
+                if new_gid != cur:
+                    device.groupId = new_gid
+
+            if carry_refs and scenes_service is not None:
+                try:
+                    scenes_changed = scenes_service.remap_group_ids(mapping)
+                except Exception:
+                    # swallow-ok: groups + devices are the critical
+                    # path; a failed scene rewrite leaves stale refs
+                    # but doesn't block the resort. Logged for diag.
+                    logger.warning(
+                        "remap_group_ids failed during group resort",
+                        exc_info=True,
+                    )
+
+            _save_groups_quietly("resort")
+
+        scopes = {state_scope.GROUPS, state_scope.DEVICE_MEMBERSHIP}
+        if scenes_changed > 0:
+            scopes.add(state_scope.SCENES)
+        _sse_refresh(ctx, scopes)
+
+        # JSON object keys must be strings; only emit pairs that
+        # actually moved so the client can render a concise summary.
+        moved = {str(old): new for old, new in mapping.items() if old != new}
+        return jsonify({
+            "ok": True,
+            "scenes_changed": scenes_changed,
+            "mapping": moved,
+        })
 
     @bp.route("/api/groups/delete", methods=["POST"])
     def api_groups_delete():
@@ -1290,6 +2549,52 @@ def register_api_routes(bp, ctx):
         ctx.sse.master.set(last_event="CONTROL_SENT")
         return jsonify({"ok": True, "changed": changed})
 
+    @bp.route("/api/devices/indicate", methods=["POST"])
+    def api_devices_indicate():
+        """Trigger the OPC_INDICATE overlay on one or more devices so the
+        operator can visually locate them (default catalog row IDENTIFY = 4,
+        magenta strobe).
+
+        Naming: the route uses *indicate* (matching the wire opcode
+        ``OPC_INDICATE``) — *identify* is reserved for the RF-discovery
+        opcode ``OPC_DEVICES``. The operator-facing verb in the UI is
+        "Locate".
+
+        Body: ``{ "macs": ["AABBCC112233", ...],
+                  "indicator_type": <int, default IDENTIFY=4>,
+                  "duration_sec":   <int, default 5, clamped 0..255> }``.
+        ``duration_sec == 0`` cancels a running indicator on the target
+        device(s). Returns ``{"ok": true, "count": N}`` where ``N`` is the
+        number of devices for which a frame was queued — unknown MACs are
+        skipped, missing-transport returns ``count: 0`` without erroring.
+        """
+        body = request.get_json(silent=True) or {}
+        macs = body.get("macs")
+        if not isinstance(macs, list) or len(macs) == 0:
+            return jsonify({"ok": False, "error": "macs must be a non-empty list"}), 400
+
+        try:
+            indicator_type = int(body.get("indicator_type", IndicatorType.IDENTIFY)) & 0xFF
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "indicator_type must be an integer"}), 400
+        try:
+            duration_sec = int(body.get("duration_sec", DEFAULT_INDICATE_DURATION_SEC))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "duration_sec must be an integer"}), 400
+        duration_sec = max(0, min(255, duration_sec))
+
+        count = 0
+        control_service = getattr(ctx.rl_instance, "control_service", None)
+        if control_service is None:
+            return jsonify({"ok": False, "error": "control_service unavailable"}), 503
+        for mac in macs:
+            dev = ctx.rl_instance.getDeviceFromAddress(str(mac))
+            if dev is None:
+                continue
+            if control_service.send_device_indicate(dev, indicator_type, duration_sec):
+                count += 1
+        return jsonify({"ok": True, "count": count})
+
     @bp.route("/api/fw/upload", methods=["POST"])
     def api_fw_upload():
         if ctx.tasks.is_running():
@@ -1456,6 +2761,19 @@ def register_api_routes(bp, ctx):
     def _runner_unavailable():
         return jsonify({"ok": False, "error": "scene runner not available"}), 503
 
+    def _enforce_scene_scope(scene: dict) -> None:
+        """Cross-action subset check for explicit ``network_scope``.
+
+        Re-raises :class:`SceneScopeViolation` when the canonicalized
+        scene's explicit scope references unknown networks OR an
+        action's target resolves to a network outside the scope.
+        Auto-mode scenes always pass. No-op (silent return) when the
+        controller is not wired (e.g. unit test bypassing the route).
+        """
+        if ctx.rl_instance is None:
+            return
+        validate_scene_scope_consistency(scene, controller=ctx.rl_instance)
+
     @bp.route("/api/scenes", methods=["GET"])
     def api_scenes_list():
         if scenes_service is None:
@@ -1591,9 +2909,26 @@ def register_api_routes(bp, ctx):
                 actions=body.get("actions"),
                 key=body.get("key"),
                 stop_on_error=body.get("stop_on_error"),
+                network_scope=body.get("network_scope"),
             )
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
+        # Cross-action scope consistency check happens AFTER service
+        # canonicalization so the structural shape is already valid.
+        # Repository access lives at this layer (the service is
+        # repository-free for testability).
+        try:
+            _enforce_scene_scope(scene)
+        except SceneScopeViolation as ex:
+            # Roll back the just-created scene so the operator can
+            # retry with corrected payload without leaving an
+            # invalid record behind.
+            scenes_service.delete(scene["key"])
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
         _sse_refresh(ctx, {state_scope.SCENES})
         return jsonify({"ok": True, "scene": scene})
 
@@ -1602,17 +2937,41 @@ def register_api_routes(bp, ctx):
         if scenes_service is None:
             return _scenes_unavailable()
         body = request.get_json(silent=True) or {}
+        # Snapshot the pre-update scene so we can roll back if scope
+        # validation rejects the post-update shape. update() returns
+        # the new shape; the previous shape lives in the service cache
+        # which we can re-fetch via get().
+        prev_scene = scenes_service.get(key)
         try:
             scene = scenes_service.update(
                 key,
                 label=body.get("label"),
                 actions=body.get("actions"),
                 stop_on_error=body.get("stop_on_error"),
+                network_scope=body.get("network_scope"),
             )
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
         if scene is None:
             return jsonify({"ok": False, "error": "scene not found"}), 404
+        try:
+            _enforce_scene_scope(scene)
+        except SceneScopeViolation as ex:
+            # Restore the previous scene shape so the rejected update
+            # doesn't leave a partially-applied scope on disk.
+            if prev_scene is not None:
+                scenes_service.update(
+                    key,
+                    label=prev_scene.get("label"),
+                    actions=prev_scene.get("actions"),
+                    stop_on_error=prev_scene.get("stop_on_error"),
+                    network_scope=prev_scene.get("network_scope"),
+                )
+            return jsonify({
+                "ok": False,
+                "error": ex.reason,
+                "detail": ex.detail,
+            }), 400
         _sse_refresh(ctx, {state_scope.SCENES})
         return jsonify({"ok": True, "scene": scene})
 
@@ -1723,6 +3082,25 @@ def register_api_routes(bp, ctx):
                               known_group_ids=_known_group_ids_from_ctx(),
                               rl_preset_lookup=_rl_preset_lookup_for_estimator(),
                               device_lookup=_device_lookup_for_estimator())
+        # Surface the scene's resolved broadcast scope so the editor
+        # can render the "Fan-out: N gateways" pill and the operator
+        # sees which networks an Auto-mode scene would actually reach.
+        # ``scene_network_ids`` honours explicit scope (filtered against
+        # current network repo) or falls back to the action walk.
+        try:
+            from ..services.scene_network_scope import scene_network_ids
+            resolved_ids = list(
+                scene_network_ids(scene_dict, controller=ctx.rl_instance)
+            )
+        except Exception:
+            # swallow-ok: scope resolution is purely additive for the
+            # cost payload; a malformed scene must not break the
+            # primary cost numbers.
+            resolved_ids = []
+        scope_mode = "auto"
+        scope_field = scene_dict.get("network_scope") if isinstance(scene_dict, dict) else None
+        if isinstance(scope_field, dict) and scope_field.get("mode") == "explicit":
+            scope_mode = "explicit"
         return {
             "ok": True,
             "total": {
@@ -1742,6 +3120,8 @@ def register_api_routes(bp, ctx):
                 for a in cost.per_action
             ],
             "lora": lora_parameters(),
+            "resolved_network_ids": resolved_ids,
+            "network_scope_mode": scope_mode,
         }
 
     @bp.route("/api/scenes/<key>/estimate", methods=["GET"])
@@ -1769,13 +3149,18 @@ def register_api_routes(bp, ctx):
             # Round-trip the actions through the validator without touching
             # storage. ``replace_all`` is too heavy; we only need canonical
             # actions, so we build a fake scene dict.
-            from ..services.scenes_service import _canonical_actions  # local import
+            from ..services.scenes_service import (
+                _canonical_actions,
+                _canonical_network_scope,
+            )  # local imports
             canonical_actions = _canonical_actions(body.get("actions") or [])
+            canonical_scope = _canonical_network_scope(body.get("network_scope"))
         except ValueError as ex:
             return jsonify({"ok": False, "error": str(ex)}), 400
         scene_dict = {
             "label": (body.get("label") or "").strip() or "draft",
             "actions": canonical_actions,
+            "network_scope": canonical_scope,
         }
         return jsonify(_scene_cost_payload(scene_dict))
 
@@ -1819,25 +3204,48 @@ def register_api_routes(bp, ctx):
 
         if draft_actions is not None:
             try:
-                from ..services.scenes_service import _canonical_actions  # local import
+                from ..services.scenes_service import (
+                    _canonical_actions,
+                    _canonical_network_scope,
+                )  # local import
                 canonical_actions = _canonical_actions(draft_actions)
             except ValueError as ex:
                 return jsonify({"ok": False, "error": str(ex)}), 400
-            # stop_on_error resolution: explicit body value wins; otherwise
-            # fall back to the persisted scene's setting (so toggling the
-            # checkbox on the saved scene still influences a draft run when
-            # the operator hasn't touched the box). Default True if neither
-            # exists — matches the saved-scene default.
+            # stop_on_error + network_scope resolution: explicit body
+            # value wins; otherwise fall back to the persisted scene
+            # so the saved settings still apply to a draft run when
+            # the editor hasn't touched them. Fetch the saved scene
+            # once and reuse for both fields. Default True / auto-mode
+            # if neither exists — matches the saved-scene defaults.
+            saved = None
             if "stop_on_error" in body:
                 stop_on_error = bool(body.get("stop_on_error"))
             else:
                 saved = scenes_service.get(key)
                 stop_on_error = bool(saved.get("stop_on_error", True)) if saved else True
+            if "network_scope" in body:
+                try:
+                    scope = _canonical_network_scope(body.get("network_scope"))
+                except ValueError as ex:
+                    return jsonify({"ok": False, "error": str(ex)}), 400
+            else:
+                if saved is None:
+                    saved = scenes_service.get(key)
+                scope = (
+                    (saved.get("network_scope") if saved else None)
+                    or {"mode": "auto"}
+                )
             scene_dict = {
                 "key": key,
                 "label": (body.get("label") or "draft").strip() or "draft",
                 "actions": canonical_actions,
                 "stop_on_error": stop_on_error,
+                # Pin the scope so the runner's broadcast fan-out
+                # respects the operator's choice on a draft Run too —
+                # not just on a saved-scene Run. Without this the
+                # runner falls through to auto-mode, which on a
+                # broadcast action resolves to every known network.
+                "network_scope": scope,
             }
             result = scene_runner_service.run(
                 key, progress_cb=_emit_progress, scene=scene_dict,

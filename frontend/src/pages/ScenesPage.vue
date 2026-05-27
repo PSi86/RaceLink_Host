@@ -44,10 +44,8 @@ onBeforeRouteLeave(async () => {
 </script>
 
 <template>
-  <main class="grid grid-cols-1 gap-3 p-3">
-    <section class="grid w-full gap-4 p-4 sm:grid-cols-[minmax(220px,280px)_1fr]">
-      <ScenesSidebar />
-      <SceneEditor />
-    </section>
+  <main class="grid h-full min-h-0 grid-cols-[260px_1fr] gap-3 overflow-hidden p-3">
+    <ScenesSidebar />
+    <SceneEditor />
   </main>
 </template>

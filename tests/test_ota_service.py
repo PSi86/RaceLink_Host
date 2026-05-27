@@ -530,5 +530,50 @@ class WledSkipValidationTests(unittest.TestCase):
         self.assertNotIn(b"skipValidation", body)
 
 
+class ExpectedSoftApBssidTests(unittest.TestCase):
+    """ESP32 SoftAP MAC follows the IDF default ``AP_MAC = STA_MAC + 1``.
+    neu 94.txt confirmed this empirically across three RaceLink Node V3
+    boards — the OTA workflow relies on it to pre-lock ``nmcli connect``
+    to the target device's BSSID."""
+
+    def setUp(self):
+        self.svc = _make_service()
+
+    def test_standard_increment(self):
+        # neu 94.txt: STA DCB4D9A8A95A → AP DC:B4:D9:A8:A9:5B.
+        self.assertEqual(
+            self.svc.expected_softap_bssid("DCB4D9A8A95A"),
+            "DC:B4:D9:A8:A9:5B",
+        )
+
+    def test_low_byte_carry_propagates_upward(self):
+        # 0xFF + 1 in low byte must carry into the next octet — the
+        # 48-bit addition guards against an off-by-one in the bottom
+        # nibble that would silently produce ``...:00`` and fail the
+        # subsequent BSSID-locked connect.
+        self.assertEqual(
+            self.svc.expected_softap_bssid("DCB4D9A8A9FF"),
+            "DC:B4:D9:A8:AA:00",
+        )
+
+    def test_separators_in_input_are_tolerated(self):
+        self.assertEqual(
+            self.svc.expected_softap_bssid("DC:B4:D9:A8:A9:5A"),
+            "DC:B4:D9:A8:A9:5B",
+        )
+        self.assertEqual(
+            self.svc.expected_softap_bssid("dc-b4-d9-a8-a9-5a"),
+            "DC:B4:D9:A8:A9:5B",
+        )
+
+    def test_short_or_malformed_addr_returns_empty(self):
+        # OTA workflow uses the empty string as a sentinel to fall
+        # through to ``bssid=<auto>``. Both "too short" and "junk"
+        # must take that branch rather than raising.
+        self.assertEqual(self.svc.expected_softap_bssid(""), "")
+        self.assertEqual(self.svc.expected_softap_bssid("DCB4D9"), "")
+        self.assertEqual(self.svc.expected_softap_bssid("not-a-mac"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

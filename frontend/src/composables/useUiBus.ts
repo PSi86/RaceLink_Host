@@ -15,6 +15,31 @@ const newGroupRequest = ref(0)
 const rlPresetsRequest = ref(0)
 const wledPresetsRequest = ref(0)
 const fwUpdateRequest = ref(0)
+const hostSettingsRequest = ref(0)
+const onboardingRequest = ref(0)
+const batteryDevicesRequest = ref(0)
+const manageGroupsRequest = ref(0)
+// Stage 4 Block 2: Channel-Scan wizard. Triggered from the
+// AppHeader's wrench-menu (or future GatewayStatusBar's
+// per-card action) when an operator wants to recover stranded
+// devices.
+const channelScanRequest = ref(0)
+// Stage 4 Block 3: Network Manager (CRUD on networks). Triggered
+// from the HostSettingsDialog. The SetupChangeAssistant is
+// auto-open-driven by its own diff watcher so it has no UI-bus
+// signal — kept open via its v-model.
+const networkManagerRequest = ref(0)
+// Bug 3a fix: manual re-open path for the GatewayBindWizard. The
+// wizard auto-opens via the gateways store's ``attentionRecord``
+// watcher; once the operator dismisses with "Later" that watcher
+// won't re-fire on the same ident_mac. This signal lets the
+// AppHeader's ⚠ Pair button (or any future entry-point) put the
+// wizard back on screen without restarting the host.
+const bindWizardRequest = ref(0)
+// Round 3 Task 7: SetupChangeAssistant no longer auto-opens on
+// diff changes; the GatewayBanner's "Open Pair Assistant" button
+// fires this signal to open it manually.
+const setupAssistantRequest = ref(0)
 
 export function useUiBus() {
   return {
@@ -24,6 +49,14 @@ export function useUiBus() {
     rlPresetsRequest,
     wledPresetsRequest,
     fwUpdateRequest,
+    hostSettingsRequest,
+    onboardingRequest,
+    batteryDevicesRequest,
+    manageGroupsRequest,
+    channelScanRequest,
+    networkManagerRequest,
+    bindWizardRequest,
+    setupAssistantRequest,
     requestDiscover() {
       discoverRequest.value += 1
     },
@@ -41,6 +74,30 @@ export function useUiBus() {
     },
     requestFwUpdate() {
       fwUpdateRequest.value += 1
+    },
+    requestHostSettings() {
+      hostSettingsRequest.value += 1
+    },
+    requestOnboarding() {
+      onboardingRequest.value += 1
+    },
+    requestBatteryDevices() {
+      batteryDevicesRequest.value += 1
+    },
+    requestManageGroups() {
+      manageGroupsRequest.value += 1
+    },
+    requestChannelScan() {
+      channelScanRequest.value += 1
+    },
+    requestNetworkManager() {
+      networkManagerRequest.value += 1
+    },
+    requestBindWizard() {
+      bindWizardRequest.value += 1
+    },
+    requestSetupAssistant() {
+      setupAssistantRequest.value += 1
     },
   }
 }

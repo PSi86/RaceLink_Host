@@ -21,7 +21,7 @@ from .flags import (
     build_flags_byte,
     flags_from_mapping,
 )
-from .models import RL_Device, RL_DeviceGroup
+from .models import RL_Device, RL_DeviceGroup, RL_Network, default_device_name
 from .specials import (
     RL_PRESET_EDITOR_SCHEMA,
     RL_SPECIALS,
@@ -37,6 +37,7 @@ from .state_scope import normalize_scopes, sse_what_from_scopes
 __all__ = [
     "RL_Device",
     "RL_DeviceGroup",
+    "RL_Network",
     "RL_Dev_Type",
     "RL_DEV_TYPE_CAPS",
     "RL_DEV_TYPE_INFO",
@@ -55,6 +56,7 @@ __all__ = [
     "RL_SPECIALS",
     "build_specials_state",
     "create_device",
+    "default_device_name",
     "get_dev_type_info",
     "get_special_keys_for_caps",
     "get_specials_config",

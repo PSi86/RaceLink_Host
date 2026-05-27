@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { ArrowUpDown, Pencil } from 'lucide-vue-next'
 
 import { useGroupsStore } from '@/stores/groups'
 import { useDevicesStore } from '@/stores/devices'
+import { useNetworksStore } from '@/stores/networks'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useUiBus } from '@/composables/useUiBus'
@@ -10,9 +12,51 @@ import type { Group } from '@/api/types'
 
 const groups = useGroupsStore()
 const devices = useDevicesStore()
+const networks = useNetworksStore()
 const toast = useToast()
 const confirm = useConfirm()
 const ui = useUiBus()
+
+// Stage 4 Block 1: per-network filter dropdown. ``null`` ↔ ``"all"``
+// represents "All Networks" (no filter applied). The store applies
+// the filter inside ``devices.filteredDevices`` (right pane) and
+// the sidebar mirrors it on the groups list via ``visibleGroups``
+// below. The dropdown just drives the store's ``selectedNetworkId``
+// slot — both filter sites read from it.
+const networkFilter = computed<string>({
+  get: () => networks.selectedNetworkId ?? 'all',
+  set: (value: string) => networks.setNetworkFilter(value === 'all' ? null : value),
+})
+
+/** Operator-visible groups list, scoped to the active network
+ *  filter. ``All Networks`` (the dropdown default) returns every
+ *  group unchanged. Otherwise: static groups (``Unconfigured`` /
+ *  ``All WLED Nodes``) stay visible under every filter because
+ *  they are network-agnostic by design — the remaining
+ *  user-created groups are matched by ``network_id`` against the
+ *  filter, with the same ``null → defaultNetworkId`` fallback the
+ *  device-store filter uses so legacy / unmigrated groups stay
+ *  consistent with their devices.
+ *
+ *  Order is preserved (``filter`` keeps insertion order) so a
+ *  reorder applied via the Manage-groups dialog still shows the
+ *  same sequence under any filter.
+ *
+ *  Selection (``groups.selGroupId``) is left alone on purpose: if
+ *  the operator filters away the currently-selected group, the
+ *  sidebar simply renders no highlighted row and the right pane
+ *  shows the (intersection-empty) device list. Clicking another
+ *  visible group or switching back to ``All Networks`` restores
+ *  the view without us having to second-guess intent. */
+const visibleGroups = computed<Group[]>(() => {
+  const nid = networks.selectedNetworkId
+  if (nid === null) return groups.groups
+  return groups.groups.filter((g) => {
+    if (g.static || g.id === 0) return true
+    const gnid = g.network_id ?? networks.defaultNetworkId
+    return gnid === nid
+  })
+})
 
 interface GroupAggregate {
   online: number
@@ -107,17 +151,142 @@ function onNewGroup() {
   // free of modal state.
   ui.requestNewGroup()
 }
+
+function onManageGroups() {
+  ui.requestManageGroups()
+}
+
+/** Network badge class for a group row. ``null`` / unbound → the
+ * "Default" placeholder badge from the networks store; this keeps
+ * legacy groups (loaded pre-Stage-2) visually consistent with bound
+ * ones. */
+function groupNetworkBadgeClass(g: Group): string {
+  return networks.colorOf(g.network_id ?? networks.defaultNetworkId)
+}
+
+function groupNetworkLabel(g: Group): string {
+  return networks.nameOf(g.network_id ?? networks.defaultNetworkId)
+}
+
+/** Static groups ("Unconfigured", "All WLED Nodes") are network-
+ * agnostic by design — they should NOT render a network badge. The
+ * sidebar row hides the badge for them; the ManageGroupsDialog also
+ * excludes them from the movable set. */
+function hasNetworkBadge(g: Group): boolean {
+  return !g.static && Number(g.id) !== 0
+}
+
+// Inline-rename for group names. Same hover-pencil pattern the
+// DeviceTable uses for device names: pencil button is invisible
+// outside the row hover state, click swaps the name span for an input.
+// Empty trim cancels (groups have no default-name fallback — backend
+// rejects the empty-name update, so a no-op is the right semantic).
+const editingGroupId = ref<number | null>(null)
+const editGroupDraft = ref<string>('')
+const editGroupSaving = ref(false)
+
+function canRenameGroup(g: Group): boolean {
+  return !g.static && Number(g.id) !== 0
+}
+
+function startEditGroup(g: Group, ev: MouseEvent) {
+  ev.stopPropagation()
+  editingGroupId.value = g.id
+  editGroupDraft.value = g.name ?? ''
+}
+
+function cancelEditGroup() {
+  editingGroupId.value = null
+  editGroupDraft.value = ''
+}
+
+async function commitEditGroup(g: Group) {
+  if (editingGroupId.value !== g.id) return
+  // Re-entry guard mirrors the DeviceTable inline-edit: Enter triggers
+  // the first commit, the disabled state forces the input to blur,
+  // blur would fire the same handler a second time without this.
+  if (editGroupSaving.value) return
+  const next = editGroupDraft.value.trim()
+  const current = (g.name ?? '').trim()
+  if (next === current || next === '') {
+    cancelEditGroup()
+    return
+  }
+  editGroupSaving.value = true
+  try {
+    const r = await groups.renameGroup(g.id, next)
+    if (!r.ok) {
+      toast.error(`Rename failed: ${r.error || 'unknown'}`)
+      return
+    }
+    toast.show(`Renamed group to "${next}".`)
+  } finally {
+    editGroupSaving.value = false
+    cancelEditGroup()
+  }
+}
+
+function onEditGroupInputMount(el: unknown) {
+  if (!(el instanceof HTMLInputElement)) return
+  // Function refs in v-for fire on every patch, not just on mount.
+  // The ``activeElement`` guard keeps the focus call idempotent so
+  // keystrokes don't refocus mid-edit.
+  if (document.activeElement === el) return
+  el.focus()
+  // No ``.select()`` on purpose: matches the DeviceTable rename — the
+  // operator appends/corrects rather than overwrites, so the browser-
+  // default end-of-text caret wins.
+  //
+  // Timing caveat: ``.select()`` / ``.setSelectionRange()`` called
+  // synchronously here are a no-op in practice because Vue's render
+  // flush runs inside the click-event tail and the browser settles the
+  // selection state afterwards. If those calls ever come back, wrap
+  // them in ``nextTick(() => …)`` so they run on the next microtask.
+}
 </script>
 
 <template>
-  <aside class="rounded-[10px] border border-border bg-card p-2.5">
-    <div class="mb-1.5 flex items-center justify-between">
-      <span>Groups</span>
-      <button title="Create group" @click="onNewGroup">+</button>
+  <aside class="flex h-full min-h-0 flex-col rounded-[10px] border border-border bg-card p-2.5">
+    <!-- Stage 4 Block 1: per-network filter. Hidden when only one
+         network exists (N=1 deployment) so the dropdown doesn't add
+         visual noise to the single-gateway UX. -->
+    <div
+      v-if="networks.networks.length > 1"
+      class="mb-2 flex shrink-0 items-center gap-2 text-[12px]"
+    >
+      <label for="rl-network-filter" class="text-muted-foreground">Network:</label>
+      <select
+        id="rl-network-filter"
+        v-model="networkFilter"
+        class="flex-auto rounded border border-border bg-background px-1.5 py-1 text-[12px]"
+      >
+        <option value="all">All Networks</option>
+        <option
+          v-for="n in networks.networks"
+          :key="n.id"
+          :value="n.id"
+        >
+          {{ n.name }}
+        </option>
+      </select>
     </div>
-    <ul class="m-0 max-h-[calc(100vh-220px)] list-none overflow-auto p-0">
+    <div class="mb-1.5 flex shrink-0 items-center justify-between">
+      <span>Groups</span>
+      <div class="flex items-center gap-1">
+        <button
+          type="button"
+          title="Manage groups (reorder + move to network)"
+          aria-label="Manage groups"
+          @click="onManageGroups"
+        >
+          <ArrowUpDown class="h-4 w-4" />
+        </button>
+        <button title="Create group" @click="onNewGroup">+</button>
+      </div>
+    </div>
+    <ul class="m-0 min-h-0 flex-1 list-none overflow-auto p-0">
       <li
-        v-for="g in groups.groups"
+        v-for="g in visibleGroups"
         :key="g.id"
         :class="[
           'group flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-2 text-[13px] hover:bg-[#1f1f28]',
@@ -128,7 +297,59 @@ function onNewGroup() {
         ]"
         @click="selectGroup(g)"
       >
-        <span class="min-w-0 flex-auto truncate">{{ g.name || `Group ${g.id}` }}</span>
+        <!-- Network badge LEFT of the group name. Operator-movable
+             groups only — static groups + Unconfigured stay
+             network-agnostic by design and have no badge. The badge
+             is read-only here; moving the group to a different
+             network goes through the ManageGroupsDialog (header
+             "Reorder groups" button → opens the unified dialog). -->
+        <span
+          v-if="hasNetworkBadge(g) && editingGroupId !== g.id"
+          class="flex-none rounded px-1.5 py-0.5 text-[10px] font-medium"
+          :class="groupNetworkBadgeClass(g)"
+          :title="`Network: ${groupNetworkLabel(g)}`"
+        >
+          {{ groupNetworkLabel(g) }}
+        </span>
+        <!-- Edit mode: input replaces name + pencil. ``@click.stop`` on
+             the input keeps a stray click from re-selecting the group
+             row (which would not be a bug per se, but feels jittery). -->
+        <input
+          v-if="editingGroupId === g.id"
+          :ref="onEditGroupInputMount"
+          v-model="editGroupDraft"
+          type="text"
+          maxlength="32"
+          class="rl-name-input min-w-0 flex-auto"
+          :disabled="editGroupSaving"
+          @click.stop
+          @keydown.enter.prevent="commitEditGroup(g)"
+          @keydown.esc.prevent="cancelEditGroup"
+          @blur="commitEditGroup(g)"
+        />
+        <template v-else>
+          <span class="min-w-0 flex-auto truncate">{{ g.name || `Group ${g.id}` }}</span>
+          <button
+            v-if="canRenameGroup(g)"
+            type="button"
+            class="invisible flex-none cursor-pointer rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground hover:text-accent group-hover:visible"
+            :title="`Rename group ${g.name}`"
+            aria-label="Rename group"
+            @click.stop="(ev) => startEditGroup(g, ev)"
+          >
+            <Pencil class="h-3.5 w-3.5" />
+          </button>
+          <button
+            v-else
+            type="button"
+            class="pointer-events-none invisible flex-none rounded border-0 bg-transparent p-0.5 leading-none text-muted-foreground"
+            tabindex="-1"
+            aria-hidden="true"
+            disabled
+          >
+            <Pencil class="h-3.5 w-3.5" />
+          </button>
+        </template>
         <span
           class="flex-none text-xs text-muted-foreground"
           :title="

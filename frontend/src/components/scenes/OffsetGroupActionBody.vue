@@ -357,7 +357,10 @@ const offsetMsRange = computed(() => offsetCfg.value?.offset_ms ?? { min: 0, max
 
       <draggable
         v-model="children"
-        :item-key="(_el: SceneAction, idx: number) => `${parentIndex}-${idx}`"
+        :item-key="
+          (_el: SceneAction, idx: number) =>
+            `${scenes.selectedKey ?? 'new'}-${parentIndex}-${idx}`
+        "
         handle=".og-child-grip"
         animation="150"
         class="flex flex-col gap-2"

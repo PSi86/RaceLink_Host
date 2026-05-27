@@ -15,9 +15,9 @@ class ImportSurfaceTests(unittest.TestCase):
         import racelink.transport  # noqa: F401
         import racelink.web  # noqa: F401
 
-    def test_top_level_controller_module_is_importable(self):
+    def test_controller_module_is_importable(self):
         install_serial()
-        module = importlib.import_module("controller")
+        module = importlib.import_module("racelink.controller")
 
         self.assertTrue(hasattr(module, "RaceLink_Host"))
 

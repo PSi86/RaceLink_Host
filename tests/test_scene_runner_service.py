@@ -57,28 +57,34 @@ class _RecordingControlService:
         # set of group ids whose send_offset should return False
         self._fail_offsets_for = set(int(g) for g in fail_offsets_for)
 
-    def send_wled_preset(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_wled_preset(self, *, targetDevice=None, targetGroup=None,
+                         params=None, target=None):
         self.preset_calls.append({
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
+            "target": target,
         })
         return "wled_preset" not in self._fail_kinds
 
-    def send_control(self, *, targetDevice=None, targetGroup=None, params=None):
+    def send_control(self, *, targetDevice=None, targetGroup=None,
+                     params=None, target=None):
         self.control_calls.append({
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "params": dict(params or {}),
+            "target": target,
         })
         return "rl_effect" not in self._fail_kinds
 
-    def send_offset(self, *, targetDevice=None, targetGroup=None, mode="none", **mode_params):
+    def send_offset(self, *, targetDevice=None, targetGroup=None, mode="none",
+                    target=None, **mode_params):
         self.offset_calls.append({
             "targetDevice": getattr(targetDevice, "addr", None),
             "targetGroup": targetGroup,
             "mode": mode,
             "params": dict(mode_params),
+            "target": target,
         })
         if targetGroup is not None and int(targetGroup) in self._fail_offsets_for:
             return False
@@ -89,12 +95,14 @@ class _RecordingSyncService:
     def __init__(self):
         self.sync_calls = []
 
-    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *, trigger_armed=False):
+    def send_sync(self, ts24, brightness, recv3=b"\xFF\xFF\xFF", *,
+                  trigger_armed=False, target=None):
         self.sync_calls.append({
             "ts24": ts24,
             "brightness": brightness,
             "recv3": recv3,
             "trigger_armed": trigger_armed,
+            "target": target,
         })
 
 
