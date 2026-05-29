@@ -266,6 +266,10 @@ export interface MasterResponse {
 export interface NetworkSummary {
   id: string
   name: string
+  /** Network kind discriminator. `'rf'` is the historical LoRa-gateway
+   *  network; `'ethernet'` is the IP/LAN network kind. The backend always
+   *  emits this (defaulting legacy rows to `'rf'`). */
+  kind: 'rf' | 'ethernet'
   gateway_mac: string | null
   region: string | null
   channel_id: number | string | null

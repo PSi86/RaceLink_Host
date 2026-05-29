@@ -334,19 +334,39 @@ class RaceLink_Host:
     def transport_for_network(self, network_id):
         """Return the transport bound to the given ``RL_Network.id``.
 
-        Resolves via ``RL_Network.gateway_mac`` against the transport's
-        ``ident_mac`` snapshot. Returns ``None`` if no transport carries
-        that network — either because the gateway is unplugged or
-        because the network has never been bound to a physical unit.
+        Resolution order:
+
+        1. **Direct ``network_id`` binding** — every transport is stamped
+           with its bound ``network_id`` at attach time
+           (:meth:`_bind_transport_to_network`). Matching that stamp is the
+           canonical, protocol-agnostic route: it works for transports that
+           have *no* gateway MAC (e.g. an Ethernet transport, where the host
+           NIC is the transport) and keeps the door open for several logical
+           networks sharing one NIC later.
+        2. **Legacy ``gateway_mac`` fallback** — for RF networks whose
+           transport pre-dates the stamp or wasn't stamped, resolve via
+           ``RL_Network.gateway_mac`` against the transport's ``ident_mac``.
+        3. **Single-transport fallback** — a network with no MAC binding yet
+           (single-gateway deployment) routes to the only transport.
+
+        Returns ``None`` if no transport carries that network — either
+        because the gateway is unplugged or because the network has never
+        been bound to a physical unit.
         """
         if not network_id:
             return None
+        target_nid = str(network_id)
+        # (1) Direct network_id binding takes precedence.
+        for t in self._transports:
+            bound = getattr(t, "network_id", None)
+            if bound and str(bound) == target_nid:
+                return t
         net = self.network_repository.get_by_id(network_id)
         if net is None or not getattr(net, "gateway_mac", None):
-            # If the network has no MAC binding yet, the Stage-2 fallback
-            # is "use the only transport we have" — single-gateway
-            # deployments don't carry a per-network binding.
+            # (3) No MAC binding yet — single-gateway deployments don't
+            # carry a per-network binding, so use the only transport.
             return self._transports[0] if len(self._transports) == 1 else None
+        # (2) Legacy MAC-centric resolution.
         target_mac = str(net.gateway_mac).upper()
         for t in self._transports:
             ident = str(getattr(t, "ident_mac", "") or "").upper()
@@ -668,6 +688,7 @@ class RaceLink_Host:
                 loaded_networks.append(RL_Network(
                     id=net.get("id"),
                     name=str(net.get("name") or "Default"),
+                    kind=net.get("kind"),
                     gateway_mac=net.get("gateway_mac"),
                     region=str(net.get("region") or "EU868"),
                     channel_id=net.get("channel_id"),

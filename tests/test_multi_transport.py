@@ -185,6 +185,46 @@ class TransportForNetworkRoutingTests(unittest.TestCase):
         host.network_repository.append(net)
         self.assertIsNone(host.transport_for_network(net.id))
 
+    def test_resolves_via_direct_network_id_binding(self):
+        # A transport stamped with ``network_id`` resolves directly,
+        # without needing a gateway_mac on the network — the path an
+        # Ethernet transport (host NIC, no gateway MAC) relies on.
+        from racelink.domain.models import RL_Network
+
+        host = self._make_controller()
+
+        class _FakeTransport:
+            def __init__(self, nid):
+                self.ident_mac = None
+                self.network_id = nid
+
+        net = RL_Network(name="Stage LAN", kind="ethernet", gateway_mac=None)
+        t = _FakeTransport(net.id)
+        host._transports = [_FakeTransport("other-net"), t]
+        host.network_repository.append(net)
+
+        self.assertIs(host.transport_for_network(net.id), t)
+
+    def test_direct_network_id_binding_takes_precedence_over_mac(self):
+        # When both a direct network_id stamp and a gateway_mac would
+        # match different transports, the direct stamp wins.
+        from racelink.domain.models import RL_Network
+
+        host = self._make_controller()
+
+        class _FakeTransport:
+            def __init__(self, mac=None, nid=None):
+                self.ident_mac = mac
+                self.network_id = nid
+
+        net = RL_Network(name="Track A", gateway_mac="AA:BB:CC:DD:EE:02")
+        t_mac = _FakeTransport(mac="AA:BB:CC:DD:EE:02", nid=None)
+        t_direct = _FakeTransport(mac=None, nid=net.id)
+        host._transports = [t_mac, t_direct]
+        host.network_repository.append(net)
+
+        self.assertIs(host.transport_for_network(net.id), t_direct)
+
 
 class PendingMatcherRegistryGatewayIdEnforcementTests(unittest.TestCase):
     """Stage 3 Part C contract: the registry refuses to admit a

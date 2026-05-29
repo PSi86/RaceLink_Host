@@ -499,6 +499,7 @@ def register_api_routes(bp, ctx):
                 rows.append({
                     "id": nid,
                     "name": str(getattr(net, "name", "") or ""),
+                    "kind": str(getattr(net, "kind", "rf") or "rf"),
                     "gateway_mac": getattr(net, "gateway_mac", None),
                     "region": getattr(net, "region", None),
                     "channel_id": getattr(net, "channel_id", None),

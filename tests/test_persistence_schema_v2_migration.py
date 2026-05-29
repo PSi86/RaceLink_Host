@@ -138,5 +138,79 @@ class V1ToV2MigrationTests(unittest.TestCase):
         self.assertEqual(n, networks)
 
 
+class V2ToV3MigrationTests(unittest.TestCase):
+    """v3 adds the network ``kind`` discriminator (Ethernet groundwork).
+
+    Every pre-v3 network is an RF network by definition, so the step
+    back-fills ``kind="rf"`` on networks that lack it and leaves any
+    existing ``kind`` (incl. ``"ethernet"``) untouched.
+    """
+
+    def test_v2_network_backfills_kind_rf(self):
+        networks = [{
+            "id": DEFAULT_NETWORK_ID, "name": "Default",
+            "region": "EU868", "channel_id": None, "rf_config": None,
+            "gateway_mac": None, "created_ts": 0.0,
+        }]
+        _, _, n, ver = migrate_state([], [], networks, from_version=2)
+        self.assertEqual(ver, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(n[0]["kind"], "rf")
+
+    def test_existing_kind_is_preserved(self):
+        networks = [
+            {"id": "eth-1", "name": "Stage LAN", "kind": "ethernet"},
+            {"id": "rf-1", "name": "Track A", "kind": "rf"},
+        ]
+        _, _, n, _ = migrate_state([], [], networks, from_version=2)
+        self.assertEqual(n[0]["kind"], "ethernet")
+        self.assertEqual(n[1]["kind"], "rf")
+
+    def test_full_v1_to_v3_chain_seeds_rf_default(self):
+        # A v1 payload migrates all the way to v3: the synthesised default
+        # network carries kind="rf" and devices/groups land in it.
+        devices = [{"addr": "AA", "groupId": 1}]
+        groups = [{"name": "G", "static_group": 0, "dev_type": 0}]
+        d, g, n, ver = migrate_state(devices, groups, [], from_version=1)
+        self.assertEqual(ver, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(n[0]["id"], DEFAULT_NETWORK_ID)
+        self.assertEqual(n[0]["kind"], "rf")
+        self.assertEqual(d[0]["network_id"], DEFAULT_NETWORK_ID)
+        self.assertEqual(g[0]["network_id"], DEFAULT_NETWORK_ID)
+
+    def test_idempotent_on_v3_payload(self):
+        networks = [{"id": "rf-1", "name": "Track A", "kind": "rf"}]
+        _, _, n, ver = migrate_state(
+            [], [], networks, from_version=CURRENT_SCHEMA_VERSION,
+        )
+        self.assertEqual(ver, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(n[0]["kind"], "rf")
+
+
+class NetworkKindModelTests(unittest.TestCase):
+    """``RL_Network.kind`` normalisation contract."""
+
+    def test_defaults_to_rf(self):
+        from racelink.domain.models import RL_Network
+
+        self.assertEqual(RL_Network(name="X").kind, "rf")
+
+    def test_accepts_ethernet(self):
+        from racelink.domain.models import RL_Network
+
+        self.assertEqual(RL_Network(name="X", kind="ethernet").kind, "ethernet")
+
+    def test_unknown_or_none_falls_back_to_rf(self):
+        from racelink.domain.models import RL_Network
+
+        self.assertEqual(RL_Network(name="X", kind=None).kind, "rf")
+        self.assertEqual(RL_Network(name="X", kind="").kind, "rf")
+        self.assertEqual(RL_Network(name="X", kind="wifi").kind, "rf")
+
+    def test_kind_is_case_insensitive(self):
+        from racelink.domain.models import RL_Network
+
+        self.assertEqual(RL_Network(name="X", kind="ETHERNET").kind, "ethernet")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
