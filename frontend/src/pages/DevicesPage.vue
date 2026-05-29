@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 
 import DevicesSidebar from '@/components/DevicesSidebar.vue'
+import NetworkKindIcon from '@/components/NetworkKindIcon.vue'
 import BulkActionsToolbar from '@/components/BulkActionsToolbar.vue'
 import NodeConfigToolbar from '@/components/NodeConfigToolbar.vue'
 import ConfigDisplayToolbar from '@/components/ConfigDisplayToolbar.vue'
@@ -62,6 +63,10 @@ const headerBadgeLabel = computed<string>(() => {
   const g = selectedGroup.value
   return networks.nameOf(g?.network_id ?? networks.defaultNetworkId)
 })
+const headerBadgeKind = computed<'rf' | 'ethernet'>(() => {
+  const g = selectedGroup.value
+  return networks.kindOf(g?.network_id ?? networks.defaultNetworkId)
+})
 const headerGroupLabel = computed<string>(() => {
   const g = selectedGroup.value
   if (!g) return 'All groups'
@@ -83,10 +88,11 @@ const headerGroupLabel = computed<string>(() => {
         </span>
         <span
           v-if="showHeaderBadge"
-          class="shrink-0 rounded px-2 py-0.5 text-[11px] font-medium"
+          class="inline-flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium"
           :class="headerBadgeClass"
-          :title="`Network: ${headerBadgeLabel}`"
+          :title="`Network: ${headerBadgeLabel} (${headerBadgeKind === 'ethernet' ? 'Ethernet' : 'RF'})`"
         >
+          <NetworkKindIcon :kind="headerBadgeKind" :size="11" />
           {{ headerBadgeLabel }}
         </span>
       </div>

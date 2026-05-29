@@ -106,6 +106,15 @@ export const useNetworksStore = defineStore('networks', () => {
     return networkBadgeClasses(networkId)
   }
 
+  /** Network *kind* for a network id (`'rf'` | `'ethernet'`). Falls back
+   *  to `'rf'` when the network is unknown or pre-dates the `kind` field —
+   *  matching the backend's ``RL_Network._normalize_kind`` default. Drives
+   *  the RF-vs-Ethernet badge icon. */
+  function kindOf(networkId: string | null | undefined): 'rf' | 'ethernet' {
+    if (!networkId) return 'rf'
+    return byId.value[networkId]?.kind === 'ethernet' ? 'ethernet' : 'rf'
+  }
+
   /** Channel descriptor lookup. Returns ``null`` when the region or
    *  channel id is unknown — the Network Manager dialog uses this
    *  to render the channel name next to the rf_config preview. */
@@ -149,6 +158,7 @@ export const useNetworksStore = defineStore('networks', () => {
     // helpers
     nameOf,
     colorOf,
+    kindOf,
     findChannel,
   }
 })
