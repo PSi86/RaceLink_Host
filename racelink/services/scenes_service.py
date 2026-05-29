@@ -8,7 +8,7 @@ in order; simultaneity is achieved by giving multiple dispatchable actions
 ``arm_on_sync`` flag overrides and inserting an explicit ``sync`` action after
 them.
 
-Storage: a single JSON file ``~/.racelink/scenes.json`` written atomically
+Storage: a single JSON file ``~/.racelink/rl_scenes.json`` written atomically
 (temp file + ``os.replace``). Schema is versioned for forward-compat. The
 service handles structural validation only — runtime concerns (does the
 target group/device still exist?) live in ``SceneRunnerService``.
@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from .._user_paths import migrate_legacy_name, user_data_path
 from ..domain.flags import USER_FLAG_KEYS
 
 logger = logging.getLogger(__name__)
@@ -971,7 +972,7 @@ def _collapse_action(action: Dict[str, Any],
 
 
 class SceneService:
-    """CRUD for scenes (``~/.racelink/scenes.json``).
+    """CRUD for scenes (``~/.racelink/rl_scenes.json``).
 
     Public shape mirrors :class:`RLPresetsService` so the wiring patterns
     (``on_changed`` callback, ``state_scope.SCENES`` SSE refresh, etc.) carry
@@ -980,9 +981,11 @@ class SceneService:
 
     def __init__(self, *, storage_path: Optional[str] = None,
                  known_group_ids_getter: Optional[Callable[[], List[int]]] = None):
-        self._path = storage_path or os.path.join(
-            os.path.expanduser("~"), ".racelink", "scenes.json"
-        )
+        if storage_path:
+            self._path = storage_path
+        else:
+            self._path = user_data_path("rl_scenes.json")
+            migrate_legacy_name(self._path, "scenes.json")
         self._lock = threading.RLock()
         self._cache: Optional[List[dict]] = None
         # Monotone-increasing scene id counter; persisted across writes so

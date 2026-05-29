@@ -119,7 +119,7 @@ export function useRaceLinkEvents() {
     try {
       const r = await apiGet('/api/health')
       if (r?.ok && r.phase === 'booting') {
-        showTransientBanner('RotorHazard is starting…')
+        showTransientBanner('Server is starting…')
       }
     } catch {
       // ignore — useEventSource will retry independently
@@ -170,11 +170,11 @@ export function useRaceLinkEvents() {
     knownBad = true
     if (next === 'CLOSED') {
       clearGrace()
-      showTransientBanner('RotorHazard not reachable — retrying…')
+      showTransientBanner('Server not reachable — retrying…')
       void probeHealth()
     } else {
       // CONNECTING — give the browser its grace window first.
-      armTransientBanner('RotorHazard not reachable — retrying…')
+      armTransientBanner('Server not reachable — retrying…')
     }
   })
 
@@ -221,7 +221,7 @@ export function useRaceLinkEvents() {
   watch(error, (err) => {
     if (!err) return
     knownBad = true
-    armTransientBanner('RotorHazard not reachable — retrying…')
+    armTransientBanner('Server not reachable — retrying…')
   })
 
   async function dispatch(name: string, payload: unknown) {

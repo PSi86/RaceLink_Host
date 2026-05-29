@@ -3,7 +3,7 @@
 Pins three contracts:
 
   1. ``discoverPort`` walks :meth:`GatewaySerialTransport.enumerate_all`
-     (when no ``psi_comms_port`` hint is set) and attaches one
+     (when no ``rl_comms_port`` hint is set) and attaches one
      transport per discovered gateway. At N=1 hardware the end state
      is identical to the pre-Part-5 single-transport path.
   2. ``_bind_transport_to_network`` follows the Part-5 policy:
@@ -76,7 +76,7 @@ class _FakeTransport:
     def discover_and_open(self):
         # Manual-pin path: the constructor was given a concrete port and
         # ``discover_and_open`` would just open it. Always succeed for
-        # the test path that exercises ``psi_comms_port``.
+        # the test path that exercises ``rl_comms_port``.
         self.opened = True
         return True
 
@@ -183,11 +183,11 @@ class EnumerateAllBootPathTests(unittest.TestCase):
         self.assertIsNotNone(host.last_gateway_error)
         self.assertEqual(host.last_gateway_error.get("code"), "NOT_FOUND")
 
-    def test_psi_comms_port_hint_still_uses_legacy_path(self):
+    def test_rl_comms_port_hint_still_uses_legacy_path(self):
         host = _make_controller()
         # Pin a port — the legacy single-port path opens that and only
         # that, never calls enumerate_all.
-        host._host_api.db.set_option("psi_comms_port", "COM9")
+        host._host_api.db.set_option("rl_comms_port", "COM9")
         enumerate_calls = []
 
         def _fake_enumerate():
@@ -207,6 +207,49 @@ class EnumerateAllBootPathTests(unittest.TestCase):
         self.assertEqual(len(host.transports), 1)
         self.assertEqual(host.transport.port, "COM9")
         self.assertEqual(enumerate_calls, [])
+
+    def test_multi_pin_attaches_only_whitelisted_ports(self):
+        host = _make_controller()
+        # Multi-pin: enumerate, then attach only the pinned ports. The
+        # unpinned COM4 is enumerated but filtered out.
+        host._host_api.db.set_option("rl_comms_port", "COM3,COM5")
+        enumerated = [
+            ("COM3", "AA:BB:CC:DD:EE:01"),
+            ("COM4", "AA:BB:CC:DD:EE:02"),
+            ("COM5", "AA:BB:CC:DD:EE:03"),
+        ]
+        with mock.patch.object(
+            controller_module, "GatewaySerialTransport", _FakeTransport,
+        ), mock.patch.object(
+            _FakeTransport, "enumerate_all",
+            staticmethod(lambda: list(enumerated)),
+            create=True,
+        ):
+            host.discoverPort({}, origin="programmatic")
+
+        self.assertTrue(host.ready)
+        self.assertEqual(sorted(t.port for t in host.transports), ["COM3", "COM5"])
+        self.assertEqual(
+            sorted(t.ident_mac for t in host.transports),
+            ["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:03"],
+        )
+
+    def test_multi_pin_no_match_records_not_found(self):
+        host = _make_controller()
+        host._host_api.db.set_option("rl_comms_port", "COM98,COM99")
+        enumerated = [("COM3", "AA:BB:CC:DD:EE:01")]
+        with mock.patch.object(
+            controller_module, "GatewaySerialTransport", _FakeTransport,
+        ), mock.patch.object(
+            _FakeTransport, "enumerate_all",
+            staticmethod(lambda: list(enumerated)),
+            create=True,
+        ):
+            host.discoverPort({}, origin="auto")
+
+        self.assertFalse(host.ready)
+        self.assertEqual(host.transports, [])
+        self.assertEqual(host.last_gateway_error.get("code"), "NOT_FOUND")
 
     def test_close_all_transports_drops_every_slot(self):
         host = _make_controller()
@@ -288,6 +331,25 @@ class AutoBindPolicyTests(unittest.TestCase):
         self.assertIsNone(bound)
         # Network's gateway_mac is untouched.
         self.assertIsNone(net.gateway_mac)
+
+
+class NormalizeCommsPinsTests(unittest.TestCase):
+    """``_normalize_comms_pins`` — the rl_comms_port value parser that
+    feeds the single/multi-pin branches of ``discoverPort``."""
+
+    def test_value_forms(self):
+        f = RaceLink_Host._normalize_comms_pins
+        self.assertEqual(f(None), [])
+        self.assertEqual(f(""), [])
+        self.assertEqual(f("   "), [])
+        self.assertEqual(f("COM12"), ["COM12"])
+        self.assertEqual(f("COM12,COM13"), ["COM12", "COM13"])
+        self.assertEqual(f(" COM12 , COM13 "), ["COM12", "COM13"])
+        self.assertEqual(f("COM12,,"), ["COM12"])
+        self.assertEqual(f(["COM12", "COM13"]), ["COM12", "COM13"])
+        self.assertEqual(f('["COM12","COM13"]'), ["COM12", "COM13"])
+        self.assertEqual(f("/dev/ttyUSB0,/dev/ttyACM0"),
+                         ["/dev/ttyUSB0", "/dev/ttyACM0"])
 
 
 if __name__ == "__main__":  # pragma: no cover

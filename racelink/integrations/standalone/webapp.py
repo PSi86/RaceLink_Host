@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import threading
+import webbrowser
 from types import SimpleNamespace
 from typing import Optional
 
@@ -113,12 +117,65 @@ def create_standalone_app(config: StandaloneConfig | None = None) -> tuple[Flask
     return app, rl_app
 
 
+def _configure_logging() -> None:
+    """Send RaceLink runtime logs to the console.
+
+    Standalone mode otherwise inherits the root logger's default level
+    (WARNING), which hides the INFO-level OTA / gateway progress that
+    operators need when something goes wrong. Honour ``RACELINK_LOG_LEVEL``
+    (e.g. ``DEBUG``) for deeper traces. No-op if logging is already
+    configured (e.g. the RotorHazard plugin owns logging).
+    """
+    if logging.getLogger().handlers:
+        return
+    level_name = os.environ.get("RACELINK_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level_name, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _browser_open_requested() -> bool:
+    """Opt-in browser launch for the desktop-shortcut use case.
+
+    Enabled by the ``--open-browser`` / ``-o`` flag or
+    ``RACELINK_OPEN_BROWSER=1``. Off by default so terminal / service
+    launches don't pop a browser.
+    """
+    if os.environ.get("RACELINK_OPEN_BROWSER", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return "--open-browser" in sys.argv or "-o" in sys.argv
+
+
+def _standalone_ui_url(cfg: StandaloneConfig) -> str:
+    # A wildcard bind address isn't browsable; point the browser at loopback.
+    host = "127.0.0.1" if cfg.host in ("0.0.0.0", "::", "") else cfg.host
+    return f"http://{host}:{cfg.port}/racelink"
+
+
+def _schedule_browser_open(url: str) -> None:
+    """Open the default browser a moment after ``app.run`` binds the port."""
+    def _open():
+        try:
+            webbrowser.open(url)
+            logger.info("RaceLink: opened browser at %s", url)
+        except Exception:
+            # swallow-ok: a missing/headless browser must not break the server
+            logger.debug("could not open browser at %s", url, exc_info=True)
+    timer = threading.Timer(1.5, _open)
+    timer.daemon = True
+    timer.start()
+
+
 def run_standalone(config: StandaloneConfig | None = None):
+    _configure_logging()
     cfg = config or StandaloneConfig.load()
     app, rl_app = create_standalone_app(cfg)
     try:
         rl_app.rl_instance.onStartup({})
     except Exception as ex:  # pragma: no cover
         logger.warning("RaceLink standalone startup encountered an issue: %s", ex)
+    if _browser_open_requested():
+        _schedule_browser_open(_standalone_ui_url(cfg))
     app.run(host=cfg.host, port=cfg.port, debug=cfg.debug)
     return app, rl_app

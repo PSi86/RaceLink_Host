@@ -417,23 +417,37 @@ class FwUpdateReannounceSyncTests(FwUpdateMetaSurfaceTests):
         return rl
 
     def test_ap_close_uses_wait_for_ack(self):
-        """N1: the post-FW AP-Close must wait for ACK so we don't race
-        the device's reboot with the next AP-Open."""
+        """N1 (scoped 2026-05-19 to the error-after-AP-open case): when
+        AP-Open succeeded but a later step failed, the cleanup AP-Close
+        must wait for ACK so the frame isn't lost in the device's reboot
+        window. A clean success sends no AP-Close — the firmware-upload
+        reboot drops the AP itself (see ``test_clean_success_sends_no_ap_close``)."""
         rl = self._make_rl_with_gateway()
-        self._run(macs=["AA:BB"], rl_instance=rl)
+        ota = _ok_response()
+        ota.wled_upload_firmware.side_effect = RuntimeError("HTTP 500")
+        self._run(macs=["AA:BB"], ota=ota, rl_instance=rl)
 
-        ap_close_calls = [
-            c for c in rl.sendConfig.call_args_list
-            if c.args[:2] == (0x04,) or c.kwargs.get("data0") == 0
-        ]
-        # Each device produces one AP-Open (data0=1) and one AP-Close
-        # (data0=0). Find the AP-Close and assert wait_for_ack=True.
+        # AP-Open is data0=1, AP-Close is data0=0. The failure path must
+        # emit exactly the ACK-waiting AP-Close.
         close_call = next(
             c for c in rl.sendConfig.call_args_list
             if c.kwargs.get("data0") == 0
         )
         self.assertTrue(close_call.kwargs.get("wait_for_ack"))
-        self.assertAlmostEqual(close_call.kwargs.get("timeout_s"), 3.0, places=2)
+        self.assertAlmostEqual(close_call.kwargs.get("timeout_s"), 1.5, places=2)
+
+    def test_clean_success_sends_no_ap_close(self):
+        """The 2026-05-19 scoping decision in code form: a successful
+        upload reboots the device (which drops its AP), so no AP-Close
+        (data0=0) frame should be sent on the success path."""
+        rl = self._make_rl_with_gateway()
+        self._run(macs=["AA:BB"], rl_instance=rl)
+
+        ap_close_calls = [
+            c for c in rl.sendConfig.call_args_list
+            if c.kwargs.get("data0") == 0
+        ]
+        self.assertEqual(ap_close_calls, [])
 
     def test_waits_for_identify_then_autorestore_per_device(self):
         """N2 + N3: after each device's AP-Close, the workflow must
