@@ -223,7 +223,16 @@ class MasterStateMap:
         the controller lookup raises. This is the routing front door
         for EV_STATE_CHANGED.
         """
-        if not gateway_id or self._controller is None:
+        if not gateway_id:
+            return self.default
+        # Ethernet transports have no gateway MAC — the host NIC is the
+        # transport. Their ident encodes the network id ("ETH:<network_id>"),
+        # so route straight to that network slot instead of a MAC lookup.
+        gid = str(gateway_id)
+        if gid.startswith("ETH:"):
+            nid = gid[4:]
+            return self.for_network(nid) if nid else self.default
+        if self._controller is None:
             return self.default
         try:
             net = self._controller.network_repository.get_by_gateway_mac(gateway_id)
@@ -451,6 +460,7 @@ class SSEBridge:
                     f"RaceLink: transport event listener installed (add_listener) "
                     f"ident_mac={getattr(transport, 'ident_mac', None)!r}"
                 )
+                self._seed_master_state_from_transport(transport)
                 return
             except Exception as ex:
                 # swallow-ok: fall through to the on_event hook below.
@@ -486,6 +496,7 @@ class SSEBridge:
                 f"RaceLink: transport event hook installed "
                 f"ident_mac={getattr(transport, 'ident_mac', None)!r}"
             )
+            self._seed_master_state_from_transport(transport)
         except Exception as ex:
             # swallow-ok: SSE will operate without the transport hook
             # — events from the gateway just won't fan out to clients.
@@ -495,6 +506,33 @@ class SSEBridge:
                 f"RaceLink: transport hook failed: "
                 f"{type(ex).__name__}: {ex}"
             )
+
+    def _seed_master_state_from_transport(self, transport) -> None:
+        """Seed the per-network MasterState from a freshly-hooked transport's
+        reported state.
+
+        RF transports report ``UNKNOWN`` until their first ``STATE_REPORT``,
+        so this is a no-op for them. An Ethernet transport reports a constant
+        ``IDLE`` (the host NIC has no LoRa state machine), so seeding here makes
+        its network's master pill show ``IDLE``/ready immediately on attach
+        instead of sitting at ``UNKNOWN`` until an event that never comes.
+        """
+        try:
+            sb = int(getattr(transport, "gateway_state_byte", GATEWAY_STATE_UNKNOWN))
+        except Exception:
+            # swallow-ok: a transport without a readable state byte simply
+            # isn't seeded — it stays UNKNOWN until a real state event.
+            return
+        if sb == GATEWAY_STATE_UNKNOWN:
+            return
+        ident = getattr(transport, "ident_mac", None)
+        try:
+            meta = int(getattr(transport, "gateway_state_metadata_ms", 0) or 0)
+            self.masters.for_gateway(ident).apply_gateway_state(
+                sb, meta, source_event="HOOK_SEED",
+            )
+        except Exception:
+            logger.debug("master seed-on-hook failed", exc_info=True)
             logger.warning("transport hook failed", exc_info=True)
 
     def _task_is_running(self):

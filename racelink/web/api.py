@@ -828,10 +828,50 @@ def register_api_routes(bp, ctx):
         the bind wizard when any record is in ``conflict`` or
         ``unbound``.
         """
-        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
-        if bind_service is None:
-            return jsonify({"ok": True, "gateways": []})
-        return jsonify({"ok": True, **bind_service.snapshot()})
+        rl = ctx.rl_instance
+        bind_service = getattr(rl, "gateway_bind_service", None)
+        gateways: list = []
+        if bind_service is not None:
+            snap = bind_service.snapshot()
+            gateways = list(snap.get("gateways", []) or [])
+
+        # Surface attached Ethernet transports as ready "gateways" so the
+        # WebUI's per-gateway status bar renders a pill for them just like an
+        # RF gateway. There is no bind state machine for Ethernet (the host
+        # NIC is the transport, no gateway MAC), so the record is synthesised
+        # as a permanently-``bound`` entry; its RF/link state comes from the
+        # per-network MasterState (constant IDLE) via the ``master`` payload.
+        net_repo = getattr(rl, "network_repository", None)
+        for t in (getattr(rl, "transports", None) or []):
+            if getattr(t, "kind", "rf") != "ethernet":
+                continue
+            nid = str(getattr(t, "network_id", "") or "")
+            ident = str(getattr(t, "ident_mac", "") or "") or (f"ETH:{nid}" if nid else "")
+            if not ident:
+                continue
+            name = None
+            if net_repo is not None and nid:
+                try:
+                    net = net_repo.get_by_id(nid)
+                    name = str(getattr(net, "name", "") or "") or None
+                except Exception:
+                    # swallow-ok: the label is cosmetic — fall back to the
+                    # ident if the repo lookup hiccups.
+                    name = None
+            gateways.append({
+                "ident_mac": ident,
+                "state": "bound",
+                "network_id": nid or None,
+                "network_name": name,
+                "rf_config_actual": None,
+                "rf_config_expected": None,
+                "conflict_fields": [],
+                "migration_pending": False,
+                "last_evaluated_ts": 0.0,
+                "token": "",
+                "kind": "ethernet",
+            })
+        return jsonify({"ok": True, "gateways": gateways})
 
     @bp.route("/api/networks/<network_id>/migrate", methods=["POST"])
     def api_network_migrate(network_id: str):
@@ -1238,6 +1278,19 @@ def register_api_routes(bp, ctx):
         transports = list(getattr(rl, "transports", None) or ())
         results = []
         for t in transports:
+            # Ethernet transports have no LoRa state machine to query — they
+            # report a constant IDLE. Return that snapshot directly so the ↻
+            # refresh doesn't reset their pill to UNKNOWN waiting for a
+            # STATE_REPORT that never arrives.
+            if getattr(t, "kind", "rf") == "ethernet":
+                snap = (
+                    t.gateway_state_snapshot()
+                    if hasattr(t, "gateway_state_snapshot") else {}
+                )
+                r = dict(snap)
+                r["ident_mac"] = str(getattr(t, "ident_mac", "") or "") or None
+                results.append(r)
+                continue
             r = query(transport=t)
             if isinstance(r, dict):
                 r = dict(r)

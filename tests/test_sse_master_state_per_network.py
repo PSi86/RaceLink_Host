@@ -22,6 +22,7 @@ from racelink.state.migrations import DEFAULT_NETWORK_ID
 from racelink.transport import (
     EV_STATE_CHANGED,
     EV_STATE_REPORT,
+    GATEWAY_STATE_IDLE,
     GATEWAY_STATE_NAME,
     GATEWAY_STATE_RX_WINDOW,
 )
@@ -222,6 +223,68 @@ class SSEBridgeMultiTransportTests(unittest.TestCase):
         ctrl._transports = [t_a2]
         bridge.rebind_transport(ctrl)
         self.assertIn(bridge.on_transport_event, t_a2._listeners)
+
+
+class _FakeEthTransport:
+    """Mimics an attached EthernetTransport for the seed-on-hook path."""
+
+    kind = "ethernet"
+
+    def __init__(self, network_id, state_byte=GATEWAY_STATE_IDLE):
+        self.network_id = network_id
+        self.ident_mac = f"ETH:{network_id}"
+        self.gateway_state_byte = state_byte
+        self.gateway_state_metadata_ms = 0
+        self._listeners = []
+
+    def add_listener(self, cb):
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def gateway_state_snapshot(self):
+        return {
+            "state_byte": self.gateway_state_byte,
+            "state": GATEWAY_STATE_NAME.get(self.gateway_state_byte, "UNKNOWN"),
+            "state_metadata_ms": 0,
+        }
+
+
+class EthernetMasterStateTests(unittest.TestCase):
+    """Ethernet PoC: the host NIC presents as a ready 'gateway'."""
+
+    def test_for_gateway_routes_eth_ident_to_network_slot(self):
+        m = MasterStateMap(lambda ev, payload: None)
+        # No repo lookup needed — the network id is encoded in the ident.
+        slot = m.for_gateway("ETH:net-eth-1")
+        self.assertIsInstance(slot, MasterState)
+        self.assertIsNot(slot, m.default)
+        # Same ident resolves to the same slot.
+        self.assertIs(m.for_gateway("ETH:net-eth-1"), slot)
+        # A different ethernet network gets a distinct slot.
+        self.assertIsNot(m.for_gateway("ETH:net-eth-2"), slot)
+
+    def test_hooking_ethernet_transport_seeds_idle(self):
+        bridge = SSEBridge(logger=None)
+        t_eth = _FakeEthTransport("net-eth-1")
+        ctrl = _FakeController(transports=[t_eth])
+        bridge.ensure_transport_hooked(ctrl)
+        # Listener attached + master slot seeded to IDLE (not UNKNOWN).
+        self.assertIn(bridge.on_transport_event, t_eth._listeners)
+        snap = bridge.masters.snapshot()
+        rows = {row["network_id"]: row for row in snap["networks"]}
+        self.assertIn("net-eth-1", rows)
+        self.assertEqual(rows["net-eth-1"]["state"], "IDLE")
+
+    def test_rf_transport_without_state_is_not_seeded(self):
+        # A plain transport reporting no state (UNKNOWN) must not be
+        # force-seeded — RF stays UNKNOWN until its first STATE_REPORT.
+        bridge = SSEBridge(logger=None)
+        t_rf = _FakeTransport(ident_mac="GW-A")  # no gateway_state_byte attr
+        ctrl = _FakeController(transports=[t_rf])
+        bridge.ensure_transport_hooked(ctrl)
+        snap = bridge.masters.snapshot()
+        # Only the eagerly-created default slot, still UNKNOWN.
+        self.assertEqual(snap["networks"][0]["state"], "UNKNOWN")
 
 
 class MasterMapBackCompatTests(unittest.TestCase):

@@ -1746,5 +1746,94 @@ class NetworkCreateRouteTests(unittest.TestCase):
         self.assertIn("ethernet", result[0]["error"])
 
 
+# ---------------------------------------------------------------------
+# Ethernet transport presents as a "gateway" (Ethernet PoC follow-up)
+# ---------------------------------------------------------------------
+
+class _EthGatewayContext(_FakeContext):
+    """Context whose controller has one attached Ethernet transport, so the
+    /api/gateways + query-state routes surface it as a ready gateway."""
+
+    def __init__(self):
+        super().__init__()
+
+        class _Net:
+            kind = "ethernet"
+
+            def __init__(self, nid, name):
+                self.id = nid
+                self.name = name
+
+        class _NetRepo:
+            def __init__(self, nets):
+                self._nets = nets
+
+            def list(self):
+                return list(self._nets)
+
+            def get_by_id(self, nid):
+                for n in self._nets:
+                    if str(n.id) == str(nid):
+                        return n
+                return None
+
+        class _EthT:
+            kind = "ethernet"
+
+            def __init__(self, nid):
+                self.network_id = nid
+                self.ident_mac = f"ETH:{nid}"
+                self.gateway_state_byte = 0
+                self.gateway_state_metadata_ms = 0
+
+            def gateway_state_snapshot(self):
+                return {"state_byte": 0, "state": "IDLE", "state_metadata_ms": 0}
+
+        class _GW:
+            @staticmethod
+            def query_state(transport=None):
+                # Should never be called for an Ethernet transport.
+                return {"state": "UNKNOWN"}
+
+        net = _Net("net-eth-1", "Wired")
+
+        class _RL:
+            network_repository = _NetRepo([net])
+            gateway_service = _GW()
+            transports = [_EthT("net-eth-1")]
+            uiPresetList = []
+
+        self.rl_instance = _RL()
+
+
+class EthernetGatewayPresenceTests(unittest.TestCase):
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self.bp = _FakeBlueprint()
+        self.ctx = _EthGatewayContext()
+        self.api_module.register_api_routes(self.bp, self.ctx)
+
+    def test_gateways_list_includes_synthetic_ethernet_record(self):
+        result = self.bp.routes[("/api/gateways", ("GET",))]()
+        self.assertTrue(result["ok"])
+        gws = result["gateways"]
+        self.assertEqual(len(gws), 1)
+        rec = gws[0]
+        self.assertEqual(rec["ident_mac"], "ETH:net-eth-1")
+        self.assertEqual(rec["state"], "bound")
+        self.assertEqual(rec["network_id"], "net-eth-1")
+        self.assertEqual(rec["network_name"], "Wired")
+
+    def test_query_state_returns_idle_for_ethernet(self):
+        result = self.bp.routes[("/api/gateways/query-state", ("POST",))]()
+        self.assertTrue(result["ok"])
+        gws = result["gateways"]
+        self.assertEqual(len(gws), 1)
+        self.assertEqual(gws[0]["ident_mac"], "ETH:net-eth-1")
+        self.assertEqual(gws[0]["state"], "IDLE")
+
+
 if __name__ == "__main__":
     unittest.main()
