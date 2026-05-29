@@ -950,5 +950,60 @@ class MigrateGroupsToTests(unittest.TestCase):
         self.assertEqual(res["groups_flipped"], [0])
 
 
+class CrossKindMigrationGuardTests(unittest.TestCase):
+    """Block D: RF migration must refuse to cross network kinds."""
+
+    def test_migrate_groups_to_ethernet_target_rejected_no_flip(self):
+        net_rf = RL_Network(id="net-rf", name="Track A", kind="rf",
+                            gateway_mac="GW-A", rf_config=dict(_OLD_CFG))
+        net_eth = RL_Network(id="net-eth", name="Stage LAN", kind="ethernet")
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-rf")
+        dev_1 = _device("AABBCC111111", network_id="net-rf", link_online=True)
+        dev_1.groupId = 0
+        _ctrl, gw, svc = _make_membership_service(
+            networks=[net_rf, net_eth], groups=[team_a], devices=[dev_1],
+        )
+
+        res = svc.migrate_groups_to("net-eth", [0])
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage"], "validate")
+        self.assertEqual(res["detail"]["code"], "network_kind_mismatch")
+        # Nothing was touched: no wire pushes, no group flip, no device flip.
+        self.assertEqual(gw.node_calls, [])
+        self.assertEqual(res["groups_flipped"], [])
+        self.assertEqual(team_a.network_id, "net-rf")
+        self.assertEqual(dev_1.network_id, "net-rf")
+
+    def test_migrate_network_to_non_rf_network_rejected(self):
+        net_eth = RL_Network(id="net-eth", name="Stage LAN", kind="ethernet")
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_eth], groups=[], devices=[],
+        )
+
+        res = svc.migrate_network_to("net-eth", dict(_NEW_CFG))
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage"], "validate")
+        self.assertEqual(res["detail"]["code"], "network_kind_mismatch")
+
+    def test_migrate_groups_to_same_rf_kind_still_works(self):
+        # Regression guard: the new check must not block legitimate
+        # RF -> RF group moves.
+        net_a = RL_Network(id="net-a", name="A", kind="rf",
+                           gateway_mac="GW-A", rf_config=dict(_OLD_CFG))
+        net_b = RL_Network(id="net-b", name="B", kind="rf",
+                           gateway_mac="GW-B", rf_config=dict(_TARGET_CFG))
+        team_a = RL_DeviceGroup(name="Team A", static_group=0, dev_type=0,
+                                network_id="net-a")
+        _ctrl, _gw, svc = _make_membership_service(
+            networks=[net_a, net_b], groups=[team_a], devices=[],
+        )
+        res = svc.migrate_groups_to("net-b", [0])
+        self.assertTrue(res["ok"])
+        self.assertEqual(team_a.network_id, "net-b")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

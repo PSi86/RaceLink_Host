@@ -1378,10 +1378,11 @@ class _MigrationRouteContext(_FakeContext):
     only — the service-level tests in test_rf_migration_service.py
     cover the actual migration outcomes)."""
 
-    def __init__(self, *, devices=None, groups=None):
+    def __init__(self, *, devices=None, groups=None, networks=None):
         super().__init__()
         self._fake_devs = list(devices or [])
         self._fake_groups = list(groups or [])
+        self._fake_networks = list(networks or [])
 
         # Tasks: record start + meta, never actually run the runner.
         started: list = []
@@ -1450,8 +1451,16 @@ class _MigrationRouteContext(_FakeContext):
             def list(self):
                 return list(self._items)
 
+        class _NetRepo(_Repo):
+            def get_by_id(self, network_id):
+                for n in self._items:
+                    if str(getattr(n, "id", "") or "") == str(network_id):
+                        return n
+                return None
+
         ctx_devs = self._fake_devs
         ctx_groups = self._fake_groups
+        ctx_networks = self._fake_networks
 
         class _RL:
             rf_migration_service = _MigrationService
@@ -1466,6 +1475,13 @@ class _MigrationRouteContext(_FakeContext):
                     if str(getattr(d, "addr", "") or "").upper() == target:
                         return d
                 return None
+
+        # Only attach a network_repository when the test supplies networks —
+        # the endpoint's cross-kind guard is best-effort and must degrade
+        # gracefully when the repo is absent (older deployments / minimal
+        # fakes).
+        if ctx_networks:
+            _RL.network_repository = _NetRepo(ctx_networks)
 
         self.rl_instance = _RL()
         self.migration_service = _MigrationService
@@ -1485,9 +1501,11 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         self._flask_request = sys.modules["flask"].request
         self._flask_request.get_json = lambda silent=True: {}
 
-    def _make(self, *, devices=None, groups=None):
+    def _make(self, *, devices=None, groups=None, networks=None):
         bp = _FakeBlueprint()
-        ctx = _MigrationRouteContext(devices=devices or [], groups=groups or [])
+        ctx = _MigrationRouteContext(
+            devices=devices or [], groups=groups or [], networks=networks or [],
+        )
         self.api_module.register_api_routes(bp, ctx)
         return bp, ctx
 
@@ -1541,6 +1559,30 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         result = self._route(bp)()
         self.assertEqual(result[1], 404)
         self.assertIn("unknown group_id", result[0]["error"])
+
+    def test_cross_kind_migration_returns_400(self):
+        # An RF group migrating onto an Ethernet network is rejected
+        # synchronously with the structured network_kind_mismatch detail,
+        # before any task is started.
+        from racelink.domain.models import RL_Network
+
+        groups = [RL_DeviceGroup("Team A", static_group=0, dev_type=0,
+                                 network_id="net-rf")]
+        networks = [
+            RL_Network(id="net-rf", name="Track A", kind="rf"),
+            RL_Network(id="net-eth", name="Stage LAN", kind="ethernet"),
+        ]
+        bp, ctx = self._make(groups=groups, networks=networks)
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-eth",
+            "offline_mode": "skip",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertEqual(result[0]["detail"]["code"], "network_kind_mismatch")
+        # No migration task was kicked off.
+        self.assertEqual(ctx.tasks_started, [])
 
     def test_block_mode_rejects_offline_member_with_structured_detail(self):
         groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]

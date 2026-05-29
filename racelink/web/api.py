@@ -29,6 +29,7 @@ from ..domain.network_boundary import (
     NetworkBoundaryViolation,
     SceneScopeViolation,
     validate_group_membership,
+    validate_network_kind_match,
     validate_scene_scope_consistency,
 )
 from ..domain.node_config import serialize_node_config_schema
@@ -899,6 +900,35 @@ def register_api_routes(bp, ctx):
                     "ok": False,
                     "error": f"unknown group_id(s): {unknown}",
                 }), 404
+
+            # Cross-kind guard: a group on an RF network cannot migrate onto
+            # an Ethernet network (or vice versa). Reject synchronously with
+            # HTTP 400 before launching the task — clearer than letting the
+            # RF-specific migration fail mid-flight. Best-effort: target
+            # existence is left to the service (which returns a failed task
+            # for an unknown id); this only fires when we can resolve both
+            # ends, and rf_migration_service.migrate_groups_to is the
+            # authoritative backstop.
+            net_repo = getattr(ctx.rl_instance, "network_repository", None)
+            target_net = net_repo.get_by_id(target_network_id) if net_repo else None
+            if target_net is not None:
+                source_ids = {
+                    str(getattr(groups_list[gid], "network_id", "") or "")
+                    for gid in clean_gids
+                }
+                source_ids.discard("")
+                try:
+                    validate_network_kind_match(
+                        target_net,
+                        [net_repo.get_by_id(nid) for nid in source_ids],
+                    )
+                except NetworkBoundaryViolation as exc:
+                    return jsonify({
+                        "ok": False,
+                        "error": exc.reason,
+                        "detail": exc.detail,
+                    }), 400
+
             gid_set = set(clean_gids)
             for dev in (ctx.rl_instance.device_repository.list() or ()):
                 if int(getattr(dev, "groupId", 0) or 0) not in gid_set:
