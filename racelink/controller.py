@@ -994,6 +994,12 @@ class RaceLink_Host:
                     "RaceLink: failed to attach Ethernet transport for network %s",
                     getattr(net, "id", "?"),
                 )
+        if count:
+            # Re-hook subscribers (SSEBridge) onto the new transport(s) so the
+            # per-network MasterState gets seeded (Ethernet → IDLE) and the
+            # gateway pill renders. discoverPort also fires this after its RF
+            # loop; the API-create path relies on this call.
+            self._fire_transport_rebind()
         return count
 
     def _handle_no_rf_gateway(self, *, reason: str, origin: str, code: str) -> None:
