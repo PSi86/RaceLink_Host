@@ -227,6 +227,7 @@ class RL_Network:
         rf_config: Optional[dict] = None,
         created_ts: Optional[float] = None,
         kind: str = NETWORK_KIND_RF,
+        eth_config: Optional[dict] = None,
     ):
         self.id: str = str(id) if id else str(uuid.uuid4())
         self.name: str = str(name)
@@ -235,6 +236,10 @@ class RL_Network:
         self.region: str = str(region)
         self.channel_id: Optional[int] = int(channel_id) if channel_id is not None else None
         self.rf_config: Optional[dict] = dict(rf_config) if isinstance(rf_config, dict) else None
+        # Ethernet-kind networks carry IP transport settings here (node/host
+        # UDP ports, bind/broadcast host, discovery mode) — the symmetric
+        # counterpart to ``rf_config`` for RF networks. ``None`` for RF.
+        self.eth_config: Optional[dict] = dict(eth_config) if isinstance(eth_config, dict) else None
         self.created_ts: float = float(created_ts) if created_ts is not None else time.time()
 
     @staticmethod

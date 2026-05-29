@@ -274,6 +274,9 @@ export interface NetworkSummary {
   region: string | null
   channel_id: number | string | null
   rf_config: Record<string, unknown> | null
+  /** IP transport settings for `kind === 'ethernet'` networks (node/host UDP
+   *  ports, bind/broadcast host, discovery mode); `null` for RF networks. */
+  eth_config?: Record<string, unknown> | null
   created_ts: number | null
   live?: MasterSnapshot | null
 }

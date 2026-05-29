@@ -1845,6 +1845,15 @@ class GatewayService:
                         if not dev:
                             dev_type = ev.get("caps", 0)
                             dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=default_device_name(mac12))
+                            # Stamp the network for devices discovered over an
+                            # Ethernet transport so status routing + isolation
+                            # work (gateway_id == "ETH:<network_id>"). RF devices
+                            # keep their existing (None -> later-assigned) path.
+                            gid = ev.get("gateway_id")
+                            if isinstance(gid, str) and gid.startswith("ETH:"):
+                                eth_nid = gid[4:]
+                                if eth_nid:
+                                    dev.network_id = eth_nid
                             self.controller.device_repository.append(dev)
 
                         dev.update_from_identify(

@@ -38,7 +38,12 @@ from racelink.state.persistence import (
     load_state,
     try_parse_legacy_repr,
 )
-from racelink.transport import GatewaySerialTransport, LP, mac_last3_from_hex
+from racelink.transport import (
+    EthernetTransport,
+    GatewaySerialTransport,
+    LP,
+    mac_last3_from_hex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -693,6 +698,7 @@ class RaceLink_Host:
                     region=str(net.get("region") or "EU868"),
                     channel_id=net.get("channel_id"),
                     rf_config=net.get("rf_config"),
+                    eth_config=net.get("eth_config"),
                     created_ts=net.get("created_ts"),
                 ))
             except Exception:
@@ -870,9 +876,22 @@ class RaceLink_Host:
                 )
             return None
         self._transports.append(transport)
-        bound_id = self._bind_transport_to_network(transport)
+        # Ethernet transports carry their ``network_id`` directly (the host NIC
+        # is the transport — there is no gateway MAC to bind against). Skip the
+        # MAC-based auto-bind, which would otherwise clear the pre-stamped
+        # network_id, and the RF-only gateway bind-service evaluation below.
+        is_ethernet = getattr(transport, "kind", "rf") == "ethernet"
+        if is_ethernet:
+            bound_id = getattr(transport, "network_id", None) or None
+        else:
+            bound_id = self._bind_transport_to_network(transport)
         # Install hooks per-transport (Part 3 made this per-id idempotent).
         self._install_transport_hooks(transport)
+        if is_ethernet:
+            # No RF bind state machine and no gateway state to probe for
+            # Ethernet (constant IDLE) — attach is complete here.
+            self._clear_gateway_error()
+            return bound_id
         # Stage 3 Part D: run the bind state machine. The service
         # probes the gateway's NVS RF config and broadcasts the
         # ``gateway_bound`` / ``gateway_conflict`` / ``gateway_unbound``
@@ -918,6 +937,87 @@ class RaceLink_Host:
         # the on_gateway_status_changed callback so the banner clears.
         self._clear_gateway_error()
         return bound_id
+
+    # ---- Ethernet transport attach (Ethernet PoC) ------------------------
+
+    @staticmethod
+    def _eth_transport_kwargs(eth_config) -> dict:
+        """Map a network's ``eth_config`` dict to ``EthernetTransport`` kwargs.
+
+        Only known keys are forwarded so a forward-compatible config (extra
+        fields) never trips the constructor. Missing keys fall back to the
+        transport's own defaults.
+        """
+        cfg = eth_config if isinstance(eth_config, dict) else {}
+        allowed = ("node_port", "host_port", "bind_host", "broadcast_host", "discovery")
+        return {k: cfg[k] for k in allowed if k in cfg and cfg[k] is not None}
+
+    def _attach_ethernet_transports(self) -> int:
+        """Attach one ``EthernetTransport`` per persisted ``kind="ethernet"``
+        network. Returns the number attached.
+
+        Runs alongside (not instead of) the RF enumerate path: the host NIC is
+        the transport, so there is no USB probe — each Ethernet network maps to
+        exactly one UDP transport bound from its ``eth_config``. The duplicate
+        guard in :meth:`_attach_transport` (keyed on the ``ETH:<id>`` ident)
+        keeps a re-run from double-attaching.
+        """
+        count = 0
+        try:
+            networks = list(self.network_repository.list())
+        except Exception:
+            logger.debug("RaceLink: network_repository.list raised in _attach_ethernet_transports", exc_info=True)
+            networks = []
+        for net in networks:
+            if getattr(net, "kind", "rf") != "ethernet":
+                continue
+            try:
+                t = EthernetTransport(
+                    network_id=str(getattr(net, "id", "") or ""),
+                    on_event=None,
+                    **self._eth_transport_kwargs(getattr(net, "eth_config", None)),
+                )
+                if not t.discover_and_open():
+                    logger.warning(
+                        "RaceLink: Ethernet transport for network %s failed to bind",
+                        getattr(net, "id", "?"),
+                    )
+                    continue
+                self._attach_transport(t)
+                count += 1
+                logger.info(
+                    "RaceLink: Ethernet transport attached for network %s (%s) on %s",
+                    getattr(net, "id", "?"), getattr(net, "name", "?"), t.port,
+                )
+            except Exception:
+                logger.exception(
+                    "RaceLink: failed to attach Ethernet transport for network %s",
+                    getattr(net, "id", "?"),
+                )
+        return count
+
+    def _handle_no_rf_gateway(self, *, reason: str, origin: str, code: str) -> None:
+        """RF enumerate found nothing. If an Ethernet transport is attached the
+        host is still ``ready`` (Ethernet-only deployment); otherwise record the
+        RF gateway error as before.
+        """
+        has_ethernet = any(
+            getattr(t, "kind", "rf") == "ethernet" for t in self._transports
+        )
+        if has_ethernet:
+            self.ready = True
+            self._link_recovery_pending = False
+            self._clear_gateway_error()
+            self._fire_transport_rebind()
+            logger.info(
+                "RaceLink: no RF gateway found, but %d Ethernet transport(s) "
+                "attached — host ready via Ethernet",
+                sum(1 for t in self._transports if getattr(t, "kind", "rf") == "ethernet"),
+            )
+            return
+        self._record_gateway_error(reason=reason, origin=origin, code=code)
+        if origin == "manual":
+            self._notify(self._translate(reason))
 
     def format_gateway_label(self, gateway_id) -> str:
         """Compact human label for log prefixing: ``[#0 1C:10/Pit-Lane]``.
@@ -1110,6 +1210,12 @@ class RaceLink_Host:
             # the fresh transport instances.
             self._transport_hooks_installed_for.clear()
 
+            # Ethernet transports attach independently of the RF enumerate
+            # path (host NIC = transport, no USB probe). Run this first so an
+            # Ethernet-only deployment is ``ready`` even when no RF gateway is
+            # present (see ``_handle_no_rf_gateway``).
+            self._attach_ethernet_transports()
+
             if len(pinned_ports) == 1:
                 # Single manual pin — preserve the legacy single-port path.
                 # ``discover_and_open`` with an explicit port skips the
@@ -1136,11 +1242,9 @@ class RaceLink_Host:
                             self._notify(self._translate(reason))
                         return
                     reason = "No RaceLink Gateway module discovered or configured"
-                    self._record_gateway_error(
+                    self._handle_no_rf_gateway(
                         reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
                     )
-                    if origin == "manual":
-                        self._notify(self._translate(reason))
                     return
                 bound_id = self._attach_transport(t)
                 self.ready = True
@@ -1183,11 +1287,9 @@ class RaceLink_Host:
 
             if not gateways:
                 reason = "No RaceLink Gateway module discovered or configured"
-                self._record_gateway_error(
+                self._handle_no_rf_gateway(
                     reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
                 )
-                if origin == "manual":
-                    self._notify(self._translate(reason))
                 return
 
             opened_count = 0
@@ -1236,11 +1338,9 @@ class RaceLink_Host:
 
             if opened_count == 0:
                 reason = "No RaceLink Gateway module discovered or configured"
-                self._record_gateway_error(
+                self._handle_no_rf_gateway(
                     reason=reason, origin=origin, code=GW_ERR_NOT_FOUND,
                 )
-                if origin == "manual":
-                    self._notify(self._translate(reason))
                 return
 
             self.ready = True

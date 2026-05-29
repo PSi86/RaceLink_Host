@@ -226,6 +226,69 @@ class TransportForNetworkRoutingTests(unittest.TestCase):
         self.assertIs(host.transport_for_network(net.id), t_direct)
 
 
+class EthernetTransportAttachTests(unittest.TestCase):
+    """Ethernet PoC: ``_attach_ethernet_transports`` binds one UDP transport
+    per ``kind="ethernet"`` network, routes via the stamped network_id, and
+    keeps the host ``ready`` even with no RF gateway present."""
+
+    def _make_controller(self):
+        from racelink.controller import RaceLink_Host
+
+        class _FakeHostApi:
+            class _Db:
+                def option(self, key, default=None):
+                    return default
+
+                def set_option(self, key, value):
+                    pass
+
+            def __init__(self):
+                self.db = _FakeHostApi._Db()
+
+            def fire_event(self, *_a, **_kw):
+                pass
+
+            def log(self, *_a, **_kw):
+                pass
+
+        return RaceLink_Host(_FakeHostApi(), "test", "Test")
+
+    def test_attach_routes_and_ready_without_rf(self):
+        from racelink.domain.models import RL_Network
+
+        host = self._make_controller()
+        # The runtime state repository is a process-wide singleton, so isolate
+        # this test's network set (and restore it afterwards) to keep the
+        # attach count deterministic regardless of leftovers from sibling tests.
+        repo = host.network_repository
+        original = list(repo.list())
+        # host_port=0 -> OS-assigned ephemeral port, no cross-test clash.
+        net = RL_Network(
+            name="Stage LAN", kind="ethernet",
+            eth_config={"host_port": 0, "bind_host": "127.0.0.1"},
+        )
+        repo.replace_all([net])
+
+        try:
+            count = host._attach_ethernet_transports()
+            self.assertEqual(count, 1)
+            self.assertEqual(len(host.transports), 1)
+            t = host.transports[0]
+            self.assertEqual(getattr(t, "kind", None), "ethernet")
+            self.assertEqual(t.network_id, net.id)
+            # Routing resolves via the directly-stamped network_id.
+            self.assertIs(host.transport_for_network(net.id), t)
+
+            # No RF gateway found -> Ethernet keeps the host ready.
+            host._handle_no_rf_gateway(
+                reason="none", origin="programmatic", code="NOT_FOUND",
+            )
+            self.assertTrue(host.ready)
+        finally:
+            host._close_all_transports()
+            repo.replace_all(original)
+
+
 class PendingMatcherRegistryGatewayIdEnforcementTests(unittest.TestCase):
     """Stage 3 Part C contract: the registry refuses to admit a
     concrete-sender matcher without a ``gateway_id``.

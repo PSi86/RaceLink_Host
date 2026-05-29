@@ -505,6 +505,7 @@ def register_api_routes(bp, ctx):
                     "region": getattr(net, "region", None),
                     "channel_id": getattr(net, "channel_id", None),
                     "rf_config": getattr(net, "rf_config", None),
+                    "eth_config": getattr(net, "eth_config", None),
                     "created_ts": getattr(net, "created_ts", None),
                     "live": live_by_id.get(nid),
                 })
@@ -512,6 +513,84 @@ def register_api_routes(bp, ctx):
             "ok": True,
             "networks": rows,
             "default_network_id": masters_snap.get("default_network_id"),
+        })
+
+    @bp.route("/api/networks", methods=["POST"])
+    def api_network_create():
+        """Create a new Ethernet-kind network (Ethernet PoC).
+
+        RF networks are created via the gateway-bind wizard (they need a
+        probed ``rf_config``); this endpoint is the lightweight seed for an
+        IP/LAN network. Body::
+
+            {name, kind:"ethernet", node_port?, host_port?, bind_host?,
+             broadcast_host?, discovery?}
+
+        On success the network is persisted and its ``EthernetTransport`` is
+        attached immediately (no full gateway rediscover needed).
+        """
+        from ..domain.models import RL_Network
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        kind = str(body.get("kind") or "ethernet").strip().lower()
+        if kind != "ethernet":
+            return jsonify({
+                "ok": False,
+                "error": "only kind='ethernet' networks can be created here "
+                         "(RF networks are created via the gateway bind wizard)",
+            }), 400
+
+        def _int(key, default):
+            try:
+                return int(body.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        eth_config = {
+            "node_port": _int("node_port", 5078),
+            "host_port": _int("host_port", 5079),
+            "bind_host": str(body.get("bind_host") or "0.0.0.0"),
+            "broadcast_host": str(body.get("broadcast_host") or "255.255.255.255"),
+            "discovery": str(body.get("discovery") or "broadcast"),
+        }
+        net = RL_Network(name=name, kind="ethernet", eth_config=eth_config)
+        with ctx.rl_lock:
+            net_repo.append(net)
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_create: save_to_db failed")
+
+        # Attach the Ethernet transport now so discovery can run immediately.
+        # Best-effort + idempotent (the attach path dedupes on the ETH ident).
+        attach = getattr(rl, "_attach_ethernet_transports", None)
+        if callable(attach):
+            try:
+                attach()
+            except Exception:
+                logger.exception("api_network_create: ethernet transport attach raised")
+
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({
+            "ok": True,
+            "network": {
+                "id": net.id,
+                "name": net.name,
+                "kind": net.kind,
+                "gateway_mac": None,
+                "region": None,
+                "channel_id": None,
+                "rf_config": None,
+                "eth_config": net.eth_config,
+                "created_ts": net.created_ts,
+            },
         })
 
     @bp.route("/api/networks/<network_id>", methods=["PUT"])

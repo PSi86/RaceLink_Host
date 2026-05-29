@@ -1657,5 +1657,94 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 0)
 
 
+# ---------------------------------------------------------------------
+# POST /api/networks — create an Ethernet-kind network (Ethernet PoC)
+# ---------------------------------------------------------------------
+
+class _NetworkCreateContext(_FakeContext):
+    def __init__(self):
+        super().__init__()
+        nets: list = []
+
+        class _NetRepo:
+            def list(self):
+                return list(nets)
+
+            def append(self, n):
+                nets.append(n)
+
+            def get_by_id(self, nid):
+                for n in nets:
+                    if str(getattr(n, "id", "")) == str(nid):
+                        return n
+                return None
+
+        saved: list = []
+
+        class _RL:
+            network_repository = _NetRepo()
+            uiPresetList = []
+
+            @staticmethod
+            def save_to_db(args, scopes=None):
+                saved.append((dict(args or {}), scopes))
+
+        self.rl_instance = _RL()
+        self.nets = nets
+        self.saved = saved
+        # _sse_refresh -> ctx.sse.broadcast; record refreshes as no-op.
+        self.sse = type("SSE", (), {"broadcast": staticmethod(lambda *a, **k: None)})()
+
+
+class NetworkCreateRouteTests(unittest.TestCase):
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+
+    def _make(self):
+        bp = _FakeBlueprint()
+        ctx = _NetworkCreateContext()
+        self.api_module.register_api_routes(bp, ctx)
+        return bp, ctx
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    def _route(self, bp):
+        return bp.routes[("/api/networks", ("POST",))]
+
+    def test_create_ethernet_network(self):
+        bp, ctx = self._make()
+        self._set_body({"name": "Stage LAN", "kind": "ethernet", "node_port": 5078})
+        result = self._route(bp)()
+        # tuple => error; dict => success payload
+        self.assertTrue(result["ok"])
+        net = result["network"]
+        self.assertEqual(net["kind"], "ethernet")
+        self.assertEqual(net["name"], "Stage LAN")
+        self.assertEqual(net["eth_config"]["node_port"], 5078)
+        # persisted + appended to the repo
+        self.assertEqual(len(ctx.nets), 1)
+        self.assertTrue(ctx.saved)
+
+    def test_missing_name_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"kind": "ethernet"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("name required", result[0]["error"])
+
+    def test_rf_kind_rejected(self):
+        bp, _ctx = self._make()
+        self._set_body({"name": "Track A", "kind": "rf"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("ethernet", result[0]["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

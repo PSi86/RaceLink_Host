@@ -46,6 +46,7 @@ __all__ = [
     "TX_REJECT_UNKNOWN",
     "TX_REJECT_ZEROLEN",
     "GatewaySerialTransport",
+    "EthernetTransport",
     "mac_last3_from_hex",
     "u16le",
 ]
@@ -56,4 +57,8 @@ def __getattr__(name):
         from .gateway_serial import GatewaySerialTransport
 
         return GatewaySerialTransport
+    if name == "EthernetTransport":
+        from .ethernet_transport import EthernetTransport
+
+        return EthernetTransport
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
