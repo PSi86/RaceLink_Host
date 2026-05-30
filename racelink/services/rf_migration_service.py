@@ -57,6 +57,11 @@ import logging
 import time
 from typing import Iterable, Optional
 
+from ..domain.network_boundary import (
+    NetworkBoundaryViolation,
+    validate_network_kind_match,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -171,6 +176,27 @@ class RfMigrationService:
                 "ok": False,
                 "stage": "validate",
                 "error": f"unknown network_id {network_id!r}",
+                "summary": {},
+            }
+        # RF re-config only makes sense on an RF network — an Ethernet (or
+        # other non-RF) network has no radio to re-flash.
+        net_kind = str(getattr(network, "kind", "rf") or "rf").strip().lower()
+        if net_kind != "rf":
+            return {
+                "ok": False,
+                "stage": "validate",
+                "error": (
+                    f"network {network_id!r} is a '{net_kind}' network — "
+                    "RF migration only applies to RF networks"
+                ),
+                "detail": {
+                    "code": "network_kind_mismatch",
+                    "target_kind": "rf",
+                    "target_network_id": str(network_id),
+                    "source_networks": [
+                        {"network_id": str(network_id), "kind": net_kind}
+                    ],
+                },
                 "summary": {},
             }
         try:
@@ -726,6 +752,33 @@ class RfMigrationService:
                 "ok": False,
                 "stage": "validate",
                 "error": f"unknown group_id(s): {unknown_gids}",
+                "group_ids": clean_gids,
+                "groups_flipped": [],
+                "summary": {},
+                "per_device": [],
+                "stranded": [],
+            }
+
+        # Cross-kind guard (defense-in-depth; the web layer pre-checks too).
+        # Bail BEFORE collecting members or flipping any group.network_id so
+        # a rejected move leaves all state untouched.
+        repo = self.controller.network_repository
+        source_nets = []
+        seen_src: set = set()
+        for _gid, grp in resolved_groups:
+            nid = str(getattr(grp, "network_id", "") or "")
+            if not nid or nid in seen_src:
+                continue
+            seen_src.add(nid)
+            source_nets.append(repo.get_by_id(nid))
+        try:
+            validate_network_kind_match(target_net, source_nets)
+        except NetworkBoundaryViolation as exc:
+            return {
+                "ok": False,
+                "stage": "validate",
+                "error": exc.reason,
+                "detail": exc.detail,
                 "group_ids": clean_gids,
                 "groups_flipped": [],
                 "summary": {},

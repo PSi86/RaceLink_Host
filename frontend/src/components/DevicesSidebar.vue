@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { ArrowUpDown, Pencil } from 'lucide-vue-next'
 
+import NetworkKindIcon from '@/components/NetworkKindIcon.vue'
 import { useGroupsStore } from '@/stores/groups'
 import { useDevicesStore } from '@/stores/devices'
 import { useNetworksStore } from '@/stores/networks'
@@ -168,6 +169,10 @@ function groupNetworkLabel(g: Group): string {
   return networks.nameOf(g.network_id ?? networks.defaultNetworkId)
 }
 
+function groupNetworkKind(g: Group): 'rf' | 'ethernet' {
+  return networks.kindOf(g.network_id ?? networks.defaultNetworkId)
+}
+
 /** Static groups ("Unconfigured", "All WLED Nodes") are network-
  * agnostic by design — they should NOT render a network badge. The
  * sidebar row hides the badge for them; the ManageGroupsDialog also
@@ -305,10 +310,11 @@ function onEditGroupInputMount(el: unknown) {
              "Reorder groups" button → opens the unified dialog). -->
         <span
           v-if="hasNetworkBadge(g) && editingGroupId !== g.id"
-          class="flex-none rounded px-1.5 py-0.5 text-[10px] font-medium"
+          class="flex-none inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium"
           :class="groupNetworkBadgeClass(g)"
-          :title="`Network: ${groupNetworkLabel(g)}`"
+          :title="`Network: ${groupNetworkLabel(g)} (${groupNetworkKind(g) === 'ethernet' ? 'Ethernet' : 'RF'})`"
         >
+          <NetworkKindIcon :kind="groupNetworkKind(g)" :size="10" />
           {{ groupNetworkLabel(g) }}
         </span>
         <!-- Edit mode: input replaces name + pencil. ``@click.stop`` on

@@ -1378,10 +1378,11 @@ class _MigrationRouteContext(_FakeContext):
     only — the service-level tests in test_rf_migration_service.py
     cover the actual migration outcomes)."""
 
-    def __init__(self, *, devices=None, groups=None):
+    def __init__(self, *, devices=None, groups=None, networks=None):
         super().__init__()
         self._fake_devs = list(devices or [])
         self._fake_groups = list(groups or [])
+        self._fake_networks = list(networks or [])
 
         # Tasks: record start + meta, never actually run the runner.
         started: list = []
@@ -1450,8 +1451,16 @@ class _MigrationRouteContext(_FakeContext):
             def list(self):
                 return list(self._items)
 
+        class _NetRepo(_Repo):
+            def get_by_id(self, network_id):
+                for n in self._items:
+                    if str(getattr(n, "id", "") or "") == str(network_id):
+                        return n
+                return None
+
         ctx_devs = self._fake_devs
         ctx_groups = self._fake_groups
+        ctx_networks = self._fake_networks
 
         class _RL:
             rf_migration_service = _MigrationService
@@ -1466,6 +1475,13 @@ class _MigrationRouteContext(_FakeContext):
                     if str(getattr(d, "addr", "") or "").upper() == target:
                         return d
                 return None
+
+        # Only attach a network_repository when the test supplies networks —
+        # the endpoint's cross-kind guard is best-effort and must degrade
+        # gracefully when the repo is absent (older deployments / minimal
+        # fakes).
+        if ctx_networks:
+            _RL.network_repository = _NetRepo(ctx_networks)
 
         self.rl_instance = _RL()
         self.migration_service = _MigrationService
@@ -1485,9 +1501,11 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         self._flask_request = sys.modules["flask"].request
         self._flask_request.get_json = lambda silent=True: {}
 
-    def _make(self, *, devices=None, groups=None):
+    def _make(self, *, devices=None, groups=None, networks=None):
         bp = _FakeBlueprint()
-        ctx = _MigrationRouteContext(devices=devices or [], groups=groups or [])
+        ctx = _MigrationRouteContext(
+            devices=devices or [], groups=groups or [], networks=networks or [],
+        )
         self.api_module.register_api_routes(bp, ctx)
         return bp, ctx
 
@@ -1541,6 +1559,30 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         result = self._route(bp)()
         self.assertEqual(result[1], 404)
         self.assertIn("unknown group_id", result[0]["error"])
+
+    def test_cross_kind_migration_returns_400(self):
+        # An RF group migrating onto an Ethernet network is rejected
+        # synchronously with the structured network_kind_mismatch detail,
+        # before any task is started.
+        from racelink.domain.models import RL_Network
+
+        groups = [RL_DeviceGroup("Team A", static_group=0, dev_type=0,
+                                 network_id="net-rf")]
+        networks = [
+            RL_Network(id="net-rf", name="Track A", kind="rf"),
+            RL_Network(id="net-eth", name="Stage LAN", kind="ethernet"),
+        ]
+        bp, ctx = self._make(groups=groups, networks=networks)
+        self._set_body({
+            "group_ids": [0],
+            "target_network_id": "net-eth",
+            "offline_mode": "skip",
+        })
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertEqual(result[0]["detail"]["code"], "network_kind_mismatch")
+        # No migration task was kicked off.
+        self.assertEqual(ctx.tasks_started, [])
 
     def test_block_mode_rejects_offline_member_with_structured_detail(self):
         groups = [RL_DeviceGroup("Team", static_group=0, dev_type=0)]
@@ -1613,6 +1655,184 @@ class MigrateNetworkRouteTests(unittest.TestCase):
         result = self._route(bp)()
         self.assertTrue(result["ok"])
         self.assertEqual(ctx.tasks_started[0]["meta"]["total"], 0)
+
+
+# ---------------------------------------------------------------------
+# POST /api/networks — create an Ethernet-kind network (Ethernet PoC)
+# ---------------------------------------------------------------------
+
+class _NetworkCreateContext(_FakeContext):
+    def __init__(self):
+        super().__init__()
+        nets: list = []
+
+        class _NetRepo:
+            def list(self):
+                return list(nets)
+
+            def append(self, n):
+                nets.append(n)
+
+            def get_by_id(self, nid):
+                for n in nets:
+                    if str(getattr(n, "id", "")) == str(nid):
+                        return n
+                return None
+
+        saved: list = []
+
+        class _RL:
+            network_repository = _NetRepo()
+            uiPresetList = []
+
+            @staticmethod
+            def save_to_db(args, scopes=None):
+                saved.append((dict(args or {}), scopes))
+
+        self.rl_instance = _RL()
+        self.nets = nets
+        self.saved = saved
+        # _sse_refresh -> ctx.sse.broadcast; record refreshes as no-op.
+        self.sse = type("SSE", (), {"broadcast": staticmethod(lambda *a, **k: None)})()
+
+
+class NetworkCreateRouteTests(unittest.TestCase):
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self._flask_request = sys.modules["flask"].request
+        self._flask_request.get_json = lambda silent=True: {}
+
+    def _make(self):
+        bp = _FakeBlueprint()
+        ctx = _NetworkCreateContext()
+        self.api_module.register_api_routes(bp, ctx)
+        return bp, ctx
+
+    def _set_body(self, body):
+        snap = dict(body) if body is not None else None
+        self._flask_request.get_json = lambda silent=True: snap
+
+    def _route(self, bp):
+        return bp.routes[("/api/networks", ("POST",))]
+
+    def test_create_ethernet_network(self):
+        bp, ctx = self._make()
+        self._set_body({"name": "Stage LAN", "kind": "ethernet", "node_port": 5078})
+        result = self._route(bp)()
+        # tuple => error; dict => success payload
+        self.assertTrue(result["ok"])
+        net = result["network"]
+        self.assertEqual(net["kind"], "ethernet")
+        self.assertEqual(net["name"], "Stage LAN")
+        self.assertEqual(net["eth_config"]["node_port"], 5078)
+        # persisted + appended to the repo
+        self.assertEqual(len(ctx.nets), 1)
+        self.assertTrue(ctx.saved)
+
+    def test_missing_name_returns_400(self):
+        bp, _ctx = self._make()
+        self._set_body({"kind": "ethernet"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("name required", result[0]["error"])
+
+    def test_rf_kind_rejected(self):
+        bp, _ctx = self._make()
+        self._set_body({"name": "Track A", "kind": "rf"})
+        result = self._route(bp)()
+        self.assertEqual(result[1], 400)
+        self.assertIn("ethernet", result[0]["error"])
+
+
+# ---------------------------------------------------------------------
+# Ethernet transport presents as a "gateway" (Ethernet PoC follow-up)
+# ---------------------------------------------------------------------
+
+class _EthGatewayContext(_FakeContext):
+    """Context whose controller has one attached Ethernet transport, so the
+    /api/gateways + query-state routes surface it as a ready gateway."""
+
+    def __init__(self):
+        super().__init__()
+
+        class _Net:
+            kind = "ethernet"
+
+            def __init__(self, nid, name):
+                self.id = nid
+                self.name = name
+
+        class _NetRepo:
+            def __init__(self, nets):
+                self._nets = nets
+
+            def list(self):
+                return list(self._nets)
+
+            def get_by_id(self, nid):
+                for n in self._nets:
+                    if str(n.id) == str(nid):
+                        return n
+                return None
+
+        class _EthT:
+            kind = "ethernet"
+
+            def __init__(self, nid):
+                self.network_id = nid
+                self.ident_mac = f"ETH:{nid}"
+                self.gateway_state_byte = 0
+                self.gateway_state_metadata_ms = 0
+
+            def gateway_state_snapshot(self):
+                return {"state_byte": 0, "state": "IDLE", "state_metadata_ms": 0}
+
+        class _GW:
+            @staticmethod
+            def query_state(transport=None):
+                # Should never be called for an Ethernet transport.
+                return {"state": "UNKNOWN"}
+
+        net = _Net("net-eth-1", "Wired")
+
+        class _RL:
+            network_repository = _NetRepo([net])
+            gateway_service = _GW()
+            transports = [_EthT("net-eth-1")]
+            uiPresetList = []
+
+        self.rl_instance = _RL()
+
+
+class EthernetGatewayPresenceTests(unittest.TestCase):
+
+    def setUp(self):
+        self.api_module = _import_api_module()
+        self.api_module.jsonify = lambda payload: payload
+        self.bp = _FakeBlueprint()
+        self.ctx = _EthGatewayContext()
+        self.api_module.register_api_routes(self.bp, self.ctx)
+
+    def test_gateways_list_includes_synthetic_ethernet_record(self):
+        result = self.bp.routes[("/api/gateways", ("GET",))]()
+        self.assertTrue(result["ok"])
+        gws = result["gateways"]
+        self.assertEqual(len(gws), 1)
+        rec = gws[0]
+        self.assertEqual(rec["ident_mac"], "ETH:net-eth-1")
+        self.assertEqual(rec["state"], "bound")
+        self.assertEqual(rec["network_id"], "net-eth-1")
+        self.assertEqual(rec["network_name"], "Wired")
+
+    def test_query_state_returns_idle_for_ethernet(self):
+        result = self.bp.routes[("/api/gateways/query-state", ("POST",))]()
+        self.assertTrue(result["ok"])
+        gws = result["gateways"]
+        self.assertEqual(len(gws), 1)
+        self.assertEqual(gws[0]["ident_mac"], "ETH:net-eth-1")
+        self.assertEqual(gws[0]["state"], "IDLE")
 
 
 if __name__ == "__main__":

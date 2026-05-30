@@ -70,6 +70,7 @@ def migrate_v1_to_v2(
         default_network = {
             "id": DEFAULT_NETWORK_ID,
             "name": "Default",
+            "kind": "rf",
             "gateway_mac": None,
             "region": "EU868",
             "channel_id": None,
@@ -99,10 +100,35 @@ def migrate_v1_to_v2(
     return devices, groups, networks
 
 
+def migrate_v2_to_v3(
+    devices: list[dict],
+    groups: list[dict],
+    networks: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Introduce the network ``kind`` discriminator (Ethernet groundwork).
+
+    v3 adds a ``kind`` field to every network so a non-RF network kind
+    (``"ethernet"``) can coexist with the historical LoRa networks. Every
+    pre-v3 network record predates the field and is, by definition, an RF
+    network — so this step simply back-fills ``kind="rf"`` wherever it is
+    missing. Devices and groups are untouched (their network membership
+    is already carried by ``network_id``).
+
+    Idempotent: a record that already has a ``kind`` is left as-is.
+    """
+    for record in networks or []:
+        if not isinstance(record, dict):
+            continue
+        if not record.get("kind"):
+            record["kind"] = "rf"
+    return devices, groups, networks
+
+
 # Map ``from_version -> migration_callable`` producing the
 # ``(devices, groups, networks)`` tuple at ``from_version + 1``.
 _MIGRATIONS: dict[int, _MigrationStep] = {
     1: migrate_v1_to_v2,
+    2: migrate_v2_to_v3,
 }
 
 

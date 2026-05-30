@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def try_parse_legacy_repr(raw: Any) -> list[dict] | None:

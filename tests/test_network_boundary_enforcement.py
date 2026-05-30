@@ -29,6 +29,7 @@ from racelink.domain.models import RL_Device, RL_DeviceGroup, RL_Network
 from racelink.domain.network_boundary import (
     NetworkBoundaryViolation,
     validate_group_membership,
+    validate_network_kind_match,
 )
 
 
@@ -123,6 +124,59 @@ class ValidateGroupMembershipTests(unittest.TestCase):
         # Mentions the group name + the recovery path (RF migration).
         self.assertIn("Team B", msg)
         self.assertIn("migration", msg.lower())
+
+
+class ValidateNetworkKindMatchTests(unittest.TestCase):
+    """Block D: forbid migrating a group/device across network *kinds*."""
+
+    def test_same_kind_passes(self):
+        target = RL_Network(name="RF B", kind="rf")
+        sources = [RL_Network(name="RF A", kind="rf"),
+                   RL_Network(name="RF A2", kind="rf")]
+        validate_network_kind_match(target, sources)  # no raise
+
+    def test_ethernet_to_ethernet_passes(self):
+        target = RL_Network(name="LAN B", kind="ethernet")
+        sources = [RL_Network(name="LAN A", kind="ethernet")]
+        validate_network_kind_match(target, sources)  # no raise
+
+    def test_rf_to_ethernet_raises(self):
+        target = RL_Network(name="LAN", kind="ethernet")
+        source = RL_Network(name="Track A", kind="rf")
+        with self.assertRaises(NetworkBoundaryViolation) as ctx:
+            validate_network_kind_match(target, [source])
+        self.assertEqual(ctx.exception.detail["code"], "network_kind_mismatch")
+        self.assertEqual(ctx.exception.detail["target_kind"], "ethernet")
+        self.assertEqual(
+            ctx.exception.detail["source_networks"][0]["kind"], "rf",
+        )
+
+    def test_ethernet_to_rf_raises(self):
+        target = RL_Network(name="Track A", kind="rf")
+        source = RL_Network(name="LAN", kind="ethernet")
+        with self.assertRaises(NetworkBoundaryViolation) as ctx:
+            validate_network_kind_match(target, [source])
+        self.assertEqual(ctx.exception.detail["target_kind"], "rf")
+
+    def test_none_sources_are_ignored(self):
+        target = RL_Network(name="RF B", kind="rf")
+        # Unbound / legacy entries (None) never conflict.
+        validate_network_kind_match(target, [None, None])  # no raise
+
+    def test_mixed_sources_reports_only_mismatch(self):
+        target = RL_Network(name="RF B", kind="rf")
+        rf_src = RL_Network(name="RF A", kind="rf")
+        eth_src = RL_Network(name="LAN", kind="ethernet")
+        with self.assertRaises(NetworkBoundaryViolation) as ctx:
+            validate_network_kind_match(target, [rf_src, eth_src])
+        mism = ctx.exception.detail["source_networks"]
+        self.assertEqual(len(mism), 1)
+        self.assertEqual(mism[0]["kind"], "ethernet")
+
+    def test_legacy_network_without_kind_treated_as_rf(self):
+        # A dict source missing 'kind' compares as the historical RF kind.
+        target = RL_Network(name="RF B", kind="rf")
+        validate_network_kind_match(target, [{"id": "legacy", "name": "Old"}])
 
 
 class GroupCreateDefaultNetworkBindingTests(unittest.TestCase):

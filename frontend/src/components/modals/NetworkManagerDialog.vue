@@ -32,6 +32,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import NetworkKindIcon from '@/components/NetworkKindIcon.vue'
 import { apiDelete, apiPost, apiPut } from '@/api/client'
 import { useConfirm } from '@/composables/useConfirm'
 import { useGatewaysStore } from '@/stores/gateways'
@@ -54,6 +55,17 @@ const draftRegion = ref<string>('EU868')
 /** ``null`` ↔ "custom (no channel)" — the network keeps whatever
  *  rf_config it has now, untouched. */
 const draftChannelId = ref<number | null>(null)
+
+// ----- Create-Ethernet-network flow (Block F) ------------------------
+// RF networks are still created via the gateway-bind wizard; this dialog
+// adds the lightweight "add an Ethernet network" path (host NIC = network).
+const creating = ref(false)
+const showCreateAdvanced = ref(false)
+const newName = ref('')
+const newNodePort = ref(5078)
+const newHostPort = ref(5079)
+const newBindHost = ref('0.0.0.0')
+const newBroadcastHost = ref('255.255.255.255')
 
 watch(
   () => props.open,
@@ -93,6 +105,21 @@ function syncDraftFromSelected() {
 const selectedNetwork = computed<NetworkSummary | null>(
   () => networks.byId[selectedId.value] ?? null,
 )
+
+const isEthernet = computed(() => selectedNetwork.value?.kind === 'ethernet')
+
+/** Read-only ``host:port`` / discovery summary for an Ethernet network's
+ *  ``eth_config`` (the IP-transport counterpart to the RF preview). */
+const ethConfigSummary = computed(() => {
+  const cfg = (selectedNetwork.value?.eth_config ?? null) as Record<string, unknown> | null
+  if (!cfg) return null
+  const nodePort = cfg.node_port ?? '—'
+  const hostPort = cfg.host_port ?? '—'
+  const bindHost = cfg.bind_host ?? '0.0.0.0'
+  const broadcastHost = cfg.broadcast_host ?? '255.255.255.255'
+  const discovery = cfg.discovery ?? 'broadcast'
+  return { nodePort, hostPort, bindHost, broadcastHost, discovery }
+})
 
 const channelsForDraftRegion = computed<Channel[]>(
   () => networks.channelsByRegion[draftRegion.value] ?? [],
@@ -150,6 +177,9 @@ const hasUnsavedChanges = computed(() => {
   const net = selectedNetwork.value
   if (!net) return false
   if (net.name !== draftName.value.trim()) return true
+  // Ethernet networks only expose the name for editing (no RF region /
+  // channel), so the name diff is the whole story.
+  if (isEthernet.value) return false
   if ((net.region || '') !== draftRegion.value) return true
   const currentChannel =
     typeof net.channel_id === 'number'
@@ -184,6 +214,27 @@ async function onSave() {
   if (!selectedNetwork.value || !canSave.value) return
   const targetId = selectedNetwork.value.id
   const targetName = draftName.value.trim()
+
+  // Ethernet networks have no RF region/channel — a save is just a rename.
+  if (isEthernet.value) {
+    submitting.value = true
+    try {
+      const res = (await apiPut(
+        `/api/networks/${encodeURIComponent(targetId)}`,
+        { name: targetName },
+      )) as { ok?: boolean; error?: string }
+      if (!res?.ok) {
+        toast.error(`Save failed: ${res?.error || 'unknown'}`)
+        return
+      }
+      toast.show(`Saved "${targetName}".`)
+      await networks.load().catch(() => undefined)
+    } finally {
+      submitting.value = false
+    }
+    return
+  }
+
   submitting.value = true
   try {
     const body: Record<string, unknown> = {
@@ -292,6 +343,48 @@ async function onDelete() {
   }
 }
 
+function startCreate() {
+  creating.value = true
+  showCreateAdvanced.value = false
+  newName.value = ''
+  newNodePort.value = 5078
+  newHostPort.value = 5079
+  newBindHost.value = '0.0.0.0'
+  newBroadcastHost.value = '255.255.255.255'
+}
+
+function cancelCreate() {
+  creating.value = false
+}
+
+const canCreate = computed(() => !!newName.value.trim() && !submitting.value)
+
+async function onCreate() {
+  if (!canCreate.value) return
+  submitting.value = true
+  try {
+    const res = (await apiPost('/api/networks', {
+      name: newName.value.trim(),
+      kind: 'ethernet',
+      node_port: newNodePort.value,
+      host_port: newHostPort.value,
+      bind_host: newBindHost.value.trim() || '0.0.0.0',
+      broadcast_host: newBroadcastHost.value.trim() || '255.255.255.255',
+    })) as { ok?: boolean; error?: string; network?: { id?: string } }
+    if (!res?.ok) {
+      toast.error(`Create failed: ${res?.error || 'unknown'}`)
+      return
+    }
+    toast.show(`Created Ethernet network "${newName.value.trim()}".`)
+    await networks.load().catch(() => undefined)
+    const newId = res.network?.id
+    if (newId) selectedId.value = newId
+    creating.value = false
+  } finally {
+    submitting.value = false
+  }
+}
+
 function close() {
   emit('update:open', false)
 }
@@ -311,34 +404,197 @@ function close() {
 
       <div class="grid grid-cols-[200px_1fr] gap-3 text-sm">
         <!-- ===== Left: network list ===== -->
-        <aside class="rounded-md border border-border bg-card/40 p-1.5">
+        <aside class="flex flex-col rounded-md border border-border bg-card/40 p-1.5">
           <div v-if="networks.networks.length === 0" class="p-2 text-xs text-muted-foreground">
             No networks yet. Plug in a gateway and use the bind
-            wizard to create one.
+            wizard to create one, or add an Ethernet network below.
           </div>
-          <ul class="m-0 list-none p-0">
+          <ul class="m-0 grow list-none overflow-y-auto p-0">
             <li
               v-for="n in networks.networks"
               :key="n.id"
               :class="[
                 'cursor-pointer rounded px-2 py-1.5 text-[13px] hover:bg-secondary/40',
-                n.id === selectedId ? 'bg-secondary/60' : '',
+                n.id === selectedId && !creating ? 'bg-secondary/60' : '',
               ]"
-              @click="selectedId = n.id"
+              @click="selectedId = n.id; creating = false"
             >
-              <div class="truncate font-medium">{{ n.name }}</div>
+              <div class="flex items-center gap-1.5 truncate font-medium">
+                <NetworkKindIcon :kind="networks.kindOf(n.id)" :size="12" />
+                <span class="truncate">{{ n.name }}</span>
+              </div>
               <div class="truncate text-[11px] text-muted-foreground">
-                {{ n.region || '—' }}
-                <template v-if="n.gateway_mac">
-                  · <span class="font-mono">{{ n.gateway_mac }}</span>
+                <template v-if="n.kind === 'ethernet'">
+                  Ethernet
+                  <template v-if="n.eth_config && (n.eth_config as Record<string, unknown>).node_port">
+                    · <span class="font-mono">udp:{{ (n.eth_config as Record<string, unknown>).node_port }}</span>
+                  </template>
+                </template>
+                <template v-else>
+                  {{ n.region || '—' }}
+                  <template v-if="n.gateway_mac">
+                    · <span class="font-mono">{{ n.gateway_mac }}</span>
+                  </template>
                 </template>
               </div>
             </li>
           </ul>
+          <Button
+            type="button"
+            variant="secondary"
+            class="mt-1.5 w-full justify-center text-xs"
+            :disabled="submitting"
+            @click="startCreate"
+          >
+            + Add Ethernet network
+          </Button>
         </aside>
 
-        <!-- ===== Right: editor ===== -->
-        <section v-if="selectedNetwork" class="grid gap-3">
+        <!-- ===== Right: create Ethernet network ===== -->
+        <section v-if="creating" class="grid gap-3">
+          <div class="text-sm font-semibold">Add Ethernet network</div>
+          <p class="text-xs text-muted-foreground">
+            Adds an IP/LAN network — the host's network interface acts as the
+            transport. Devices are discovered over UDP; no gateway is needed.
+          </p>
+          <label class="grid gap-1 text-xs">
+            Name
+            <input
+              v-model="newName"
+              type="text"
+              maxlength="64"
+              placeholder="e.g. Stage LAN"
+              class="rounded border border-border bg-background px-2 py-1 text-sm"
+              :disabled="submitting"
+            />
+          </label>
+          <label class="grid gap-1 text-xs">
+            Device UDP port (node_port)
+            <input
+              v-model.number="newNodePort"
+              type="number"
+              min="1"
+              max="65535"
+              class="rounded border border-border bg-background px-2 py-1 text-sm"
+              :disabled="submitting"
+            />
+          </label>
+
+          <button
+            type="button"
+            class="justify-self-start text-[11px] text-muted-foreground underline"
+            @click="showCreateAdvanced = !showCreateAdvanced"
+          >
+            {{ showCreateAdvanced ? 'Hide' : 'Show' }} advanced
+          </button>
+          <div v-if="showCreateAdvanced" class="grid gap-3 rounded-md border border-border bg-card/40 p-2.5">
+            <label class="grid gap-1 text-xs">
+              Host reply port (host_port)
+              <input
+                v-model.number="newHostPort"
+                type="number"
+                min="1"
+                max="65535"
+                class="rounded border border-border bg-background px-2 py-1 text-sm"
+                :disabled="submitting"
+              />
+            </label>
+            <label class="grid gap-1 text-xs">
+              Bind host
+              <input
+                v-model="newBindHost"
+                type="text"
+                class="rounded border border-border bg-background px-2 py-1 font-mono text-sm"
+                :disabled="submitting"
+              />
+            </label>
+            <label class="grid gap-1 text-xs">
+              Broadcast host
+              <input
+                v-model="newBroadcastHost"
+                type="text"
+                class="rounded border border-border bg-background px-2 py-1 font-mono text-sm"
+                :disabled="submitting"
+              />
+            </label>
+          </div>
+
+          <div class="flex items-center justify-end gap-2 border-t border-border/50 pt-2">
+            <Button variant="ghost" type="button" :disabled="submitting" @click="cancelCreate">
+              Cancel
+            </Button>
+            <Button type="button" :disabled="!canCreate" @click="onCreate">
+              Create network
+            </Button>
+          </div>
+        </section>
+
+        <!-- ===== Right: Ethernet network editor ===== -->
+        <section v-else-if="selectedNetwork && isEthernet" class="grid gap-3">
+          <label class="grid gap-1 text-xs">
+            Name
+            <input
+              v-model="draftName"
+              type="text"
+              maxlength="64"
+              class="rounded border border-border bg-background px-2 py-1 text-sm"
+              :disabled="submitting"
+            />
+          </label>
+
+          <div class="rounded-md border border-border bg-card/40 p-2.5 text-xs">
+            <div class="flex items-center gap-1.5 font-semibold">
+              <NetworkKindIcon kind="ethernet" :size="12" />
+              Ethernet transport
+            </div>
+            <div v-if="ethConfigSummary" class="mt-1 grid grid-cols-2 gap-2">
+              <div>
+                <div class="text-muted-foreground">Device UDP port</div>
+                <div class="font-mono">{{ ethConfigSummary.nodePort }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">Host reply port</div>
+                <div class="font-mono">{{ ethConfigSummary.hostPort }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">Bind host</div>
+                <div class="font-mono">{{ ethConfigSummary.bindHost }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">Broadcast host</div>
+                <div class="font-mono">{{ ethConfigSummary.broadcastHost }}</div>
+              </div>
+            </div>
+            <div class="mt-1 text-muted-foreground">
+              Transport settings are fixed at creation for this PoC.
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between border-t border-border/50 pt-2">
+            <Button
+              variant="ghost"
+              class="text-red-300 hover:text-red-200"
+              type="button"
+              :disabled="submitting"
+              @click="onDelete"
+            >
+              Delete network
+            </Button>
+            <div class="flex items-center gap-2">
+              <span v-if="hasUnsavedChanges" class="text-xs text-amber-300">Unsaved changes</span>
+              <Button
+                type="button"
+                :disabled="!canSave || !hasUnsavedChanges"
+                @click="onSave"
+              >
+                Save
+              </Button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== Right: RF network editor ===== -->
+        <section v-else-if="selectedNetwork" class="grid gap-3">
           <label class="grid gap-1 text-xs">
             Name
             <input

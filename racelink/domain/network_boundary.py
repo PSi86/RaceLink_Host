@@ -63,6 +63,26 @@ def _group_network_id(group) -> Optional[str]:
     return str(nid) if nid else None
 
 
+def _network_kind(net) -> str:
+    """Pull the ``kind`` discriminator off an ``RL_Network``-shaped object.
+
+    Defaults to ``"rf"`` for ``None`` / missing / empty so legacy networks
+    (pre-``kind``) and any forward-incompatible value compare as the
+    historical RF kind — matching ``RL_Network._normalize_kind``.
+    """
+    kind = getattr(net, "kind", None)
+    if kind is None and isinstance(net, Mapping):
+        kind = net.get("kind")
+    return str(kind).strip().lower() if kind else "rf"
+
+
+def _network_id_of(net) -> Optional[str]:
+    nid = getattr(net, "id", None)
+    if nid is None and isinstance(net, Mapping):
+        nid = net.get("id")
+    return str(nid) if nid else None
+
+
 def _device_addr(dev) -> str:
     addr = getattr(dev, "addr", None)
     if addr is None and isinstance(dev, dict):
@@ -191,6 +211,59 @@ def validate_group_membership(
                 "device_macs": list(networks_seen[device_nid]),
                 "group_id": target_group_id,
                 "group_name": _group_name(target_group),
+            },
+        )
+
+
+def validate_network_kind_match(target_network, source_networks) -> None:
+    """Refuse a migration that would move a group/device across network *kinds*.
+
+    RaceLink networks come in kinds (``"rf"``, ``"ethernet"``, …). Migrating
+    a group or device from an RF network onto an Ethernet network (or vice
+    versa) is physically meaningless — a device speaks exactly one transport,
+    not both — so the move is rejected up front rather than silently
+    producing an unreachable membership or letting an RF re-flash run against
+    a node that has no radio.
+
+    ``target_network`` is the destination ``RL_Network`` (or dict).
+    ``source_networks`` is an iterable of the current ``RL_Network`` objects
+    (or dicts) the migrated groups/devices live on; ``None`` entries
+    (unbound / legacy) are ignored.
+
+    Raises :class:`NetworkBoundaryViolation` (code ``network_kind_mismatch``)
+    listing every source network whose kind differs from the target;
+    returns ``None`` on success.
+    """
+    target_kind = _network_kind(target_network)
+    mismatched: list[dict] = []
+    seen: set = set()
+    for net in source_networks:
+        if net is None:
+            continue
+        src_kind = _network_kind(net)
+        if src_kind == target_kind:
+            continue
+        nid = _network_id_of(net)
+        key = (nid, src_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        mismatched.append({"network_id": nid, "kind": src_kind})
+
+    if mismatched:
+        raise NetworkBoundaryViolation(
+            reason=(
+                "Cannot migrate across network types: the target network is "
+                f"'{target_kind}' but the selection lives on "
+                f"{len(mismatched)} '{mismatched[0]['kind']}'"
+                f"{'/…' if len({m['kind'] for m in mismatched}) > 1 else ''} "
+                "network(s). RF and Ethernet networks cannot be mixed."
+            ),
+            detail={
+                "code": "network_kind_mismatch",
+                "target_kind": target_kind,
+                "target_network_id": _network_id_of(target_network),
+                "source_networks": mismatched,
             },
         )
 

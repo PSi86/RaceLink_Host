@@ -188,18 +188,33 @@ class RL_DeviceGroup:
         self.network_id: Optional[str] = str(network_id) if network_id else None
 
 
-class RL_Network:
-    """A logical RaceLink network — one LoRa channel + sync-word band that
-    devices and a gateway share. Hardware MAC of the bound gateway is
-    stored so a hardware swap (same identity, different physical unit)
-    is just a re-bind, not a re-create.
+#: The network *kinds* RaceLink understands. ``"rf"`` is the historical
+#: LoRa-gateway network; ``"ethernet"`` is the IP/LAN network kind. The
+#: tuple is the validation allow-list — any unknown value normalises back
+#: to ``"rf"`` so a corrupt/forward-incompatible payload degrades safely.
+NETWORK_KIND_RF = "rf"
+NETWORK_KIND_ETHERNET = "ethernet"
+VALID_NETWORK_KINDS = (NETWORK_KIND_RF, NETWORK_KIND_ETHERNET)
 
-    Stable across reboots; ``id`` is a UUID4 string. ``rf_config`` mirrors
-    the wire-format P_RfConfig dict (freq_hz / bw_khz_x10 / sf / cr_den /
-    sync_word / tx_power_dbm / preamble) so the network and the actual
-    radio carrying it speak the same field shape. Stage 3 introduces a
-    ``channel_id`` indirection on top (pointer into the region channel
-    table); for Stage 2 the field exists but is always ``None``.
+
+class RL_Network:
+    """A logical RaceLink network that devices and (for RF) a gateway share.
+
+    ``kind`` discriminates the network *type*:
+
+    * ``"rf"`` (default, backward-compatible) — one LoRa channel + sync-word
+      band bound to a gateway. The hardware MAC of the bound gateway is
+      stored so a hardware swap (same identity, different physical unit) is
+      just a re-bind, not a re-create. ``rf_config`` mirrors the wire-format
+      P_RfConfig dict (freq_hz / bw_khz_x10 / sf / cr_den / sync_word /
+      tx_power_dbm / preamble) and ``channel_id`` is the region-table
+      pointer; ``gateway_mac`` carries the binding.
+    * ``"ethernet"`` — an IP/LAN network where the host NIC itself is the
+      transport. ``gateway_mac`` / ``region`` / ``channel_id`` / ``rf_config``
+      are irrelevant and stay ``None``; routing binds via the transport's
+      stamped ``network_id`` instead of a gateway MAC.
+
+    Stable across reboots; ``id`` is a UUID4 string.
     """
 
     def __init__(
@@ -211,11 +226,29 @@ class RL_Network:
         channel_id: Optional[int] = None,
         rf_config: Optional[dict] = None,
         created_ts: Optional[float] = None,
+        kind: str = NETWORK_KIND_RF,
+        eth_config: Optional[dict] = None,
     ):
         self.id: str = str(id) if id else str(uuid.uuid4())
         self.name: str = str(name)
+        self.kind: str = self._normalize_kind(kind)
         self.gateway_mac: Optional[str] = str(gateway_mac).upper() if gateway_mac else None
         self.region: str = str(region)
         self.channel_id: Optional[int] = int(channel_id) if channel_id is not None else None
         self.rf_config: Optional[dict] = dict(rf_config) if isinstance(rf_config, dict) else None
+        # Ethernet-kind networks carry IP transport settings here (node/host
+        # UDP ports, bind/broadcast host, discovery mode) — the symmetric
+        # counterpart to ``rf_config`` for RF networks. ``None`` for RF.
+        self.eth_config: Optional[dict] = dict(eth_config) if isinstance(eth_config, dict) else None
         self.created_ts: float = float(created_ts) if created_ts is not None else time.time()
+
+    @staticmethod
+    def _normalize_kind(kind) -> str:
+        """Coerce ``kind`` to a known value, defaulting to ``"rf"``.
+
+        ``None`` / empty / unknown all fall back to ``"rf"`` so legacy
+        payloads (pre-``kind``) and any forward-incompatible value load as
+        the historical RF network rather than raising.
+        """
+        text = str(kind or NETWORK_KIND_RF).strip().lower()
+        return text if text in VALID_NETWORK_KINDS else NETWORK_KIND_RF

@@ -18,11 +18,17 @@ have an actual Python consumer:
   ``racelink/domain/indicators.py`` against drift on the wire-stable
   ``IND_*`` ids (append-only contract).
 
-The other two — ``racelink_headless.h`` and
-``racelink_transport_core.h`` — are FW-internal (Headless-Master logic
-and TX-pipeline / LBT / CAD on Gateway + Node side). They live in the
-three FW locations but have no Python consumer; the Host repo does
-NOT carry them, and this test does not require them there.
+The FW-internal headers — ``racelink_headless.h``,
+``racelink_transport_core.h`` and ``racelink_transport_common.h`` (the
+medium-agnostic helpers + RX stream reassembly split out of core.h in
+Block E) — live in the FW locations but have no Python consumer; the
+Host repo does NOT carry them. The Ethernet backend headers
+(``racelink_transport_eth.h``, ``racelink_w5500_udp.h``) are WLED-node
+only — the LoRa Gateway does not build them, so they are checked between
+the canonical and RaceLink_WLED but skipped for the Gateway sibling.
+
+Hashes are compared with line endings normalized to LF, so this guard
+flags real content drift rather than per-repo CRLF/LF differences.
 
 Drift between any pair listed below is a real bug — opcodes / structs
 / flags shift on the wire in ways that look plausible end-to-end until
@@ -51,12 +57,26 @@ HOST_HEADERS = (
     "racelink_indicators.h",
 )
 
-# FW-only headers — present in the canonical and the two FW siblings,
-# never in the Host repo.
-FW_ONLY_HEADERS = (
+# FW headers every C++ build carries — the LoRa Gateway, the WLED node and the
+# Ethernet node. Present in the canonical and BOTH FW siblings, never in Host.
+# (racelink_transport_common.h was split out of racelink_transport_core.h in
+# Block E Stage 1; core.h #includes it, so every transport build needs it.)
+FW_SHARED_HEADERS = (
     "racelink_headless.h",
     "racelink_transport_core.h",
+    "racelink_transport_common.h",
 )
+
+# FW headers only the WLED node tree carries (Ethernet backend, Block E). The
+# LoRa Gateway build does not include them, so they are expected-absent (and
+# silently skipped) for the Gateway sibling.
+WLED_ONLY_HEADERS = (
+    "racelink_transport_eth.h",
+    "racelink_w5500_udp.h",
+)
+
+# FW-only = everything not in the Host subset (used by the "not in Host" guard).
+FW_ONLY_HEADERS = FW_SHARED_HEADERS + WLED_ONLY_HEADERS
 
 # Union — every header that lives anywhere in the matrix.
 ALL_HEADERS = HOST_HEADERS + FW_ONLY_HEADERS
@@ -75,10 +95,17 @@ FW_SIBLINGS = {
 }
 
 
-def _sha256(path: pathlib.Path) -> str:
-    h = hashlib.sha256()
-    h.update(path.read_bytes())
-    return h.hexdigest()
+def _norm_hash(path: pathlib.Path) -> str:
+    """SHA256 of the file content with line endings normalized to LF.
+
+    The guard's purpose is to catch real protocol/transport drift, not EOL
+    style: the sibling repos legitimately differ in CRLF/LF (e.g. the WLED-LoRa
+    canonical stores some headers LF while RaceLink_WLED's working tree is CRLF
+    via core.autocrlf). Normalizing newlines before hashing keeps the check
+    robust across platforms while still flagging any byte-of-content change.
+    """
+    text = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(text).hexdigest()
 
 
 class ProtoHeaderDriftTests(unittest.TestCase):
@@ -114,8 +141,8 @@ class ProtoHeaderDriftTests(unittest.TestCase):
                 f"skipping host-vs-canonical comparison.",
             )
         for header in HOST_HEADERS:
-            host_hash = _sha256(ROOT / header)
-            canon_hash = _sha256(CANONICAL_DIR / header)
+            host_hash = _norm_hash(ROOT / header)
+            canon_hash = _norm_hash(CANONICAL_DIR / header)
             self.assertEqual(
                 host_hash, canon_hash,
                 f"{header} drift: Host vs Canonical sha256 differs.\n"
@@ -128,10 +155,10 @@ class ProtoHeaderDriftTests(unittest.TestCase):
 
     def test_fw_siblings_match_canonical(self):
         """Every FW sibling (RaceLink_WLED, RaceLink_Gateway/src) must
-        carry all four shared headers byte-identical to the canonical.
-        Sibling-missing is a skipped comparison; canonical-missing
-        skips the whole assertion (handled in the previous test's
-        skipTest path is moot here — we re-check)."""
+        carry the shared headers content-identical (EOL-normalized) to
+        the canonical. WLED-only Ethernet headers are skipped for the
+        Gateway sibling; any other sibling-missing file is a skipped
+        comparison; canonical-missing a declared header is a hard fail."""
         if not CANONICAL_DIR.is_dir():
             self.skipTest(
                 f"Canonical tree not present at {CANONICAL_DIR} — "
@@ -150,14 +177,14 @@ class ProtoHeaderDriftTests(unittest.TestCase):
                     f"this header is declared in ALL_HEADERS but absent "
                     f"from the source of truth.",
                 )
-            canon_hash = _sha256(canon_path)
+            canon_hash = _norm_hash(canon_path)
             for sibling_name, sibling_dir in FW_SIBLINGS.items():
                 sibling_path = sibling_dir / header
                 label = f"{sibling_name}/{header}"
                 if not sibling_path.is_file():
                     skipped.append(label)
                     continue
-                sibling_hash = _sha256(sibling_path)
+                sibling_hash = _norm_hash(sibling_path)
                 compared.append(label)
                 self.assertEqual(
                     sibling_hash, canon_hash,

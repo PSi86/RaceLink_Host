@@ -29,6 +29,7 @@ from ..domain.network_boundary import (
     NetworkBoundaryViolation,
     SceneScopeViolation,
     validate_group_membership,
+    validate_network_kind_match,
     validate_scene_scope_consistency,
 )
 from ..domain.node_config import serialize_node_config_schema
@@ -499,10 +500,12 @@ def register_api_routes(bp, ctx):
                 rows.append({
                     "id": nid,
                     "name": str(getattr(net, "name", "") or ""),
+                    "kind": str(getattr(net, "kind", "rf") or "rf"),
                     "gateway_mac": getattr(net, "gateway_mac", None),
                     "region": getattr(net, "region", None),
                     "channel_id": getattr(net, "channel_id", None),
                     "rf_config": getattr(net, "rf_config", None),
+                    "eth_config": getattr(net, "eth_config", None),
                     "created_ts": getattr(net, "created_ts", None),
                     "live": live_by_id.get(nid),
                 })
@@ -510,6 +513,84 @@ def register_api_routes(bp, ctx):
             "ok": True,
             "networks": rows,
             "default_network_id": masters_snap.get("default_network_id"),
+        })
+
+    @bp.route("/api/networks", methods=["POST"])
+    def api_network_create():
+        """Create a new Ethernet-kind network (Ethernet PoC).
+
+        RF networks are created via the gateway-bind wizard (they need a
+        probed ``rf_config``); this endpoint is the lightweight seed for an
+        IP/LAN network. Body::
+
+            {name, kind:"ethernet", node_port?, host_port?, bind_host?,
+             broadcast_host?, discovery?}
+
+        On success the network is persisted and its ``EthernetTransport`` is
+        attached immediately (no full gateway rediscover needed).
+        """
+        from ..domain.models import RL_Network
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        kind = str(body.get("kind") or "ethernet").strip().lower()
+        if kind != "ethernet":
+            return jsonify({
+                "ok": False,
+                "error": "only kind='ethernet' networks can be created here "
+                         "(RF networks are created via the gateway bind wizard)",
+            }), 400
+
+        def _int(key, default):
+            try:
+                return int(body.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        eth_config = {
+            "node_port": _int("node_port", 5078),
+            "host_port": _int("host_port", 5079),
+            "bind_host": str(body.get("bind_host") or "0.0.0.0"),
+            "broadcast_host": str(body.get("broadcast_host") or "255.255.255.255"),
+            "discovery": str(body.get("discovery") or "broadcast"),
+        }
+        net = RL_Network(name=name, kind="ethernet", eth_config=eth_config)
+        with ctx.rl_lock:
+            net_repo.append(net)
+        try:
+            rl.save_to_db({"manual": True}, scopes={state_scope.FULL})
+        except Exception:
+            logger.exception("api_network_create: save_to_db failed")
+
+        # Attach the Ethernet transport now so discovery can run immediately.
+        # Best-effort + idempotent (the attach path dedupes on the ETH ident).
+        attach = getattr(rl, "_attach_ethernet_transports", None)
+        if callable(attach):
+            try:
+                attach()
+            except Exception:
+                logger.exception("api_network_create: ethernet transport attach raised")
+
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify({
+            "ok": True,
+            "network": {
+                "id": net.id,
+                "name": net.name,
+                "kind": net.kind,
+                "gateway_mac": None,
+                "region": None,
+                "channel_id": None,
+                "rf_config": None,
+                "eth_config": net.eth_config,
+                "created_ts": net.created_ts,
+            },
         })
 
     @bp.route("/api/networks/<network_id>", methods=["PUT"])
@@ -747,10 +828,50 @@ def register_api_routes(bp, ctx):
         the bind wizard when any record is in ``conflict`` or
         ``unbound``.
         """
-        bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
-        if bind_service is None:
-            return jsonify({"ok": True, "gateways": []})
-        return jsonify({"ok": True, **bind_service.snapshot()})
+        rl = ctx.rl_instance
+        bind_service = getattr(rl, "gateway_bind_service", None)
+        gateways: list = []
+        if bind_service is not None:
+            snap = bind_service.snapshot()
+            gateways = list(snap.get("gateways", []) or [])
+
+        # Surface attached Ethernet transports as ready "gateways" so the
+        # WebUI's per-gateway status bar renders a pill for them just like an
+        # RF gateway. There is no bind state machine for Ethernet (the host
+        # NIC is the transport, no gateway MAC), so the record is synthesised
+        # as a permanently-``bound`` entry; its RF/link state comes from the
+        # per-network MasterState (constant IDLE) via the ``master`` payload.
+        net_repo = getattr(rl, "network_repository", None)
+        for t in (getattr(rl, "transports", None) or []):
+            if getattr(t, "kind", "rf") != "ethernet":
+                continue
+            nid = str(getattr(t, "network_id", "") or "")
+            ident = str(getattr(t, "ident_mac", "") or "") or (f"ETH:{nid}" if nid else "")
+            if not ident:
+                continue
+            name = None
+            if net_repo is not None and nid:
+                try:
+                    net = net_repo.get_by_id(nid)
+                    name = str(getattr(net, "name", "") or "") or None
+                except Exception:
+                    # swallow-ok: the label is cosmetic — fall back to the
+                    # ident if the repo lookup hiccups.
+                    name = None
+            gateways.append({
+                "ident_mac": ident,
+                "state": "bound",
+                "network_id": nid or None,
+                "network_name": name,
+                "rf_config_actual": None,
+                "rf_config_expected": None,
+                "conflict_fields": [],
+                "migration_pending": False,
+                "last_evaluated_ts": 0.0,
+                "token": "",
+                "kind": "ethernet",
+            })
+        return jsonify({"ok": True, "gateways": gateways})
 
     @bp.route("/api/networks/<network_id>/migrate", methods=["POST"])
     def api_network_migrate(network_id: str):
@@ -898,6 +1019,35 @@ def register_api_routes(bp, ctx):
                     "ok": False,
                     "error": f"unknown group_id(s): {unknown}",
                 }), 404
+
+            # Cross-kind guard: a group on an RF network cannot migrate onto
+            # an Ethernet network (or vice versa). Reject synchronously with
+            # HTTP 400 before launching the task — clearer than letting the
+            # RF-specific migration fail mid-flight. Best-effort: target
+            # existence is left to the service (which returns a failed task
+            # for an unknown id); this only fires when we can resolve both
+            # ends, and rf_migration_service.migrate_groups_to is the
+            # authoritative backstop.
+            net_repo = getattr(ctx.rl_instance, "network_repository", None)
+            target_net = net_repo.get_by_id(target_network_id) if net_repo else None
+            if target_net is not None:
+                source_ids = {
+                    str(getattr(groups_list[gid], "network_id", "") or "")
+                    for gid in clean_gids
+                }
+                source_ids.discard("")
+                try:
+                    validate_network_kind_match(
+                        target_net,
+                        [net_repo.get_by_id(nid) for nid in source_ids],
+                    )
+                except NetworkBoundaryViolation as exc:
+                    return jsonify({
+                        "ok": False,
+                        "error": exc.reason,
+                        "detail": exc.detail,
+                    }), 400
+
             gid_set = set(clean_gids)
             for dev in (ctx.rl_instance.device_repository.list() or ()):
                 if int(getattr(dev, "groupId", 0) or 0) not in gid_set:
@@ -1128,6 +1278,19 @@ def register_api_routes(bp, ctx):
         transports = list(getattr(rl, "transports", None) or ())
         results = []
         for t in transports:
+            # Ethernet transports have no LoRa state machine to query — they
+            # report a constant IDLE. Return that snapshot directly so the ↻
+            # refresh doesn't reset their pill to UNKNOWN waiting for a
+            # STATE_REPORT that never arrives.
+            if getattr(t, "kind", "rf") == "ethernet":
+                snap = (
+                    t.gateway_state_snapshot()
+                    if hasattr(t, "gateway_state_snapshot") else {}
+                )
+                r = dict(snap)
+                r["ident_mac"] = str(getattr(t, "ident_mac", "") or "") or None
+                results.append(r)
+                continue
             r = query(transport=t)
             if isinstance(r, dict):
                 r = dict(r)
