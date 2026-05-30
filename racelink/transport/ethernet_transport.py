@@ -43,6 +43,13 @@ from ..protocol.codec import parse_reply_event
 from ..protocol.packets import (
     build_get_devices_body,
     build_preset_body,
+    build_set_group_body,
+    build_indicate_body,
+    build_control_body,
+    build_config_body,
+    build_get_config_body,
+    build_sync_body,
+    build_offset_body,
 )
 
 # ``LP`` is the auto-generated protocol mirror (make_type / DIR_* / OPC_*).
@@ -352,6 +359,79 @@ class EthernetTransport:
     def send_preset(self, recv3: bytes, group_id: int, flags: int, preset_id: int, brightness: int) -> SendOutcome:
         body = build_preset_body(group_id=group_id, flags=flags, preset_id=preset_id, brightness=brightness)
         return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_PRESET), recv3, body)
+
+    def send_wled_preset(self, recv3: bytes, group_id: int, state: int, preset_id: int, brightness: int) -> SendOutcome:
+        """Legacy helper: WLED preset with a simple on/off state flag (-> OPC_PRESET)."""
+        flags = 0x01 if int(state) else 0x00
+        return self.send_preset(recv3, group_id, flags, int(preset_id), int(brightness))
+
+    def send_set_group(self, recv3: bytes, group_id: int) -> SendOutcome:
+        body = build_set_group_body(group_id)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SET_GROUP), recv3, body)
+
+    def send_indicate(self, recv3: bytes, indicator_type: int, duration_sec: int) -> SendOutcome:
+        body = build_indicate_body(indicator_type=indicator_type, duration_sec=duration_sec)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_INDICATE), recv3, body)
+
+    def send_control(self, recv3: bytes, group_id: int, flags: int, **params) -> SendOutcome:
+        """OPC_CONTROL (variable-length 3..21 B body). Kwargs match build_control_body."""
+        body = build_control_body(group_id=group_id, flags=flags, **params)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONTROL), recv3, body)
+
+    def send_config(self, recv3: bytes = _BROADCAST_RECV3, option: int = 0,
+                    data0: int = 0, data1: int = 0, data2: int = 0, data3: int = 0) -> SendOutcome:
+        body = build_config_body(option=option, data0=data0, data1=data1, data2=data2, data3=data3)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_CONFIG), recv3, body)
+
+    def send_get_config(self, recv3: bytes, option: int) -> SendOutcome:
+        """OPC_GET_CONFIG (1 B body = option). Unicast-only; reply is a 5 B P_Config."""
+        body = build_get_config_body(option=option)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_GET_CONFIG), recv3, body)
+
+    def send_sync(self, recv3: bytes = _BROADCAST_RECV3, ts24: int = 0,
+                  brightness: int = 0, flags: int = 0) -> SendOutcome:
+        body = build_sync_body(ts24=ts24, brightness=brightness, flags=flags)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_SYNC), recv3, body)
+
+    def send_offset(self, recv3: bytes = _BROADCAST_RECV3, group_id: int = 0,
+                    mode="none", **mode_params) -> SendOutcome:
+        """OPC_OFFSET (variable-length 2..7 B body). See build_offset_body for modes."""
+        body = build_offset_body(group_id=group_id, mode=mode, **mode_params)
+        return self._send_m2n(LP.make_type(LP.DIR_M2N, LP.OPC_OFFSET), recv3, body)
+
+    def send_stream(self, recv3: bytes, payload: bytes) -> SendOutcome:
+        """Send a logical stream payload as OPC_STREAM datagrams.
+
+        On RF the gateway splits the payload into radio-sized P_Stream packets;
+        on Ethernet there is no gateway, so the host does that chunking here:
+        8-byte data chunks (max 16 = 128 B) framed as ``[ctrl][data(8)]`` with
+        ctrl = start(0x80) | stop(0x40) | packets_left(0x3F), matching the
+        firmware's handleStreamPacket() reassembly. Each chunk is one M2N
+        datagram; the first failed send short-circuits and is returned.
+        """
+        data = bytes(payload or b"")
+        CHUNK = 8
+        total = max(1, (len(data) + CHUNK - 1) // CHUNK)
+        if total > 16:
+            return SendOutcome.usb_error(detail=f"stream payload too large ({len(data)} B > 128)")
+        padded = data + b"\x00" * (total * CHUNK - len(data))
+        type_full = LP.make_type(LP.DIR_M2N, LP.OPC_STREAM)
+        outcome = SendOutcome.success()
+        for i in range(total):
+            packets_left = (total - 1) - i
+            ctrl = (0x80 if i == 0 else 0) | (0x40 if i == total - 1 else 0) | (packets_left & 0x3F)
+            body = bytes([ctrl]) + padded[i * CHUNK:(i + 1) * CHUNK]
+            outcome = self._send_m2n(type_full, recv3, body)
+            if outcome.code != SendOutcome.success().code:
+                return outcome
+        return outcome
+
+    # ---- RF config: not applicable on Ethernet (LoRa PHY only) -------------
+    def send_rf_config(self, recv3: bytes, rf_config: dict) -> SendOutcome:
+        return SendOutcome.usb_error(detail="RF config not supported on Ethernet networks")
+
+    def send_get_rf_config_to_node(self, recv3: bytes) -> SendOutcome:
+        return SendOutcome.usb_error(detail="RF config not supported on Ethernet networks")
 
     def send_state_request(self) -> bool:
         """No-op for Ethernet (no gateway state machine). Returns ``True`` so
