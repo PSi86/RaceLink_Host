@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -1014,6 +1015,34 @@ class RaceLink_Host:
             )
         return new_count
 
+    @staticmethod
+    def _normalize_comms_pins(value) -> list[str]:
+        """Parse the ``rl_comms_port`` option into a list of pinned ports.
+
+        Accepts a single port string (``"COM12"``), a comma-separated
+        list (``"COM12,COM13"``), a native list, or a JSON-array string,
+        so the same key works in the standalone JSON config and the
+        RotorHazard DB (a plain string field). Empty / unset → ``[]``
+        (auto-discovery).
+        """
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+        else:
+            text = str(value).strip()
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    items = parsed if isinstance(parsed, list) else [text]
+                except (ValueError, TypeError):
+                    items = text.split(",")
+            else:
+                items = text.split(",")
+        return [str(x).strip() for x in items if str(x).strip()]
+
     def discoverPort(self, args, *, origin: Optional[str] = None) -> None:
         """Initialize the active gateway transports.
 
@@ -1025,13 +1054,18 @@ class RaceLink_Host:
           first startup probe -- silent, WARNING-level on failure.
         - ``programmatic``: any other caller (legacy).
 
-        Stage 2 Part 5: when no ``psi_comms_port`` hint is set, the
-        controller enumerates every USB-attached RaceLink gateway
-        (:meth:`GatewaySerialTransport.enumerate_all`) and attaches one
-        transport per hit. At N=1 attached gateway the end state is
-        identical to the pre-Part-5 single-transport path. A pinned
-        port (``psi_comms_port``) keeps the legacy single-port semantics
-        — the operator opted in to a specific device.
+        Pin behaviour via the ``rl_comms_port`` option:
+        - **unset / empty** — auto-discovery: enumerate every
+          USB-attached RaceLink gateway
+          (:meth:`GatewaySerialTransport.enumerate_all`) and attach one
+          transport per hit. At N=1 the end state matches the
+          pre-Part-5 single-transport path.
+        - **a single port** (``"COM12"``) — legacy single-port path:
+          open exactly that device, skip the probe walk.
+        - **multiple ports** (``"COM12,COM13"`` or a list) — multi-pin:
+          enumerate, then attach only the gateways whose port is in the
+          pin set, so a multi-gateway rig binds each transport to its
+          network via the probed ``ident_mac``.
 
         Persistent failure state (``ready``, ``last_gateway_error``) is tracked
         in all cases so the UI can render its banner without relying on
@@ -1039,7 +1073,7 @@ class RaceLink_Host:
         """
         if origin is None:
             origin = "manual" if "manual" in args else "programmatic"
-        port_hint = self._option("psi_comms_port", None)
+        pinned_ports = self._normalize_comms_pins(self._option("rl_comms_port", None))
 
         # Release every previously-attached transport. Skipping this
         # step means the next ``enumerate_all`` probe (or the legacy
@@ -1055,12 +1089,13 @@ class RaceLink_Host:
             # the fresh transport instances.
             self._transport_hooks_installed_for.clear()
 
-            if port_hint:
-                # Manual pin — preserve the legacy single-port path.
+            if len(pinned_ports) == 1:
+                # Single manual pin — preserve the legacy single-port path.
                 # ``discover_and_open`` with an explicit port skips the
                 # walk and just opens the OS device; ident_mac stays
                 # ``None`` unless the next IDENTIFY round-trip fills
                 # it in.
+                port_hint = pinned_ports[0]
                 t = GatewaySerialTransport(port=port_hint, on_event=None)
                 opened = False
                 try:
@@ -1104,12 +1139,26 @@ class RaceLink_Host:
                         ).format(used, mac))
                 return
 
-            # No pinned port — enumerate every USB-attached gateway.
+            # No single pin — enumerate every USB-attached gateway. With a
+            # multi-port pin set the list is then filtered to the pinned
+            # ports; probing still yields each gateway's ``ident_mac`` so
+            # multi-network binding works for the attached transports.
             try:
                 gateways = GatewaySerialTransport.enumerate_all()
             except Exception:
                 logger.exception("RaceLink: enumerate_all raised")
                 gateways = []
+
+            if pinned_ports:
+                wanted = {p.lower() for p in pinned_ports}
+                gateways = [(p, m) for (p, m) in gateways if str(p).lower() in wanted]
+                found = {str(p).lower() for p, _ in gateways}
+                missing = [p for p in pinned_ports if p.lower() not in found]
+                if missing:
+                    logger.warning(
+                        "RaceLink: pinned comms port(s) not found or not "
+                        "responding: %s", ", ".join(missing),
+                    )
 
             if not gateways:
                 reason = "No RaceLink Gateway module discovered or configured"

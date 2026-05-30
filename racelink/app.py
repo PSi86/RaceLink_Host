@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from .core import NullSink, NullSource
 from .services import (
-    HostWifiService,
     OTAService,
     PresetsService,
     RLPresetsService,
     SceneRunnerService,
     SceneService,
+    create_host_wifi_service,
 )
 from .state import get_runtime_state_repository
 
@@ -108,7 +108,7 @@ def create_runtime(
         rl_presets_service=rl_presets_service,
     )
     controller.scene_runner_service = scene_runner_service
-    host_wifi_service = HostWifiService()
+    host_wifi_service = create_host_wifi_service()
     ota_service = OTAService(host_wifi_service=host_wifi_service, presets_service=presets_service)
 
     services = {

@@ -37,6 +37,8 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from .._user_paths import migrate_legacy_name, user_data_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,8 @@ class PresetsService:
         self._apply_options = apply_options
 
     def presets_dir(self) -> str:
-        directory = os.path.join(os.path.expanduser("~"), ".racelink", "presets")
+        directory = user_data_path("rl_wled_presets")
+        migrate_legacy_name(directory, "presets")
         os.makedirs(directory, exist_ok=True)
         return directory
 

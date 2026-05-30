@@ -12,7 +12,7 @@ from flask import Blueprint, templating
 
 logger = logging.getLogger(__name__)
 
-from ..services import HostWifiService, OTAService, PresetsService
+from ..services import OTAService, PresetsService, create_host_wifi_service
 from .api import register_api_routes
 from .sse import _DefaultLock, SSEBridge
 from .tasks import TaskManager
@@ -180,7 +180,7 @@ def create_racelink_web_blueprint(
     )
 
     if "host_wifi" not in ctx.services:
-        ctx.services["host_wifi"] = HostWifiService()
+        ctx.services["host_wifi"] = create_host_wifi_service()
     if "presets" not in ctx.services:
         ctx.services["presets"] = PresetsService()
     if "rl_presets" not in ctx.services:

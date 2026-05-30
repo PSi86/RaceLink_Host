@@ -27,6 +27,7 @@ ENTRY_POINTS = {
     "console_scripts": [
         "racelink-standalone = racelink.integrations.standalone.webapp:run_standalone",
         "racelink-host-version = racelink._version:print_version",
+        "racelink-setup-nmcli = racelink.tools.setup_nmcli_polkit:main",
     ]
 }
 

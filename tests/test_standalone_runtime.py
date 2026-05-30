@@ -1,7 +1,10 @@
+import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests._flask_stub import install_flask, install_serial
 
@@ -64,7 +67,7 @@ class StandaloneRuntimeTests(unittest.TestCase):
                 host="0.0.0.0",
                 port=5088,
                 debug=True,
-                options={"psi_comms_port": "COM7", "sample": "value"},
+                options={"rl_comms_port": "COM7", "sample": "value"},
             )
             config.save()
 
@@ -73,8 +76,37 @@ class StandaloneRuntimeTests(unittest.TestCase):
             self.assertEqual(loaded.host, "0.0.0.0")
             self.assertEqual(loaded.port, 5088)
             self.assertTrue(loaded.debug)
-            self.assertEqual(loaded.options["psi_comms_port"], "COM7")
+            self.assertEqual(loaded.options["rl_comms_port"], "COM7")
             self.assertEqual(loaded.options["sample"], "value")
+        finally:
+            if config_path.exists():
+                config_path.unlink()
+
+    def test_json_blob_option_stored_unescaped_on_disk(self):
+        config_path = self._temp_path("standalone_config.json")
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            blob = '{"schema_version": 2, "devices": [], "groups": []}'
+            config = self.StandaloneConfig(
+                path=str(config_path),
+                options={"rl_state_v1": blob, "rl_comms_port": "COM7"},
+            )
+            config.save()
+
+            # On disk the blob is a nested object (no double-escaped JSON),
+            # while a plain-string option stays a plain string.
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIsInstance(raw["options"]["rl_state_v1"], dict)
+            self.assertEqual(raw["options"]["rl_state_v1"]["schema_version"], 2)
+            self.assertEqual(raw["options"]["rl_comms_port"], "COM7")
+
+            # On load the controller still receives the blob as a string.
+            loaded = self.StandaloneConfig.load(str(config_path))
+            self.assertIsInstance(loaded.options["rl_state_v1"], str)
+            self.assertEqual(
+                json.loads(loaded.options["rl_state_v1"])["schema_version"], 2,
+            )
+            self.assertEqual(loaded.options["rl_comms_port"], "COM7")
         finally:
             if config_path.exists():
                 config_path.unlink()
@@ -130,6 +162,63 @@ class StandaloneDocsTests(unittest.TestCase):
         source = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
         self.assertIn('racelink-standalone = "racelink.integrations.standalone.webapp:run_standalone"', source)
+
+    def test_build_backend_ships_all_console_scripts(self):
+        # The wheel's console scripts come from ``_build_backend.ENTRY_POINTS``,
+        # NOT from pyproject's ``[project.scripts]`` (the custom PEP 517 backend
+        # hardcodes them). The two must stay in sync or a script silently
+        # vanishes from the wheel — which is how ``racelink-setup-nmcli`` went
+        # missing once. Pin the build-relevant list here.
+        from racelink import _build_backend
+
+        scripts = _build_backend.ENTRY_POINTS["console_scripts"]
+        names = {entry.split("=", 1)[0].strip() for entry in scripts}
+        self.assertEqual(
+            names,
+            {"racelink-standalone", "racelink-host-version", "racelink-setup-nmcli"},
+        )
+
+
+class BrowserOpenHelperTests(unittest.TestCase):
+    """The --open-browser / RACELINK_OPEN_BROWSER desktop-shortcut helpers."""
+
+    @classmethod
+    def setUpClass(cls):
+        install_serial()
+        install_flask()
+        from racelink.integrations.standalone import webapp as webapp_module
+        from racelink.integrations.standalone.config import StandaloneConfig
+        cls.webapp = webapp_module
+        cls.StandaloneConfig = StandaloneConfig
+
+    def test_ui_url_uses_loopback_for_wildcard_bind(self):
+        C = self.StandaloneConfig
+        self.assertEqual(
+            self.webapp._standalone_ui_url(C(host="127.0.0.1", port=5077)),
+            "http://127.0.0.1:5077/racelink",
+        )
+        self.assertEqual(
+            self.webapp._standalone_ui_url(C(host="0.0.0.0", port=5077)),
+            "http://127.0.0.1:5077/racelink",
+        )
+        self.assertEqual(
+            self.webapp._standalone_ui_url(C(host="192.168.1.5", port=8080)),
+            "http://192.168.1.5:8080/racelink",
+        )
+
+    def test_browser_open_requested_via_flag_or_env(self):
+        wm = self.webapp
+        with mock.patch.object(sys, "argv", ["racelink-standalone"]), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RACELINK_OPEN_BROWSER", None)
+            self.assertFalse(wm._browser_open_requested())
+        with mock.patch.object(sys, "argv", ["racelink-standalone", "--open-browser"]):
+            self.assertTrue(wm._browser_open_requested())
+        with mock.patch.object(sys, "argv", ["racelink-standalone", "-o"]):
+            self.assertTrue(wm._browser_open_requested())
+        with mock.patch.object(sys, "argv", ["racelink-standalone"]), \
+                mock.patch.dict(os.environ, {"RACELINK_OPEN_BROWSER": "1"}):
+            self.assertTrue(wm._browser_open_requested())
 
 
 if __name__ == "__main__":

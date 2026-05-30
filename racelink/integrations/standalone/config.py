@@ -10,11 +10,54 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from racelink._user_paths import migrate_legacy_name, user_data_path
+
 logger = logging.getLogger(__name__)
 
 
 def _default_config_path() -> str:
-    return os.path.join(os.path.expanduser("~"), ".racelink", "standalone_config.json")
+    return user_data_path("rl_standalone_config.json")
+
+
+def _options_for_disk(options: Dict[str, Any]) -> Dict[str, Any]:
+    """Unwrap JSON-string option values into nested objects for storage.
+
+    The shared controller stores some options (notably ``rl_state_v1``) as
+    a JSON-serialised *string* so the option store stays a plain string KV
+    map (RotorHazard-DB parity). Writing that straight to the standalone
+    JSON file double-escapes the embedded JSON. Parsing such values into
+    real objects here keeps the on-disk config human-readable;
+    :func:`_options_from_disk` reverses it so the controller still receives
+    a string on load.
+    """
+    result: Dict[str, Any] = {}
+    for key, value in options.items():
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                result[key] = parsed
+                continue
+        result[key] = value
+    return result
+
+
+def _options_from_disk(options: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-serialise nested-object option values back to JSON strings.
+
+    Inverse of :func:`_options_for_disk`: values stored as nested
+    objects/arrays are converted back to the JSON *string* the shared
+    controller expects to read from the option store.
+    """
+    result: Dict[str, Any] = {}
+    for key, value in options.items():
+        if isinstance(value, (dict, list)):
+            result[key] = json.dumps(value, separators=(",", ":"))
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass
@@ -30,6 +73,8 @@ class StandaloneConfig:
     @classmethod
     def load(cls, path: Optional[str] = None) -> "StandaloneConfig":
         cfg_path = path or _default_config_path()
+        if path is None:
+            migrate_legacy_name(cfg_path, "standalone_config.json")
         if not os.path.exists(cfg_path):
             return cls(path=cfg_path)
         with open(cfg_path, "r", encoding="utf-8") as file_handle:
@@ -39,7 +84,7 @@ class StandaloneConfig:
             host=str(raw.get("host", "127.0.0.1")),
             port=int(raw.get("port", 5077) or 5077),
             debug=bool(raw.get("debug", False)),
-            options=dict(raw.get("options", {}) or {}),
+            options=_options_from_disk(dict(raw.get("options", {}) or {})),
         )
 
     def ensure_parent_dir(self) -> None:
@@ -52,7 +97,7 @@ class StandaloneConfig:
             "host": self.host,
             "port": int(self.port),
             "debug": bool(self.debug),
-            "options": dict(self.options or {}),
+            "options": _options_for_disk(self.options or {}),
         }
 
     def save(self) -> None:

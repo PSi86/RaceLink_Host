@@ -1,5 +1,7 @@
 """Business services for RaceLink application behavior."""
 
+import sys
+
 from .config_service import ConfigService
 from .control_service import ControlService
 from .discovery_service import DiscoveryService
@@ -18,9 +20,24 @@ from .status_service import StatusService
 from .stream_service import StreamService
 from .sync_service import SyncService
 
+
+def create_host_wifi_service():
+    """Return the host-WiFi backend for the current OS.
+
+    Windows uses the ``netsh wlan`` backend; everything else uses the
+    nmcli/NetworkManager backend. Both expose the same public API the OTA
+    workflow relies on.
+    """
+    if sys.platform.startswith("win"):
+        from .netsh_wifi_service import NetshWifiService
+        return NetshWifiService()
+    return HostWifiService()
+
+
 __all__ = [
     "ConfigService",
     "ControlService",
+    "create_host_wifi_service",
     "DiscoveryService",
     "GatewayService",
     "HostWifiService",
