@@ -171,8 +171,17 @@ def run_standalone(config: StandaloneConfig | None = None):
     _configure_logging()
     cfg = config or StandaloneConfig.load()
     app, rl_app = create_standalone_app(cfg)
+    from ._sim import apply_simulation, is_sim_enabled
     try:
-        rl_app.rl_instance.onStartup({})
+        if is_sim_enabled():
+            # Demo / screenshot mode: skip the real hardware probe
+            # (``discoverPort``) and seed a deterministic mock dataset plus
+            # simulated transports instead. Guarded by ``RACELINK_SIM`` so a
+            # normal launch is unaffected.
+            rl_app.rl_instance.load_from_db()
+            apply_simulation(rl_app.rl_instance)
+        else:
+            rl_app.rl_instance.onStartup({})
     except Exception as ex:  # pragma: no cover
         logger.warning("RaceLink standalone startup encountered an issue: %s", ex)
     if _browser_open_requested():

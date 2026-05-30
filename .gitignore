@@ -24,6 +24,10 @@ CLAUDE.local.md
 # Pytest cache
 .pytest_cache/
 
+# Generated screenshot documentation (produced by tools/screenshots/capture.py).
+# Local docs artefact — never committed and never shipped in the wheel.
+docs/screenshots/
+
 # Leftover standalone config files produced by tests that fail mid-run
 .standalone-test-*
 .standalone_config-*.tmp

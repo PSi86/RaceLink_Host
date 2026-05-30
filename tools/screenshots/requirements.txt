@@ -1,0 +1,3 @@
+# Screenshot documentation harness (local/offline + optional CI).
+# After installing, run the one-time browser download:  playwright install chromium
+playwright>=1.40

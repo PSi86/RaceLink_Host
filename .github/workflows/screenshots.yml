@@ -1,0 +1,62 @@
+name: Screenshot Documentation
+
+# Manually-triggered capture of the WebUI screenshot documentation. Primary use
+# is local (tools/screenshots/capture.py); this job exists to verify the
+# workflow runs in CI and to produce a downloadable artifact. The screenshots
+# are NOT committed (docs/screenshots/ is git-ignored) — they upload as a build
+# artifact instead.
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to capture from"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.target_branch }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build the WebUI bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the Host + capture deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install -r tools/screenshots/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Capture screenshots
+        run: python tools/screenshots/capture.py --force
+
+      - name: Upload screenshots artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: racelink-host-screenshots
+          path: docs/screenshots/
+          if-no-files-found: error
