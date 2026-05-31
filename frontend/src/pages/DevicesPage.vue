@@ -75,7 +75,7 @@ const headerGroupLabel = computed<string>(() => {
 </script>
 
 <template>
-  <main class="grid h-full min-h-0 grid-cols-[260px_1fr] gap-3 overflow-hidden p-3">
+  <main class="grid h-full min-h-0 grid-cols-[minmax(16rem,max-content)_minmax(0,1fr)] gap-3 overflow-hidden p-3">
     <DevicesSidebar />
     <section class="min-h-0 overflow-auto rounded-[10px] border border-border bg-card p-2.5">
       <!-- Selected-group header band. Left: group label. Right:

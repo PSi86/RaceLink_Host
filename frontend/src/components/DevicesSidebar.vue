@@ -251,7 +251,7 @@ function onEditGroupInputMount(el: unknown) {
 </script>
 
 <template>
-  <aside class="flex h-full min-h-0 flex-col rounded-[10px] border border-border bg-card p-2.5">
+  <aside class="flex h-full min-h-0 max-w-[24rem] flex-col rounded-[10px] border border-border bg-card p-2.5">
     <!-- Stage 4 Block 1: per-network filter. Hidden when only one
          network exists (N=1 deployment) so the dropdown doesn't add
          visual noise to the single-gateway UX. -->
