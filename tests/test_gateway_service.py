@@ -146,6 +146,12 @@ class FakeController:
         self.applied.append((dev, option, data0))
 
     @property
+    def transports(self):
+        # Mirror the real controller's public accessor (used by the
+        # gateway service's network-id resolution helper).
+        return list(self._transports)
+
+    @property
     def device_repository(self):
         return self._device_repository
 
@@ -336,6 +342,82 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertEqual(controller.dev.groupId, 3)
         # Plan P2-6: async worker calls setNodeGroupId with wait_for_ack=True
         self.assertEqual(controller.group_assignments, [("AABBCCDDEEFF", 3, True, True)])
+
+    def test_identify_stamps_device_network_from_receiving_gateway_when_missing(self):
+        # Multi-gateway routing fix: an RF device with no network binding
+        # must adopt the network of the gateway that heard it, so the
+        # auto-restore SET_GROUP (and every later unicast) routes via THAT
+        # gateway instead of falling back to the primary transport.
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = None
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+        service._join_auto_restore_workers(timeout=2.0)
+
+        self.assertEqual(controller.dev.network_id, "net-track")
+
+    def test_identify_does_not_override_existing_device_network(self):
+        # A device heard on a gateway bound to a *different* network keeps
+        # its stored binding — that divergence is a migration / cross-net
+        # case, not something the IDENTIFY path silently rewrites.
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-other"
+        controller.dev.groupId = 0  # == reported, so no auto-restore noise
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.dev.network_id, "net-other")
+
+    def test_identify_stamps_new_rf_device_network(self):
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("001122334455"),
+            "groupId": 5,
+            "caps": 2,
+            "version": 4,
+            "gateway_id": "TEST-GW",
+        })
+
+        new_dev = controller.device_repository.get_by_addr("001122334455")
+        self.assertIsNotNone(new_dev)
+        self.assertEqual(new_dev.network_id, "net-track")
+
+    def test_network_id_for_gateway_id_resolution(self):
+        controller = FakeController()
+        controller.transport.network_id = "net-track"  # ident_mac == "TEST-GW"
+        service = GatewayService(controller)
+        self.assertEqual(service._network_id_for_gateway_id("TEST-GW"), "net-track")
+        self.assertIsNone(service._network_id_for_gateway_id("UNKNOWN-GW"))
+        self.assertIsNone(service._network_id_for_gateway_id(None))
+        # ETH ident encodes the network id inline (fallback when no matching
+        # transport is attached).
+        self.assertEqual(service._network_id_for_gateway_id("ETH:net-eth"), "net-eth")
 
     def test_identify_reply_with_reported_nonzero_group_does_not_auto_reassign_known_device(self):
         controller = FakeController()

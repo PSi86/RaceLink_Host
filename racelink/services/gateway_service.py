@@ -1845,16 +1845,27 @@ class GatewayService:
                         if not dev:
                             dev_type = ev.get("caps", 0)
                             dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=default_device_name(mac12))
-                            # Stamp the network for devices discovered over an
-                            # Ethernet transport so status routing + isolation
-                            # work (gateway_id == "ETH:<network_id>"). RF devices
-                            # keep their existing (None -> later-assigned) path.
-                            gid = ev.get("gateway_id")
-                            if isinstance(gid, str) and gid.startswith("ETH:"):
-                                eth_nid = gid[4:]
-                                if eth_nid:
-                                    dev.network_id = eth_nid
                             self.controller.device_repository.append(dev)
+
+                        # Bind the device to the network of the gateway that
+                        # just heard it, but ONLY when it has no binding yet —
+                        # never override an existing network_id (a device heard
+                        # on the "wrong" gateway is a migration / divergence
+                        # case, handled by the cross-net STATUS_REPLY guard, not
+                        # here). Without this an RF-discovered device keeps
+                        # network_id=None, so on a multi-gateway host every
+                        # unicast to it (the auto-restore SET_GROUP below, status
+                        # polls, the group's reconciled network) falls back to
+                        # the primary transport instead of the gateway it
+                        # actually lives on. ETH idents encode the network id;
+                        # RF idents resolve via the receiving transport's bound
+                        # network_id (stamped at attach).
+                        if not getattr(dev, "network_id", None):
+                            inferred_nid = self._network_id_for_gateway_id(
+                                ev.get("gateway_id")
+                            )
+                            if inferred_nid:
+                                dev.network_id = inferred_nid
 
                         dev.update_from_identify(
                             ev.get("version"),
@@ -1884,6 +1895,27 @@ class GatewayService:
             self.pending_try_match(ev)
         except Exception:
             logger.exception("RaceLink: RX hook failed")
+
+    def _network_id_for_gateway_id(self, gateway_id) -> Optional[str]:
+        """Resolve the bound ``network_id`` of the transport an event came in
+        on (``gateway_id`` = the source transport's ``ident_mac``).
+
+        RF gateways and Ethernet transports both carry their bound
+        ``network_id`` (stamped at attach), so a lookup by ``ident_mac``
+        covers both. ``"ETH:<network_id>"`` idents also encode the id inline,
+        used as a fallback if the transport isn't in the list yet. Returns
+        ``None`` when the gateway is unknown or unbound.
+        """
+        if not gateway_id:
+            return None
+        gid = str(gateway_id)
+        for t in (getattr(self.controller, "transports", None) or []):
+            if str(getattr(t, "ident_mac", "") or "") == gid:
+                nid = str(getattr(t, "network_id", "") or "")
+                return nid or None
+        if gid.startswith("ETH:"):
+            return gid[4:] or None
+        return None
 
     def _restore_known_device_group(
         self,
