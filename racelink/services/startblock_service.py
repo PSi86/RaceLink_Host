@@ -231,13 +231,22 @@ class StartblockService:
             sent = []
             for slot0, callsign, racechannel in slots_0based:
                 slot1 = slot0 + 1
-                if slot_to_dev.get(slot1) is None:
+                dev = slot_to_dev.get(slot1)
+                if dev is None:
                     continue  # no startblock device in this group covers this slot
                 payload = build_startblock_payload_v1(slot1, racechannel, callsign)
+                # Unicast each slot to the device that OWNS it, not a broadcast
+                # to the whole group. Every slot has exactly one owner
+                # (slot_to_dev), so a group broadcast would needlessly wait for
+                # ACKs from every other online group member — including
+                # non-startblock nodes or devices that don't own this slot,
+                # which never ACK an OPC_STREAM and burned the full retry budget
+                # per slot. Same model the unicast path uses.
                 sent.append(
                     {
                         "slot": slot1,
-                        "result": self.stream_service.send_stream(payload, groupId=group_id),
+                        "device": getattr(dev, "addr", None),
+                        "result": self.stream_service.send_stream(payload, device=dev),
                     }
                 )
             return {

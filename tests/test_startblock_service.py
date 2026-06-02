@@ -114,13 +114,16 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(result["mode"], "group")
         self.assertEqual(result["groupId"], 7)
         self.assertEqual(len(stream_service.calls), 8)
-        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        # Each slot is unicast to its owning device, not broadcast to the group.
+        self.assertTrue(all(call["device"] is dev for call in stream_service.calls))
+        self.assertTrue(all(call["groupId"] is None for call in stream_service.calls))
         self.assertEqual(stream_service.calls[0]["payload"][5:], b"ALPHA")
         self.assertEqual(stream_service.calls[1]["payload"][5:], b"BRAVO")
 
-    def test_send_startblock_control_group_mode_sends_only_covered_slots(self):
+    def test_send_startblock_control_group_mode_unicasts_each_slot_to_owner(self):
         # Two devices cover slots 1-2 and 3-4 → only those 4 slots stream,
-        # not all 8. Derived from the devices' Number-of-slots / First-slot.
+        # each UNICAST to the device that owns it (never a group broadcast
+        # that would wait on non-owner members' ACKs).
         dev_a = self._sb_device("AABBCCDDEEFF", "SB-A", group=7, slots=2, first=1)
         dev_b = self._sb_device("001122334455", "SB-B", group=7, slots=2, first=3)
         controller = FakeController([dev_a, dev_b])
@@ -132,7 +135,12 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(result["mode"], "group")
         self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
         self.assertEqual(len(stream_service.calls), 4)
-        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        # slots 1-2 -> dev_a, slots 3-4 -> dev_b; no groupId broadcasts.
+        self.assertEqual(
+            [c["device"] for c in stream_service.calls],
+            [dev_a, dev_a, dev_b, dev_b],
+        )
+        self.assertTrue(all(call["groupId"] is None for call in stream_service.calls))
 
     def test_send_startblock_control_group_mode_no_startblock_device_sends_nothing(self):
         # A device in the group that isn't STARTBLOCK-capable doesn't drive
