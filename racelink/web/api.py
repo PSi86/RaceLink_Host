@@ -542,7 +542,7 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/networks", methods=["POST"])
     def api_network_create():
-        """Create a new Ethernet-kind network (Ethernet PoC).
+        """Create a new Ethernet-kind network.
 
         RF networks are created via the gateway-bind wizard (they need a
         probed ``rf_config``); this endpoint is the lightweight seed for an

@@ -1,18 +1,22 @@
-"""EthernetTransport tests (Ethernet PoC).
+"""EthernetTransport tests.
 
-Three layers:
+Layers:
 
   1. Identity / state-shim contract (no sockets).
   2. Send path — datagrams hit a loopback UDP "node" socket with the exact
-     ``[type_full][recv3][body]`` framing the firmware will expect, and the
+     ``[type_full][recv3][body]`` framing the firmware expects, and the
      send returns ``SendOutcome(code="SUCCESS")``.
   3. RX path — a crafted N2M IDENTIFY_REPLY / STATUS_REPLY datagram fed to the
      transport's socket is parsed into the same event shape the host expects
      (via ``parse_reply_event``) and tagged with ``gateway_id="ETH:<id>"``.
+  4. End-to-end against ``scripts/mock_ethernet_node.py`` over loopback UDP:
+     * transport-level — every RaceLink opcode round-trips (apply for the
+       RESP_NONE ops, ACK / GET_CONFIG_REPLY for the reply-bearing ones).
+     * gateway-level — a real ``RaceLink_Host`` + ``GatewayService`` drives the
+       operator paths (``send_config(wait_for_ack)`` / ``setNodeGroupId`` /
+       ``send_stream``) and the matcher collects the node's ACK over UDP.
 
-Plus an end-to-end test against ``scripts/mock_ethernet_node.py``: discovery
-finds the mock node, status polls telemetry, and a preset is applied. All on
-127.0.0.1; skipped gracefully if loopback UDP is unavailable.
+All e2e on 127.0.0.1; skipped gracefully if loopback UDP is unavailable.
 """
 
 from __future__ import annotations
@@ -39,7 +43,35 @@ from racelink.protocol.packets import (
 
 DIR_N2M = 0x80
 OPC_DEVICES = 1
+OPC_SET_GROUP = 2
 OPC_STATUS = 3
+OPC_CONFIG = 5
+OPC_SYNC = 6
+OPC_STREAM = 7
+OPC_CONTROL = 8
+OPC_OFFSET = 9
+OPC_INDICATE = 12
+
+
+class _FakeHostApi:
+    """Minimal host_api stand-in for constructing a real ``RaceLink_Host``
+    in the gateway-level e2e (mirrors the fake in test_multi_transport)."""
+
+    class _Db:
+        def option(self, key, default=None):
+            return default
+
+        def set_option(self, key, value):
+            pass
+
+    def __init__(self):
+        self.db = _FakeHostApi._Db()
+
+    def fire_event(self, *_a, **_kw):
+        pass
+
+    def log(self, *_a, **_kw):
+        pass
 
 
 def _free_udp_port(host="127.0.0.1") -> int:
@@ -262,8 +294,9 @@ def _load_mock_node_module():
     return mod
 
 
-class EthernetPocE2ETests(unittest.TestCase):
-    """End-to-end against the stdlib mock node on loopback."""
+class EthernetTransportE2ETests(unittest.TestCase):
+    """Transport-level end-to-end against the stdlib mock node on loopback:
+    every RaceLink opcode round-trips over UDP."""
 
     def setUp(self):
         self.mod = _load_mock_node_module()
@@ -300,6 +333,12 @@ class EthernetPocE2ETests(unittest.TestCase):
     def _replies(self, kind: str):
         return [e for e in self.events if e.get("reply") == kind]
 
+    def _saw_ack(self, ack_of: int) -> bool:
+        return any(e.get("ack_of") == ack_of for e in self._replies("ACK"))
+
+    def _node_saw(self, opc: int) -> bool:
+        return any(o == opc for o, _body in self.node.recv_log)
+
     def test_discovery_status_preset_roundtrip(self):
         # Discovery: broadcast OPC_DEVICES -> IDENTIFY_REPLY from the node.
         self.t.send_get_devices()
@@ -317,6 +356,114 @@ class EthernetPocE2ETests(unittest.TestCase):
         self.t.send_preset(self.mac6[-3:], group_id=1, flags=1, preset_id=5, brightness=222)
         self.assertTrue(_wait_for(lambda: self.node.brightness == 222))
         self.assertEqual(self.node.preset_id, 5)
+
+    def test_full_opcode_set_roundtrip(self):
+        last3 = self.mac6[-3:]
+
+        # SET_GROUP (ACK): node applies the group and ACKs.
+        self.t.send_set_group(last3, group_id=7)
+        self.assertTrue(_wait_for(lambda: self.node.group == 7))
+        self.assertTrue(_wait_for(lambda: self._saw_ack(OPC_SET_GROUP)))
+
+        # CONFIG (ACK): node stores the option and ACKs.
+        self.t.send_config(recv3=last3, option=12, data0=3, data1=4)
+        self.assertTrue(_wait_for(lambda: self.node.config_store.get(12) == (3, 4, 0, 0)))
+        self.assertTrue(_wait_for(lambda: self._saw_ack(OPC_CONFIG)))
+
+        # GET_CONFIG (SPECIFIC): reply echoes the stored P_Config.
+        self.t.send_get_config(last3, option=12)
+        self.assertTrue(_wait_for(lambda: self._replies("GET_CONFIG_REPLY")))
+        rep = self._replies("GET_CONFIG_REPLY")[-1]
+        self.assertEqual((rep["option"], rep["data0"], rep["data1"]), (12, 3, 4))
+
+        # RESP_NONE ops: no reply, but the node records each one.
+        self.t.send_control(last3, group_id=1, flags=0, brightness=90)
+        self.t.send_sync(ts24=1000, brightness=40)
+        self.t.send_offset(group_id=1, mode="explicit", offset_ms=50)
+        self.t.send_indicate(b"\xFF\xFF\xFF", indicator_type=1, duration_sec=3)
+        for opc in (OPC_CONTROL, OPC_SYNC, OPC_OFFSET, OPC_INDICATE):
+            self.assertTrue(_wait_for(lambda o=opc: self._node_saw(o)),
+                            f"node never saw opc=0x{opc:02X}")
+
+        # STREAM (ACK): chunked payload reassembles and ACKs on the stop packet.
+        payload = bytes(range(20))
+        self.t.send_stream(last3, payload)
+        self.assertTrue(_wait_for(lambda: self.node.last_stream_payload is not None))
+        self.assertEqual(self.node.last_stream_payload[:20], payload)
+        self.assertTrue(_wait_for(lambda: self._saw_ack(OPC_STREAM)))
+
+
+class EthernetGatewayE2ETests(unittest.TestCase):
+    """Gateway-level end-to-end: a real ``RaceLink_Host`` + ``GatewayService``
+    drives the operator paths over UDP and the per-gateway matcher registry
+    collects the mock node's ACK / reply through ``on_transport_event``."""
+
+    def setUp(self):
+        self.mod = _load_mock_node_module()
+        try:
+            self.node_port = _free_udp_port()
+        except OSError:
+            self.skipTest("loopback UDP unavailable")
+        self.mac6 = bytes.fromhex("AABBCCDDEE0B")
+        self.mac12 = self.mac6.hex().upper()
+        self.node = self.mod.MockNode(
+            mac6=self.mac6, group=0, dev_type=10,
+            node_port=self.node_port, bind_host="127.0.0.1",
+        )
+        self.node_thread = threading.Thread(target=self.node.serve, daemon=True)
+        self.node_thread.start()
+        time.sleep(0.1)  # let the node bind
+
+        # Lazy import (mirrors test_multi_transport) so the module loads
+        # without a configured host_api.
+        from racelink.controller import RaceLink_Host
+        from racelink.domain import RL_Device
+
+        self.host = RaceLink_Host(_FakeHostApi(), "test", "Test")
+        self.net_id = "net-eth-gw"
+        self.t = EthernetTransport(
+            self.net_id,
+            node_port=self.node_port,
+            host_port=0,
+            bind_host="127.0.0.1",
+            broadcast_host="127.0.0.1",
+        )
+        self.t.open()
+        self.t.start()
+        # Attach the transport (network_id already stamped in the ctor) and
+        # install the RX hooks so replies feed the matcher registry.
+        self.host._transports = [self.t]
+        self.host.gateway_service.install_transport_hooks(transport=self.t)
+        self.dev = RL_Device(
+            addr=self.mac12, dev_type=10, name="ETH Node",
+            network_id=self.net_id,
+        )
+        self.host.device_repository.append(self.dev)
+
+    def tearDown(self):
+        self.t.close()
+        self.node.stop()
+        self.node_thread.join(timeout=2.0)
+
+    def test_send_config_wait_for_ack(self):
+        recv3 = self.mac6[-3:]
+        ok = self.host.gateway_service.send_config(
+            option=9, data0=42, recv3=recv3, wait_for_ack=True,
+        )
+        self.assertTrue(ok, "send_config did not collect the node ACK over UDP")
+        self.assertEqual(self.node.config_store.get(9), (42, 0, 0, 0))
+
+    def test_set_node_group_id_acked(self):
+        self.dev.groupId = 5
+        ok = self.host.setNodeGroupId(self.dev)
+        self.assertTrue(ok, "setNodeGroupId did not collect the SET_GROUP ACK")
+        self.assertTrue(_wait_for(lambda: self.node.group == 5))
+
+    def test_send_stream_acked(self):
+        res = self.host.gateway_service.send_stream(payload=b"hello-eth", device=self.dev)
+        self.assertEqual(res.get("acked"), 1)
+        self.assertTrue(_wait_for(lambda: self.node.last_stream_payload is not None))
+        self.assertEqual(self.node.last_stream_payload[:9], b"hello-eth")
 
 
 if __name__ == "__main__":  # pragma: no cover
