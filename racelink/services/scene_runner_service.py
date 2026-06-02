@@ -29,7 +29,7 @@ from .dispatch_planner import (
     ActionDispatchPlan,
     plan_action_dispatch,
 )
-from .scene_network_scope import scene_network_ids
+from .scene_network_scope import _network_ids_for_target, scene_network_ids
 from .scenes_service import (
     KIND_DELAY,
     KIND_OFFSET_GROUP,
@@ -603,9 +603,37 @@ class SceneRunnerService:
             plan.detail.get("offset_packets", 0),
             plan.detail.get("child_count", 0),
         )
-        return self._execute_plan(
-            index=index, kind=KIND_OFFSET_GROUP, plan=plan, started=started,
+        # Scope inheritance: a child action's "broadcast" must mean "the full
+        # scope of the parent (this container)", not fleet-wide. For a
+        # non-broadcast container we narrow the broadcast scope to the
+        # networks the container's own target resolves to, for the duration
+        # of this container's dispatch — so a child broadcast op (and the
+        # container's own broadcast-formula offset op) fan out only to the
+        # parent's networks. A broadcast container leaves the scene-level
+        # scope untouched (broadcast parent = the scene's full scope).
+        container_target = action.get("target")
+        is_broadcast_container = (
+            not isinstance(container_target, dict)
+            or container_target.get("kind") == "broadcast"
         )
+        prev_scope = self._current_broadcast_scope
+        prev_explicit_empty = self._broadcast_is_explicit_empty
+        if not is_broadcast_container:
+            nids = list(_network_ids_for_target(self.controller, container_target))
+            self._current_broadcast_scope = (
+                BroadcastTarget.from_ids(nids) if nids else None
+            )
+            # The container's concrete target governs now; the scene-level
+            # explicit-empty guard (which gates fleet-wide SYNC fallback)
+            # does not apply to a parent that names its own networks.
+            self._broadcast_is_explicit_empty = False
+        try:
+            return self._execute_plan(
+                index=index, kind=KIND_OFFSET_GROUP, plan=plan, started=started,
+            )
+        finally:
+            self._current_broadcast_scope = prev_scope
+            self._broadcast_is_explicit_empty = prev_explicit_empty
 
     def _known_group_ids(self) -> List[int]:
         """Best-effort list of currently-configured group ids.
