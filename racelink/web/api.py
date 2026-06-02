@@ -318,7 +318,13 @@ def _prepare_discover_target(ctx, *, target_gid, new_group_name):
                 ctx.rl_grouplist.append(group)
                 created_gid = len(ctx.rl_grouplist) - 1
             ctx.log(f"RaceLink: Created group '{new_group_name}' (id={created_gid})")
-        if target_gid is None and created_gid is not None:
+        # A freshly-created group is the explicit destination for the
+        # discovered devices and takes precedence over the "Add discovered
+        # to" selector. The dialog always sends a ``targetGroupId`` (default
+        # Unconfigured = 0), so a ``target_gid is None`` guard never fired
+        # when a name was typed — the group got created but the devices were
+        # dropped into the selector's group (e.g. Unconfigured) instead.
+        if created_gid is not None:
             target_gid = created_gid
     return target_gid, created_gid
 
