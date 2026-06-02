@@ -115,6 +115,12 @@ def _apply_device_meta_updates(
     changed = 0
     skipped_offline = 0
     timed_out = 0
+    # Group ids whose membership changed in this batch — the group(s) a
+    # device left and the group it joined. After the moves are applied we
+    # recompute each one's network binding: the joined group inherits the
+    # device's network (stamping its RF/Ethernet kind on first member), and
+    # any group left empty reverts to network-agnostic.
+    affected_gids: set[int] = set()
     for index, mac in enumerate(macs, start=1):
         if progress_cb:
             progress_cb(index, total, mac, "MOVING", f"Moving {mac} → group {new_group}")
@@ -141,7 +147,13 @@ def _apply_device_meta_updates(
                 changed += 1
             if new_group is None:
                 continue
+            try:
+                old_gid = int(getattr(dev, "groupId", 0) or 0)
+            except (TypeError, ValueError):
+                old_gid = 0
             dev.groupId = int(new_group)
+            affected_gids.add(old_gid)
+            affected_gids.add(int(new_group))
             was_online = bool(getattr(dev, "link_online", False))
         # Lock released -- the reader thread can now drain ACKs from the
         # previous iteration and complete matches for the *current* one.
@@ -173,6 +185,20 @@ def _apply_device_meta_updates(
             logger.warning(
                 "setNodeGroupId failed for %s", mac, exc_info=True,
             )
+    # Re-derive each touched group's network binding now that every move
+    # is applied. ``reconcile_group_network`` ignores Unconfigured (0) and
+    # static groups; a joined group inherits the member's network, an
+    # emptied group falls back to ``None`` (network-agnostic).
+    if affected_gids:
+        with ctx.rl_lock:
+            for gid in affected_gids:
+                try:
+                    ctx.rl_instance.reconcile_group_network(gid)
+                except Exception:
+                    logger.warning(
+                        "reconcile_group_network failed for group %s", gid,
+                        exc_info=True,
+                    )
     return {
         "changed": changed,
         "skipped_offline": skipped_offline,
@@ -275,23 +301,16 @@ def _prepare_discover_target(ctx, *, target_gid, new_group_name):
     logic can be unit-tested without a Flask request context.
     """
     created_gid = None
-    # Stage 3 Part B: inherit the default network_id so discover-
-    # created groups participate in the boundary check on subsequent
-    # bulk-set operations.
-    net_repo = getattr(ctx.rl_instance, "network_repository", None)
-    default_network_id = None
-    if net_repo is not None:
-        try:
-            items = list(net_repo.list())
-            if items:
-                default_network_id = str(getattr(items[0], "id", "") or "") or None
-        except Exception:
-            logger.exception("_prepare_discover_target: default network lookup raised")
+    # A discover-created group is network-agnostic (``network_id=None``)
+    # like any other new group: the discovered devices that land in it
+    # stamp its network via ``reconcile_group_network``, so the group's
+    # RF/Ethernet kind is decided by its members, not by create-time
+    # defaulting.
     with ctx.rl_lock:
         if new_group_name:
             group = ctx.RL_DeviceGroup(
                 str(new_group_name), static_group=0, dev_type=0,
-                network_id=default_network_id,
+                network_id=None,
             )
             if ctx.group_repo is not None:
                 created_gid = ctx.group_repo.append(group)
@@ -299,7 +318,13 @@ def _prepare_discover_target(ctx, *, target_gid, new_group_name):
                 ctx.rl_grouplist.append(group)
                 created_gid = len(ctx.rl_grouplist) - 1
             ctx.log(f"RaceLink: Created group '{new_group_name}' (id={created_gid})")
-        if target_gid is None and created_gid is not None:
+        # A freshly-created group is the explicit destination for the
+        # discovered devices and takes precedence over the "Add discovered
+        # to" selector. The dialog always sends a ``targetGroupId`` (default
+        # Unconfigured = 0), so a ``target_gid is None`` guard never fired
+        # when a name was typed — the group got created but the devices were
+        # dropped into the selector's group (e.g. Unconfigured) instead.
+        if created_gid is not None:
             target_gid = created_gid
     return target_gid, created_gid
 
@@ -517,7 +542,7 @@ def register_api_routes(bp, ctx):
 
     @bp.route("/api/networks", methods=["POST"])
     def api_network_create():
-        """Create a new Ethernet-kind network (Ethernet PoC).
+        """Create a new Ethernet-kind network.
 
         RF networks are created via the gateway-bind wizard (they need a
         probed ``rf_config``); this endpoint is the lightweight seed for an
@@ -2002,24 +2027,18 @@ def register_api_routes(bp, ctx):
         dev_type = int(body.get("dev_type", body.get("device_type", 0)) or 0)
         if not name:
             return jsonify({"ok": False, "error": "name required"}), 400
-        # Stage 3 Part B: new groups inherit the default network id
-        # so the boundary validator has a concrete network anchor for
-        # every membership check. Pre-Stage-4 there is no operator UI
-        # to pick a different network at create time; the v1→v2
-        # migration ensures the default network always exists.
-        net_repo = getattr(ctx.rl_instance, "network_repository", None)
-        default_network_id = None
-        if net_repo is not None:
-            try:
-                items = list(net_repo.list())
-                if items:
-                    default_network_id = str(getattr(items[0], "id", "") or "") or None
-            except Exception:
-                logger.exception("api_groups_create: default network lookup raised")
+        # A new group is network-agnostic: it carries no RF/Ethernet
+        # binding (``network_id=None``) until a device joins it. The first
+        # member decides the group's network — and therefore its kind —
+        # via ``reconcile_group_network`` on the move; an emptied group
+        # reverts to ``None``. The boundary validator already treats a
+        # ``None``-network group as "no constraint, always allowed", so a
+        # device from any network (RF or Ethernet) can be the first to land
+        # here.
         with ctx.rl_lock:
             new_group = ctx.RL_DeviceGroup(
                 name, static_group=0, dev_type=dev_type,
-                network_id=default_network_id,
+                network_id=None,
             )
             if ctx.group_repo is not None:
                 gid = ctx.group_repo.append(new_group)

@@ -109,6 +109,23 @@ class PrepareDiscoverTargetTests(unittest.TestCase):
         self.assertIsNone(created)
         self.assertEqual(repo.items, [])
 
+    def test_new_group_name_overrides_target_selector(self):
+        # Regression: the Discover dialog always sends ``targetGroupId``
+        # (default Unconfigured = 0). When a new-group name is ALSO given,
+        # the freshly-created group must become the destination — not the
+        # selector's group. Previously the override only fired for
+        # ``target_gid is None``, so devices landed in Unconfigured while
+        # the named group was created empty.
+        repo = _FakeGroupRepo()
+        repo.items.append(object())  # stand-in for the Unconfigured anchor (id 0)
+        ctx = _fake_ctx(group_repo=repo)
+        target, created = _prepare_discover_target(
+            ctx, target_gid=0, new_group_name="Test12",
+        )
+        self.assertEqual(created, 1)
+        self.assertEqual(target, 1)
+        self.assertEqual(repo.items[1].name, "Test12")
+
     def test_uses_list_fallback_without_group_repo(self):
         fallback = []
         ctx = _fake_ctx(group_repo=None, rl_grouplist=fallback)

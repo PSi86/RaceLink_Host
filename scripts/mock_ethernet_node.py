@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Mock RaceLink Ethernet node (UDP) for the EthernetTransport PoC.
+"""Mock RaceLink Ethernet node (UDP) — full RaceLink opcode emulator.
 
 Stdlib-only standalone device emulator. It speaks the same RaceLink wire
 opcodes the host's :class:`racelink.transport.ethernet_transport.EthernetTransport`
-sends, so a real host can discover it, poll its status, and apply presets over
-UDP — no firmware required.
+sends and answers them exactly as the real firmware does over the W5500/UDP
+backend (which feeds the same backend-agnostic ``handlePacket`` dispatch as the
+LoRa build), so a real host can discover, poll, apply presets, set groups,
+control, sync, offset, configure, read config, indicate, and stream — over UDP,
+no firmware required.
 
 Wire framing (matches EthernetTransport):
 
@@ -14,10 +17,22 @@ Wire framing (matches EthernetTransport):
   where ``Header7 = sender3(3) + receiver3(3) + type(1)``. Replies are sent
   back to the datagram's source address (the host's bound port).
 
-Supported opcodes (PoC scope):
-  * OPC_DEVICES (0x01) -> IDENTIFY_REPLY (version, caps, groupId, mac6)
-  * OPC_STATUS  (0x03) -> STATUS_REPLY  (flags, configByte, effectId, brightness, vbat, rssi, snr)
-  * OPC_PRESET  (0x04) -> applied locally (logged), no reply (RESP_NONE)
+Supported opcodes (response policy in parentheses — mirrors the proto rules):
+  * OPC_DEVICES   (0x01, SPECIFIC) -> IDENTIFY_REPLY (version, caps, groupId, mac6)
+  * OPC_SET_GROUP (0x02, ACK)      -> apply groupId + ACK
+  * OPC_STATUS    (0x03, SPECIFIC) -> STATUS_REPLY (flags, configByte, effectId, brightness, vbat, rssi, snr)
+  * OPC_PRESET    (0x04, NONE)     -> apply locally, no reply
+  * OPC_CONFIG    (0x05, ACK)      -> store option/data, ACK
+  * OPC_SYNC      (0x06, NONE)     -> apply locally, no reply
+  * OPC_STREAM    (0x07, ACK)      -> reassemble chunks, ACK on the stop packet
+  * OPC_CONTROL   (0x08, NONE)     -> apply locally, no reply
+  * OPC_OFFSET    (0x09, NONE)     -> apply locally, no reply
+  * OPC_GET_CONFIG(0x0A, SPECIFIC) -> GET_CONFIG_REPLY (5 B P_Config)
+  * OPC_HEADLESS  (0x0B, NONE)     -> apply locally, no reply
+  * OPC_INDICATE  (0x0C, NONE)     -> apply locally, no reply
+
+RF-config opcodes (OPC_RF_CONFIG / OPC_GET_RF_CONFIG) are LoRa-PHY only and are
+deliberately not emulated — the host never sends them to an Ethernet node.
 
 Run several instances with different ``--mac`` / ``--node-port`` to emulate a
 small fleet.
@@ -41,8 +56,20 @@ OPC_DEVICES = 0x01
 OPC_SET_GROUP = 0x02
 OPC_STATUS = 0x03
 OPC_PRESET = 0x04
+OPC_CONFIG = 0x05
+OPC_SYNC = 0x06
+OPC_STREAM = 0x07
+OPC_CONTROL = 0x08
+OPC_OFFSET = 0x09
+OPC_GET_CONFIG = 0x0A
+OPC_HEADLESS = 0x0B
+OPC_INDICATE = 0x0C
+OPC_ACK = 0x7E
 
 BROADCAST_RECV3 = b"\xFF\xFF\xFF"
+
+# ACK status byte (0 == ACK_OK, mirrors the firmware's ack_status contract).
+ACK_OK = 0x00
 
 # IDENTIFY_REPLY firmware version + status defaults the mock reports.
 MOCK_FW_VERSION = 4
@@ -69,6 +96,16 @@ class MockNode:
         self.effect_id = 0
         self.preset_id = 0
         self.power_on = 1
+        # Per-option config store (option -> (data0, data1, data2, data3)),
+        # written by OPC_CONFIG and read back by OPC_GET_CONFIG.
+        self.config_store: dict[int, tuple[int, int, int, int]] = {}
+        # Last fully-reassembled OPC_STREAM payload (bytes) for assertions.
+        self.last_stream_payload: bytes | None = None
+        self._stream_buf = bytearray()
+        # Log of every addressed M2N frame as (opc, body) so a test can assert
+        # which operations reached the node (incl. the RESP_NONE ones that
+        # produce no reply: CONTROL / SYNC / OFFSET / INDICATE / HEADLESS).
+        self.recv_log: list[tuple[int, bytes]] = []
         self.sock: socket.socket | None = None
         self._running = True
 
@@ -89,6 +126,11 @@ class MockNode:
         assert self.sock is not None
         self.sock.sendto(frame, dest)
 
+    def _ack(self, ack_of: int, dest, status: int = ACK_OK) -> None:
+        """Send an OPC_ACK for ``ack_of`` (P_Ack = [ack_of, status])."""
+        self._reply(OPC_ACK, bytes([ack_of & 0x7F, status & 0xFF]), dest)
+        print(f"[{self.mac6.hex().upper()}] ACK opc=0x{ack_of:02X} status={status}")
+
     def _handle(self, data: bytes, addr) -> None:
         if len(data) < 4:
             return
@@ -100,6 +142,8 @@ class MockNode:
         body = bytes(data[4:])
         if not self._addressed_to_me(recv3):
             return
+
+        self.recv_log.append((opc, body))
 
         if opc == OPC_DEVICES:
             # IDENTIFY_REPLY body: [version, caps, groupId, mac6(6)]
@@ -128,9 +172,49 @@ class MockNode:
                 self.power_on = 1 if (flags & 0x01) else self.power_on
                 print(f"[{self.mac6.hex().upper()}] PRESET applied preset={preset_id} bri={brightness} flags=0x{flags:02X}")
         elif opc == OPC_SET_GROUP:
+            # P_SetGroup body (1 B): groupId. ACK after applying.
             if len(body) >= 1:
                 self.group = body[0] & 0xFF
                 print(f"[{self.mac6.hex().upper()}] SET_GROUP -> {self.group}")
+            self._ack(OPC_SET_GROUP, addr)
+        elif opc == OPC_CONFIG:
+            # P_Config body (5 B): option + data0..3. Store + ACK.
+            if len(body) >= 5:
+                self.config_store[body[0]] = (body[1], body[2], body[3], body[4])
+                print(f"[{self.mac6.hex().upper()}] CONFIG opt={body[0]} -> {self.config_store[body[0]]}")
+            self._ack(OPC_CONFIG, addr)
+        elif opc == OPC_GET_CONFIG:
+            # Body (1 B): option to read. Reply 5 B P_Config (zeros if unset).
+            option = body[0] if body else 0
+            d0, d1, d2, d3 = self.config_store.get(option, (0, 0, 0, 0))
+            self._reply(OPC_GET_CONFIG, bytes([option, d0, d1, d2, d3]), addr)
+            print(f"[{self.mac6.hex().upper()}] GET_CONFIG opt={option} -> ({d0},{d1},{d2},{d3})")
+        elif opc == OPC_STREAM:
+            # P_Stream chunk: [ctrl(1)][data(8)]. ctrl bit7=start, bit6=stop,
+            # low 6 bits = packets_left. Reassemble; ACK on the stop chunk
+            # (mirrors the firmware's handleStreamPacket completion ACK).
+            if body:
+                ctrl = body[0]
+                chunk = body[1:9]
+                if ctrl & 0x80:  # start packet
+                    self._stream_buf = bytearray()
+                self._stream_buf.extend(chunk)
+                if ctrl & 0x40:  # stop packet
+                    self.last_stream_payload = bytes(self._stream_buf)
+                    print(f"[{self.mac6.hex().upper()}] STREAM complete ({len(self.last_stream_payload)} B)")
+                    self._ack(OPC_STREAM, addr)
+        elif opc == OPC_CONTROL:
+            # P_Control (variable): direct effect-parameter remote control.
+            # RESP_NONE — recorded in recv_log; apply brightness if present.
+            print(f"[{self.mac6.hex().upper()}] CONTROL ({len(body)} B)")
+        elif opc == OPC_SYNC:
+            print(f"[{self.mac6.hex().upper()}] SYNC ({len(body)} B)")
+        elif opc == OPC_OFFSET:
+            print(f"[{self.mac6.hex().upper()}] OFFSET ({len(body)} B)")
+        elif opc == OPC_INDICATE:
+            print(f"[{self.mac6.hex().upper()}] INDICATE ({len(body)} B)")
+        elif opc == OPC_HEADLESS:
+            print(f"[{self.mac6.hex().upper()}] HEADLESS ({len(body)} B)")
         else:
             print(f"[{self.mac6.hex().upper()}] ignoring opc=0x{opc:02X}")
 

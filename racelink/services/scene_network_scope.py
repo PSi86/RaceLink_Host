@@ -133,13 +133,29 @@ def _all_known_network_ids(controller) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _network_ids_for_target(controller, target: Mapping[str, Any]) -> Iterable[str]:
+def _network_ids_for_target(
+    controller,
+    target: Mapping[str, Any],
+    *,
+    parent_scope: Optional[Iterable[str]] = None,
+) -> Iterable[str]:
     """Resolve one action's ``target`` to a (possibly empty) iterable
-    of network ids. Helper for :func:`scene_network_ids`."""
+    of network ids. Helper for :func:`scene_network_ids`.
+
+    ``parent_scope`` is the set of network ids the *enclosing* container
+    action addresses. When the target is ``broadcast`` and a parent scope
+    is supplied (i.e. this is a child action inside an ``offset_group``),
+    "broadcast" means "the full scope of the parent action" — NOT every
+    network. Only a top-level broadcast (``parent_scope is None``) keeps
+    the historical fleet-wide meaning. ``groups`` / ``device`` targets
+    resolve to their own networks regardless of the parent.
+    """
     if not isinstance(target, Mapping):
         return ()
     kind = target.get("kind")
     if kind == "broadcast":
+        if parent_scope is not None:
+            return tuple(str(n) for n in parent_scope)
         return _all_known_network_ids(controller)
     if kind == "groups":
         out: list = []
@@ -234,16 +250,26 @@ def scene_network_ids(
         seen.add(s)
         ordered.append(s)
 
-    def _walk(action: Mapping[str, Any]) -> None:
+    def _walk(action: Mapping[str, Any], parent_scope: Optional[Tuple[str, ...]] = None) -> None:
         if not isinstance(action, Mapping):
             return
         target = action.get("target")
         if isinstance(target, Mapping):
-            for nid in _network_ids_for_target(controller, target):
+            resolved = tuple(
+                _network_ids_for_target(controller, target, parent_scope=parent_scope)
+            )
+            for nid in resolved:
                 _add(nid)
+            # This action's resolved networks become the scope its
+            # children's "broadcast" targets inherit.
+            child_scope: Optional[Tuple[str, ...]] = resolved
+        else:
+            # No target of its own (e.g. sync/delay) — children inherit
+            # whatever scope this action was given.
+            child_scope = parent_scope
         # offset_group + future container kinds: descend into children.
         for child in action.get("actions") or ():
-            _walk(child)
+            _walk(child, parent_scope=child_scope)
 
     for action in actions:
         _walk(action)

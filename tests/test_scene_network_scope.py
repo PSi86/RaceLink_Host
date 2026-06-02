@@ -181,6 +181,39 @@ class ActionShapeTests(unittest.TestCase):
         # Deduplicated; ordering: container's target first, then children.
         self.assertEqual(set(ids), {net_a.id, net_b.id})
 
+    def test_child_broadcast_inherits_parent_groups_scope(self):
+        """A child action's ``broadcast`` under a non-broadcast container
+        means "the parent's scope", NOT fleet-wide. Container targets
+        groups[1] (net_a); the child broadcast must resolve to net_a only,
+        never net_b."""
+        ctrl, net_a, net_b = _ctrl_two_networks()
+        scene = {"actions": [
+            {"kind": "offset_group",
+             "target": {"kind": "groups", "value": [1]},  # net_a only
+             "offset": {"mode": "none"},
+             "actions": [
+                 {"kind": "wled_preset", "target": {"kind": "broadcast"}, "params": {}},
+             ]},
+        ]}
+        ids = scene_network_ids(scene, controller=ctrl)
+        self.assertEqual(tuple(ids), (net_a.id,))
+        self.assertNotIn(net_b.id, ids)
+
+    def test_child_broadcast_under_broadcast_parent_stays_fleet_wide(self):
+        """When the container itself is ``broadcast``, a child broadcast
+        inherits that full (fleet-wide) scope — back-compat."""
+        ctrl, net_a, net_b = _ctrl_two_networks()
+        scene = {"actions": [
+            {"kind": "offset_group",
+             "target": {"kind": "broadcast"},
+             "offset": {"mode": "none"},
+             "actions": [
+                 {"kind": "wled_preset", "target": {"kind": "broadcast"}, "params": {}},
+             ]},
+        ]}
+        ids = scene_network_ids(scene, controller=ctrl)
+        self.assertEqual(set(ids), {net_a.id, net_b.id})
+
     def test_ordering_is_first_occurrence(self):
         ctrl, net_a, net_b = _ctrl_two_networks()
         scene = {"actions": [

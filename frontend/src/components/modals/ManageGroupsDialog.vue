@@ -129,9 +129,16 @@ const migrationLabel = computed<string>(() => {
 // canonical network binding from the store, not the stale snapshot
 // in ``draftOrder``. After SSE refreshes ``groups.groups`` on
 // migration done, the badge updates automatically.
+//
+// A group with no ``network_id`` is network-agnostic (empty / not yet
+// bound to a network): return ``null`` so the badge renders the neutral
+// "Unbound" chip rather than misleadingly claiming the default RF
+// network. The first device that joins stamps the group's network
+// (server-side ``reconcile_group_network``); an emptied group reverts
+// to unbound.
 function currentNetworkOf(gid: number): string | null {
   const g = groups.groups.find((entry) => entry.id === gid)
-  return g?.network_id ?? networks.defaultNetworkId
+  return g?.network_id ?? null
 }
 
 // Reset both workflows every time the dialog opens so a previous

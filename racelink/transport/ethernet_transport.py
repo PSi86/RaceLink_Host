@@ -24,8 +24,13 @@ Wire framing (UDP gives message boundaries — no ``[0x00][LEN]`` byte framing):
   transport appends a synthetic ``rssi=0 (LE16) + snr=0 (i8)`` trailer and calls
   ``parse_reply_event`` so the parsed event is byte-for-byte what the host expects.
 
-PoC scope: discovery (OPC_DEVICES), telemetry (OPC_STATUS), and apply (OPC_PRESET).
-Control / config / sync / offset and device firmware are out of scope (Block E/F).
+Opcode coverage: full M2N parity with the serial transport — discovery,
+status, preset, set-group, control, sync, offset, config, get-config,
+indicate, headless, and stream all flow over UDP (the firmware's W5500
+backend feeds the same backend-agnostic dispatch as LoRa). The LoRa-PHY-only
+RF-config opcodes (``send_rf_config`` / ``send_get_rf_config_to_node``) return
+``USB_ERROR`` — an Ethernet network has no radio. Device firmware update over
+RaceLink is out of scope (WLED's own Wi-Fi/web OTA handles that).
 """
 
 from __future__ import annotations

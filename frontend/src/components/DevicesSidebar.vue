@@ -54,8 +54,11 @@ const visibleGroups = computed<Group[]>(() => {
   if (nid === null) return groups.groups
   return groups.groups.filter((g) => {
     if (g.static || g.id === 0) return true
-    const gnid = g.network_id ?? networks.defaultNetworkId
-    return gnid === nid
+    // Unbound (empty) groups are network-agnostic — they have no RF/
+    // Ethernet binding yet, so keep them visible under every filter so
+    // they stay available as a drop target for a device of any network.
+    if (!g.network_id) return true
+    return g.network_id === nid
   })
 })
 
@@ -157,28 +160,29 @@ function onManageGroups() {
   ui.requestManageGroups()
 }
 
-/** Network badge class for a group row. ``null`` / unbound → the
- * "Default" placeholder badge from the networks store; this keeps
- * legacy groups (loaded pre-Stage-2) visually consistent with bound
- * ones. */
+/** Network badge helpers for a group row. Only invoked for groups that
+ * carry a ``network_id`` (see ``hasNetworkBadge``), so the binding is
+ * always concrete here. */
 function groupNetworkBadgeClass(g: Group): string {
-  return networks.colorOf(g.network_id ?? networks.defaultNetworkId)
+  return networks.colorOf(g.network_id)
 }
 
 function groupNetworkLabel(g: Group): string {
-  return networks.nameOf(g.network_id ?? networks.defaultNetworkId)
+  return networks.nameOf(g.network_id)
 }
 
 function groupNetworkKind(g: Group): 'rf' | 'ethernet' {
-  return networks.kindOf(g.network_id ?? networks.defaultNetworkId)
+  return networks.kindOf(g.network_id)
 }
 
 /** Static groups ("Unconfigured", "All WLED Nodes") are network-
- * agnostic by design — they should NOT render a network badge. The
- * sidebar row hides the badge for them; the ManageGroupsDialog also
- * excludes them from the movable set. */
+ * agnostic by design and never render a network badge. An unbound
+ * user group (empty / no ``network_id`` yet) is likewise network-
+ * agnostic — it shows no badge until the first device joins and stamps
+ * its network. Both the sidebar row and the ManageGroupsDialog treat
+ * these as having no network. */
 function hasNetworkBadge(g: Group): boolean {
-  return !g.static && Number(g.id) !== 0
+  return !g.static && Number(g.id) !== 0 && !!g.network_id
 }
 
 // Inline-rename for group names. Same hover-pencil pattern the

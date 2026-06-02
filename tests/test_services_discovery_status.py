@@ -109,6 +109,14 @@ class FakeController:
     def setNodeGroupId(self, dev):
         self.group_assignments.append((dev.addr, dev.groupId))
 
+    def reconcile_group_network(self, group_id):
+        # No-op stand-in: the discovery add-to-group path calls this to
+        # stamp the joined group's network. The discovery tests assert on
+        # group assignment, not on the reconcile side effect.
+        self.reconciled_groups = getattr(self, "reconciled_groups", [])
+        self.reconciled_groups.append(int(group_id))
+        return False
+
     @property
     def device_repository(self):
         class Repo:
@@ -226,6 +234,44 @@ class DiscoveryAndStatusTests(unittest.TestCase):
         emitted = sorted(call[1].get("group_id") for call in send_calls)
         self.assertEqual(emitted, [1, 5])
         self.assertEqual(result["found"], 0)
+
+    def test_discovery_service_broadcasts_on_every_attached_transport(self):
+        """Operator "Discover Devices" must send OPC_DEVICES on EVERY
+        attached transport, not just the primary slot — so a second RF
+        gateway and an Ethernet network are both probed regardless of
+        attach order. Mirrors the status-service fan-out (Bug 5)."""
+        gw_a = FakeTransport(ident_mac="GW-A")
+        gw_eth = FakeTransport(ident_mac="ETH:net-eth")
+        dev_a = RL_Device("AABBCCDDEEFF", 1, "A", groupId=0, network_id="GW-A")
+        dev_eth = RL_Device("001122334455", 1, "ETH", groupId=0, network_id="net-eth")
+        controller = FakeController([dev_a, dev_eth], transports=[gw_a, gw_eth])
+        gateway = FakeGateway(
+            [
+                {
+                    "opc": LP.OPC_DEVICES,
+                    "reply": "IDENTIFY_REPLY",
+                    "mac6": bytes.fromhex("AABBCCDDEEFF"),
+                    "sender3": bytes.fromhex("DDEEFF"),
+                },
+                {
+                    "opc": LP.OPC_DEVICES,
+                    "reply": "IDENTIFY_REPLY",
+                    "mac6": bytes.fromhex("001122334455"),
+                    "sender3": bytes.fromhex("334455"),
+                },
+            ]
+        )
+        service = DiscoveryService(controller, gateway)
+
+        result = service.discover_devices(group_filter=0)
+
+        # One OPC_DEVICES per attached transport — neither is skipped.
+        a_sends = [s for s in gw_a.sent if s[0] == "devices"]
+        eth_sends = [s for s in gw_eth.sent if s[0] == "devices"]
+        self.assertEqual(len(a_sends), 1)
+        self.assertEqual(len(eth_sends), 1)
+        # Responders from both transports merge into the aggregated result.
+        self.assertEqual(result["responders"], {"AABBCCDDEEFF", "001122334455"})
 
     def test_status_service_marks_non_responders_offline_on_window_close(self):
         responding = RL_Device("AABBCCDDEEFF", 1, "Node A", groupId=2)

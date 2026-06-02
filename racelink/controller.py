@@ -256,6 +256,26 @@ class RaceLink_Host:
         # is wired later by the blueprint.
         from racelink.services.missing_transport_tracker import MissingTransportTracker
         self.missing_transport_tracker = MissingTransportTracker(controller=self)
+        # Host-side periodic SYNC for Ethernet networks. RF networks get
+        # their SYNC from the LoRa gateway; an Ethernet network has no
+        # gateway, so the host drives the tick. Constructed here (not
+        # started) so building the controller in tests never spawns the
+        # thread; started in ``onStartup`` and stopped in ``shutdown``.
+        from racelink.services.eth_autosync_service import (
+            DEFAULT_ETH_AUTOSYNC_INTERVAL_S,
+            EthAutosyncService,
+        )
+        try:
+            autosync_interval = float(
+                self._option("rl_eth_autosync_interval_s",
+                             DEFAULT_ETH_AUTOSYNC_INTERVAL_S)
+                or DEFAULT_ETH_AUTOSYNC_INTERVAL_S
+            )
+        except (TypeError, ValueError):
+            autosync_interval = DEFAULT_ETH_AUTOSYNC_INTERVAL_S
+        self.eth_autosync_service = EthAutosyncService(
+            self, interval_s=autosync_interval,
+        )
 
     def _option(self, key: str, default=None):
         return self._host_api.db.option(key, default)
@@ -419,6 +439,61 @@ class RaceLink_Host:
                 return routed
         return self._transports[0] if len(self._transports) == 1 else None
 
+    def reconcile_group_network(self, group_id) -> bool:
+        """Recompute a group's ``network_id`` from its current members.
+
+        A group is *network-agnostic* until a device lives in it: an empty
+        group carries ``network_id = None`` (no RF/Ethernet binding), and the
+        first device that joins decides the group's network — and therefore
+        whether it is an RF or Ethernet group. When the last member leaves,
+        the group reverts to ``None`` so it can be re-purposed for either
+        kind.
+
+        Rules:
+
+        * Group ``0`` (Unconfigured) and static aggregate groups span every
+          network by design — never stamped, always left alone.
+        * Populated group → the ``network_id`` of its members. Part-B
+          boundary enforcement guarantees the members agree, so the first
+          non-empty binding found is authoritative. Members without a binding
+          (legacy / pre-migration) don't pin a network.
+        * Empty group → ``None``.
+
+        Returns ``True`` when the stored ``network_id`` actually changed
+        (so the caller can decide whether a persist/SSE refresh is warranted).
+        The caller is responsible for holding the appropriate state lock.
+        """
+        try:
+            gid = int(group_id)
+        except (TypeError, ValueError):
+            return False
+        if gid <= 0:
+            # Unconfigured / invalid index: always network-agnostic.
+            return False
+        groups = list(self.group_repository.list())
+        if not (0 <= gid < len(groups)):
+            return False
+        group = groups[gid]
+        if getattr(group, "static_group", 0):
+            return False
+
+        member_nid: Optional[str] = None
+        for dev in self.device_repository.list():
+            try:
+                if int(getattr(dev, "groupId", 0) or 0) != gid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            nid = getattr(dev, "network_id", None)
+            if nid:
+                member_nid = str(nid)
+                break
+
+        if getattr(group, "network_id", None) != member_nid:
+            group.network_id = member_nid
+            return True
+        return False
+
     @property
     def backup_device_repository(self):
         return self.state_repository.backup_devices
@@ -434,6 +509,12 @@ class RaceLink_Host:
         # RotorHazard log-to-UI-alert bridge. Auto-retry machinery takes over
         # from there for PORT_BUSY / LINK_LOST.
         self.discoverPort({}, origin="auto")
+        # Start the host-side Ethernet autosync loop. No-op on RF-only
+        # deployments (``tick`` skips when no Ethernet transport is bound).
+        try:
+            self.eth_autosync_service.start()
+        except Exception:
+            logger.exception("RaceLink: failed to start Ethernet autosync")
         self._startup_done = True
 
     def save_to_db(self, args, scopes=None) -> None:
@@ -1554,6 +1635,12 @@ class RaceLink_Host:
             return
         self._shutdown_called = True
         self._cancel_gateway_retry()
+        autosync = getattr(self, "eth_autosync_service", None)
+        if autosync is not None:
+            try:
+                autosync.stop()
+            except Exception:
+                logger.exception("RaceLink: eth_autosync_service.stop raised")
         tracker = getattr(self, "missing_transport_tracker", None)
         if tracker is not None:
             try:

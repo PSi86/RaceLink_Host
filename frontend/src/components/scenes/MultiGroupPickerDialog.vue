@@ -22,8 +22,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import NetworkKindIcon from '@/components/NetworkKindIcon.vue'
 import { useGroupsStore } from '@/stores/groups'
 import { useNetworksStore } from '@/stores/networks'
+import type { Group } from '@/api/types'
 
 const props = defineProps<{
   open: boolean
@@ -44,6 +46,14 @@ const groups = useGroupsStore()
 const networks = useNetworksStore()
 const searchInput = useTemplateRef<HTMLInputElement>('searchInput')
 
+/** Static groups (Unconfigured / "All WLED Nodes") and unbound (empty)
+ *  groups are network-agnostic — they render no network badge, matching
+ *  the group list on the devices page. Only a group with a concrete
+ *  ``network_id`` shows its RF/Ethernet badge. */
+function hasGroupBadge(g: Group): boolean {
+  return !g.static && Number(g.id) !== 0 && !!g.network_id
+}
+
 // Working copy: the dialog edits this set, and only writes back to
 // the v-model on Confirm. Operator can Cancel without leaving stray
 // edits in the underlying scene draft.
@@ -56,6 +66,15 @@ watch(
     if (!next) return
     draft.value = new Set(props.modelValue ?? [])
     search.value = ''
+    // Ensure the network repo is loaded so the per-group badges resolve
+    // their name / colour / kind (no-op once cached).
+    if (networks.networks.length === 0) {
+      try {
+        await networks.load()
+      } catch {
+        // best-effort: badges fall back to the raw id / RF default.
+      }
+    }
     await nextTick()
     searchInput.value?.focus()
   },
@@ -103,9 +122,11 @@ function groupNetworkOf(id: number): string | null {
   const g = groups.groups.find((row) => row.id === id)
   if (!g) return null
   // Unconfigured (id 0) is network-agnostic; the validator treats
-  // it as a cross-network sink.
+  // it as a cross-network sink. An unbound (empty) group is likewise
+  // network-agnostic — it has no binding to anchor on, so it never
+  // constrains the cross-network selection (and stays selectable).
   if (id === 0) return null
-  return g.network_id ?? networks.defaultNetworkId
+  return g.network_id ?? null
 }
 
 const anchorNetworkId = computed<string | null>(() => {
@@ -223,10 +244,19 @@ function confirm() {
               @change="toggle(g.id)"
             />
             <span class="text-muted-foreground tabular-nums">{{ g.id }}</span>
-            <span class="truncate">{{ g.name }}</span>
+            <span class="min-w-0 flex-1 truncate">{{ g.name }}</span>
+            <span
+              v-if="hasGroupBadge(g)"
+              class="flex-none inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium"
+              :class="networks.colorOf(g.network_id)"
+              :title="`Network: ${networks.nameOf(g.network_id)} (${networks.kindOf(g.network_id) === 'ethernet' ? 'Ethernet' : 'RF'})`"
+            >
+              <NetworkKindIcon :kind="networks.kindOf(g.network_id)" :size="10" />
+              {{ networks.nameOf(g.network_id) }}
+            </span>
             <span
               v-if="isCrossNetwork(g.id) && !draft.has(g.id)"
-              class="ml-auto text-xs text-amber-300"
+              class="flex-none text-xs text-amber-300"
             >
               other net
             </span>

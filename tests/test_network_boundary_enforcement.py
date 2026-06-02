@@ -11,8 +11,11 @@ Pins three layers:
        (back-compat for unmigrated payloads)
 
   2. Group creation routes
-     (``api_groups_create``, ``_prepare_discover_target``) stamp the
-     default network's id on every fresh group.
+     (``api_groups_create``, ``_prepare_discover_target``) create
+     network-agnostic groups (``network_id=None``); the group's
+     network is stamped from its first member by
+     ``Controller.reconcile_group_network`` and reverts to ``None``
+     when emptied.
 
   3. ``/api/devices/update-meta`` returns HTTP 400 with the
      structured ``detail`` shape on a boundary violation, BEFORE
@@ -179,11 +182,15 @@ class ValidateNetworkKindMatchTests(unittest.TestCase):
         validate_network_kind_match(target, [{"id": "legacy", "name": "Old"}])
 
 
-class GroupCreateDefaultNetworkBindingTests(unittest.TestCase):
-    """When the operator creates a fresh group via the API (and
-    in the discover-time created-group helper), the new group
-    inherits the default network's id so the validator has a
-    concrete anchor on every future bulk-set call."""
+class GroupCreateNetworkAgnosticTests(unittest.TestCase):
+    """A freshly-created group (via the API or the discover-time
+    created-group helper) is network-agnostic: it carries no
+    ``network_id`` until a device joins it. The first member stamps
+    the group's network (and thus RF/Ethernet kind) via
+    ``Controller.reconcile_group_network``; an emptied group reverts
+    to ``None``. The boundary validator already treats a ``None``
+    group as "no constraint", so a device from any network can be the
+    first to land in it."""
 
     def _make_ctx(self, default_network_id=None):
         # Light-weight stand-in for the ``RouteContext`` shape that
@@ -228,7 +235,7 @@ class GroupCreateDefaultNetworkBindingTests(unittest.TestCase):
         ctx.log = lambda *_a, **_kw: None
         return ctx
 
-    def test_prepare_discover_target_stamps_default_network(self):
+    def test_prepare_discover_target_creates_network_agnostic_group(self):
         from racelink.web.api import _prepare_discover_target
 
         default_id = "00000000-0000-4000-8000-000000000001"
@@ -238,7 +245,9 @@ class GroupCreateDefaultNetworkBindingTests(unittest.TestCase):
         )
         self.assertIsNotNone(created_gid)
         created_group = ctx.group_repo.items[created_gid]
-        self.assertEqual(created_group.network_id, default_id)
+        # Even though a default network exists, the new group is NOT
+        # bound to it — it stays network-agnostic until a device joins.
+        self.assertIsNone(created_group.network_id)
         self.assertEqual(created_group.name, "Pit-Lane")
 
     def test_prepare_discover_target_no_networks_yet_leaves_none(self):
@@ -248,12 +257,81 @@ class GroupCreateDefaultNetworkBindingTests(unittest.TestCase):
         _, created_gid = _prepare_discover_target(
             ctx, target_gid=None, new_group_name="Pit-Lane",
         )
-        # The route still creates the group, but ``network_id``
-        # stays ``None`` — the boundary validator will skip the
-        # check for it (back-compat).
         self.assertIsNotNone(created_gid)
         created_group = ctx.group_repo.items[created_gid]
         self.assertIsNone(created_group.network_id)
+
+
+class ReconcileGroupNetworkTests(unittest.TestCase):
+    """``RaceLink_Host.reconcile_group_network`` derives a group's
+    ``network_id`` from its current members: empty → ``None``,
+    populated → the members' shared network. Unconfigured (0) and
+    static groups are always left network-agnostic."""
+
+    def _host(self, groups, devices):
+        # The method only touches ``group_repository`` and
+        # ``device_repository``; duck-type a minimal host and call the
+        # unbound method so we don't build a whole controller.
+        from racelink.controller import RaceLink_Host
+        from types import SimpleNamespace
+
+        host = SimpleNamespace(
+            group_repository=SimpleNamespace(list=lambda: list(groups)),
+            device_repository=SimpleNamespace(list=lambda: list(devices)),
+        )
+        return RaceLink_Host.reconcile_group_network.__get__(host)
+
+    def test_empty_group_resets_to_none(self):
+        groups = [
+            RL_DeviceGroup("Unconfigured", static_group=0),
+            RL_DeviceGroup("Heat 1", network_id="net-eth"),
+        ]
+        reconcile = self._host(groups, devices=[])  # no members
+        changed = reconcile(1)
+        self.assertTrue(changed)
+        self.assertIsNone(groups[1].network_id)
+
+    def test_first_member_stamps_group_network(self):
+        groups = [
+            RL_DeviceGroup("Unconfigured", static_group=0),
+            RL_DeviceGroup("Heat 1", network_id=None),
+        ]
+        devices = [_dev("AABBCCDDEEFF", network_id="net-eth")]
+        devices[0].groupId = 1
+        reconcile = self._host(groups, devices)
+        changed = reconcile(1)
+        self.assertTrue(changed)
+        self.assertEqual(groups[1].network_id, "net-eth")
+
+    def test_noop_when_already_correct(self):
+        groups = [
+            RL_DeviceGroup("Unconfigured", static_group=0),
+            RL_DeviceGroup("Heat 1", network_id="net-eth"),
+        ]
+        devices = [_dev("AABBCCDDEEFF", network_id="net-eth")]
+        devices[0].groupId = 1
+        reconcile = self._host(groups, devices)
+        self.assertFalse(reconcile(1))
+        self.assertEqual(groups[1].network_id, "net-eth")
+
+    def test_unconfigured_group_never_stamped(self):
+        groups = [RL_DeviceGroup("Unconfigured", static_group=0)]
+        devices = [_dev("AABBCCDDEEFF", network_id="net-eth")]
+        devices[0].groupId = 0
+        reconcile = self._host(groups, devices)
+        self.assertFalse(reconcile(0))
+        self.assertIsNone(groups[0].network_id)
+
+    def test_static_group_never_stamped(self):
+        groups = [
+            RL_DeviceGroup("Unconfigured", static_group=0),
+            RL_DeviceGroup("All WLED Nodes", static_group=1),
+        ]
+        devices = [_dev("AABBCCDDEEFF", network_id="net-eth")]
+        devices[0].groupId = 1
+        reconcile = self._host(groups, devices)
+        self.assertFalse(reconcile(1))
+        self.assertIsNone(groups[1].network_id)
 
 
 class IntegrationCheckTests(unittest.TestCase):
