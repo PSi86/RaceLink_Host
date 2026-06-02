@@ -256,6 +256,26 @@ class RaceLink_Host:
         # is wired later by the blueprint.
         from racelink.services.missing_transport_tracker import MissingTransportTracker
         self.missing_transport_tracker = MissingTransportTracker(controller=self)
+        # Host-side periodic SYNC for Ethernet networks. RF networks get
+        # their SYNC from the LoRa gateway; an Ethernet network has no
+        # gateway, so the host drives the tick. Constructed here (not
+        # started) so building the controller in tests never spawns the
+        # thread; started in ``onStartup`` and stopped in ``shutdown``.
+        from racelink.services.eth_autosync_service import (
+            DEFAULT_ETH_AUTOSYNC_INTERVAL_S,
+            EthAutosyncService,
+        )
+        try:
+            autosync_interval = float(
+                self._option("rl_eth_autosync_interval_s",
+                             DEFAULT_ETH_AUTOSYNC_INTERVAL_S)
+                or DEFAULT_ETH_AUTOSYNC_INTERVAL_S
+            )
+        except (TypeError, ValueError):
+            autosync_interval = DEFAULT_ETH_AUTOSYNC_INTERVAL_S
+        self.eth_autosync_service = EthAutosyncService(
+            self, interval_s=autosync_interval,
+        )
 
     def _option(self, key: str, default=None):
         return self._host_api.db.option(key, default)
@@ -489,6 +509,12 @@ class RaceLink_Host:
         # RotorHazard log-to-UI-alert bridge. Auto-retry machinery takes over
         # from there for PORT_BUSY / LINK_LOST.
         self.discoverPort({}, origin="auto")
+        # Start the host-side Ethernet autosync loop. No-op on RF-only
+        # deployments (``tick`` skips when no Ethernet transport is bound).
+        try:
+            self.eth_autosync_service.start()
+        except Exception:
+            logger.exception("RaceLink: failed to start Ethernet autosync")
         self._startup_done = True
 
     def save_to_db(self, args, scopes=None) -> None:
@@ -1609,6 +1635,12 @@ class RaceLink_Host:
             return
         self._shutdown_called = True
         self._cancel_gateway_retry()
+        autosync = getattr(self, "eth_autosync_service", None)
+        if autosync is not None:
+            try:
+                autosync.stop()
+            except Exception:
+                logger.exception("RaceLink: eth_autosync_service.stop raised")
         tracker = getattr(self, "missing_transport_tracker", None)
         if tracker is not None:
             try:
