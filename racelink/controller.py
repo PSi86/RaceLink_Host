@@ -419,6 +419,61 @@ class RaceLink_Host:
                 return routed
         return self._transports[0] if len(self._transports) == 1 else None
 
+    def reconcile_group_network(self, group_id) -> bool:
+        """Recompute a group's ``network_id`` from its current members.
+
+        A group is *network-agnostic* until a device lives in it: an empty
+        group carries ``network_id = None`` (no RF/Ethernet binding), and the
+        first device that joins decides the group's network — and therefore
+        whether it is an RF or Ethernet group. When the last member leaves,
+        the group reverts to ``None`` so it can be re-purposed for either
+        kind.
+
+        Rules:
+
+        * Group ``0`` (Unconfigured) and static aggregate groups span every
+          network by design — never stamped, always left alone.
+        * Populated group → the ``network_id`` of its members. Part-B
+          boundary enforcement guarantees the members agree, so the first
+          non-empty binding found is authoritative. Members without a binding
+          (legacy / pre-migration) don't pin a network.
+        * Empty group → ``None``.
+
+        Returns ``True`` when the stored ``network_id`` actually changed
+        (so the caller can decide whether a persist/SSE refresh is warranted).
+        The caller is responsible for holding the appropriate state lock.
+        """
+        try:
+            gid = int(group_id)
+        except (TypeError, ValueError):
+            return False
+        if gid <= 0:
+            # Unconfigured / invalid index: always network-agnostic.
+            return False
+        groups = list(self.group_repository.list())
+        if not (0 <= gid < len(groups)):
+            return False
+        group = groups[gid]
+        if getattr(group, "static_group", 0):
+            return False
+
+        member_nid: Optional[str] = None
+        for dev in self.device_repository.list():
+            try:
+                if int(getattr(dev, "groupId", 0) or 0) != gid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            nid = getattr(dev, "network_id", None)
+            if nid:
+                member_nid = str(nid)
+                break
+
+        if getattr(group, "network_id", None) != member_nid:
+            group.network_id = member_nid
+            return True
+        return False
+
     @property
     def backup_device_repository(self):
         return self.state_repository.backup_devices

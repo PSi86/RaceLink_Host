@@ -125,6 +125,16 @@ class DiscoveryService:
                     continue
                 dev.groupId = assigned_group
                 self.controller.setNodeGroupId(dev)
+            # First device(s) landing in a network-agnostic group stamp its
+            # network (and thus RF/Ethernet kind); see
+            # ``Controller.reconcile_group_network``.
+            try:
+                self.controller.reconcile_group_network(assigned_group)
+            except Exception:
+                logger.debug(
+                    "discover_devices: reconcile_group_network raised for group %s",
+                    assigned_group, exc_info=True,
+                )
 
         return {"found": found, "responders": responders, "assigned_group": assigned_group}
 

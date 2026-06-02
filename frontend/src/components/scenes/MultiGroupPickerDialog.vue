@@ -23,7 +23,6 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useGroupsStore } from '@/stores/groups'
-import { useNetworksStore } from '@/stores/networks'
 
 const props = defineProps<{
   open: boolean
@@ -41,7 +40,6 @@ const emit = defineEmits<{
 }>()
 
 const groups = useGroupsStore()
-const networks = useNetworksStore()
 const searchInput = useTemplateRef<HTMLInputElement>('searchInput')
 
 // Working copy: the dialog edits this set, and only writes back to
@@ -103,9 +101,11 @@ function groupNetworkOf(id: number): string | null {
   const g = groups.groups.find((row) => row.id === id)
   if (!g) return null
   // Unconfigured (id 0) is network-agnostic; the validator treats
-  // it as a cross-network sink.
+  // it as a cross-network sink. An unbound (empty) group is likewise
+  // network-agnostic — it has no binding to anchor on, so it never
+  // constrains the cross-network selection (and stays selectable).
   if (id === 0) return null
-  return g.network_id ?? networks.defaultNetworkId
+  return g.network_id ?? null
 }
 
 const anchorNetworkId = computed<string | null>(() => {

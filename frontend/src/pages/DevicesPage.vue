@@ -50,22 +50,24 @@ const showHeaderBadge = computed<boolean>(() => {
   const g = selectedGroup.value
   // Static groups (Unconfigured + All WLED Nodes) are network-
   // agnostic by design; treat them the same as "all groups" for
-  // the header — no badge.
+  // the header — no badge. An unbound (empty) user group has no
+  // network binding yet either, so it gets no badge until a device
+  // joins and stamps its network.
   if (!g) return false
   if (g.static || g.id === 0) return false
-  return true
+  return !!g.network_id
 })
 const headerBadgeClass = computed<string>(() => {
   const g = selectedGroup.value
-  return networks.colorOf(g?.network_id ?? networks.defaultNetworkId)
+  return networks.colorOf(g?.network_id ?? null)
 })
 const headerBadgeLabel = computed<string>(() => {
   const g = selectedGroup.value
-  return networks.nameOf(g?.network_id ?? networks.defaultNetworkId)
+  return networks.nameOf(g?.network_id ?? null)
 })
 const headerBadgeKind = computed<'rf' | 'ethernet'>(() => {
   const g = selectedGroup.value
-  return networks.kindOf(g?.network_id ?? networks.defaultNetworkId)
+  return networks.kindOf(g?.network_id ?? null)
 })
 const headerGroupLabel = computed<string>(() => {
   const g = selectedGroup.value
