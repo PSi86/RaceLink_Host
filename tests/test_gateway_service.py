@@ -392,6 +392,47 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertEqual(result["expected"], 1)
         self.assertEqual(len(controller.transport.sent_stream), 1)
 
+    def test_send_stream_expected_devices_scopes_ack_set(self):
+        # A group broadcast with an explicit expected_devices set waits ONLY
+        # for those devices — other online group members (e.g. a non-startblock
+        # node) are ignored, even though the broadcast physically reaches them.
+        controller = FakeController()
+        startblock = controller.dev  # AABBCCDDEEFF -> DDEEFF
+        startblock.groupId = 7
+        startblock.link_online = True
+        other = RL_Device("001122334455", 1, "Other")  # online group member, last3 334455
+        other.groupId = 7
+        other.link_online = True
+        controller.device_repository.append(other)
+        service = GatewayService(controller)
+
+        captured = {}
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            captured["sender_filter"] = set(matcher.sender_filter or [])
+
+            def wrapped_send():
+                send_fn()
+                controller.transport.emit({
+                    "opc": LP.OPC_ACK,
+                    "ack_of": LP.OPC_STREAM,
+                    "ack_status": 0,
+                    "sender3": bytes.fromhex("DDEEFF"),
+                })
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(
+            b"\x01\x02", groupId=7, retries=2, expected_devices=[startblock],
+        )
+
+        self.assertEqual(result, {"expected": 1, "acked": 1})
+        # Only the listed device is awaited; the other online member is not.
+        self.assertIn(bytes.fromhex("DDEEFF"), captured["sender_filter"])
+        self.assertNotIn(bytes.fromhex("334455"), captured["sender_filter"])
+
     def test_identify_reply_restores_stored_group_for_known_device(self):
         controller = FakeController()
         controller.dev.groupId = 3

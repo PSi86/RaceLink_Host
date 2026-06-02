@@ -738,9 +738,19 @@ class GatewayService:
         device=None,
         retries: int = rf_timing.STREAM_MAX_ATTEMPTS - 1,
         timeout_s: float = rf_timing.STREAM_ATTEMPT_TIMEOUT_S,
+        expected_devices=None,
     ) -> dict[str, int]:
         if device is None and groupId is None:
             raise ValueError("sendStream requires groupId or device")
+        # ``expected_devices`` (group broadcast only): the explicit set of
+        # devices to wait for ACKs from, decoupled from the broadcast target.
+        # The frame still goes to the whole group (recv3=FFFFFF) so every
+        # device receives it, but only these devices count toward the
+        # expected-ACK total. The startblock control uses it to wait on just
+        # the STARTBLOCK-capable members of a group — a plain WLED node in the
+        # group never ACKs an OPC_STREAM and would otherwise burn the retry
+        # budget. When ``None`` the expected set is every online group member
+        # (back-compat).
 
         # Multi-network routing: a stream addresses one device (unicast)
         # or one group (broadcast within the network owning that group).
@@ -784,26 +794,33 @@ class GatewayService:
             # iteration. The list comprehension materialises the result
             # immediately, so the lock can be released before the slower
             # downstream stream-send work begins.
-            with self._state_lock():
-                group_members = [
-                    dev
-                    for dev in self.controller.device_repository.list()
-                    if int(getattr(dev, "groupId", 0) or 0) == group_filter
-                ]
+            if expected_devices is not None:
+                # Caller named the exact ACK-expectation set (e.g. the
+                # STARTBLOCK-capable members covering this slot). Non-listed
+                # group members — including plain WLED nodes that never ACK an
+                # OPC_STREAM — are ignored entirely.
+                ack_pool = list(expected_devices)
+            else:
+                with self._state_lock():
+                    ack_pool = [
+                        dev
+                        for dev in self.controller.device_repository.list()
+                        if int(getattr(dev, "groupId", 0) or 0) == group_filter
+                    ]
             # Only wait for ACKs from currently-online members. An offline
             # device can't ACK, and chasing it burns the full retry budget on
-            # EVERY frame — a startblock control pushes one OPC_STREAM per slot
-            # (8 frames), so a single offline group member turned a ~1 s update
-            # into ~30 s of redundant retransmits. The stream is a broadcast
+            # EVERY frame — a startblock control pushes one OPC_STREAM per slot,
+            # so a single offline/unreachable member turned a ~1 s update into
+            # ~30 s of redundant retransmits. The stream is a broadcast
             # (recv3=FFFFFF), so it still physically reaches every device; we
             # just don't retry for the ones known to be offline. If NONE are
-            # online, fall back to the full population so the broadcast still
-            # fires once (covers a present-but-not-yet-seen device).
+            # online, fall back to the full pool so the broadcast still fires
+            # once (covers a present-but-not-yet-seen device).
             online_members = [
-                dev for dev in group_members
+                dev for dev in ack_pool
                 if bool(getattr(dev, "link_online", False))
             ]
-            targets = online_members or group_members
+            targets = online_members or ack_pool
         else:
             targets = [device]
 

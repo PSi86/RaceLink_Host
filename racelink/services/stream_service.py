@@ -39,6 +39,7 @@ class StreamService:
         device=None,
         retries: int = rf_timing.STREAM_MAX_ATTEMPTS - 1,
         timeout_s: float = rf_timing.STREAM_ATTEMPT_TIMEOUT_S,
+        expected_devices=None,
     ) -> dict[str, int]:
         return self.gateway_service.send_stream(
             payload,
@@ -46,4 +47,5 @@ class StreamService:
             device=device,
             retries=retries,
             timeout_s=timeout_s,
+            expected_devices=expected_devices,
         )

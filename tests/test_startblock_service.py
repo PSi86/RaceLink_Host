@@ -9,12 +9,13 @@ class FakeStreamService:
     def __init__(self):
         self.calls = []
 
-    def send_stream(self, payload, groupId=None, device=None):
+    def send_stream(self, payload, groupId=None, device=None, expected_devices=None):
         self.calls.append(
             {
                 "payload": payload,
                 "groupId": groupId,
                 "device": device,
+                "expected_devices": expected_devices,
             }
         )
         return {"expected": 1, "acked": 1}
@@ -114,16 +115,17 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(result["mode"], "group")
         self.assertEqual(result["groupId"], 7)
         self.assertEqual(len(stream_service.calls), 8)
-        # Each slot is unicast to its owning device, not broadcast to the group.
-        self.assertTrue(all(call["device"] is dev for call in stream_service.calls))
-        self.assertTrue(all(call["groupId"] is None for call in stream_service.calls))
+        # Each slot is broadcast to the group (groupId set, no unicast device),
+        # with the lone covering device as the expected-ACK set.
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        self.assertTrue(all(call["device"] is None for call in stream_service.calls))
+        self.assertTrue(all(call["expected_devices"] == [dev] for call in stream_service.calls))
         self.assertEqual(stream_service.calls[0]["payload"][5:], b"ALPHA")
         self.assertEqual(stream_service.calls[1]["payload"][5:], b"BRAVO")
 
-    def test_send_startblock_control_group_mode_unicasts_each_slot_to_owner(self):
-        # Two devices cover slots 1-2 and 3-4 → only those 4 slots stream,
-        # each UNICAST to the device that owns it (never a group broadcast
-        # that would wait on non-owner members' ACKs).
+    def test_send_startblock_control_group_mode_broadcasts_with_per_slot_expected_set(self):
+        # Two devices cover slots 1-2 and 3-4 → those 4 slots broadcast to the
+        # group, each expecting an ACK only from the device(s) covering it.
         dev_a = self._sb_device("AABBCCDDEEFF", "SB-A", group=7, slots=2, first=1)
         dev_b = self._sb_device("001122334455", "SB-B", group=7, slots=2, first=3)
         controller = FakeController([dev_a, dev_b])
@@ -135,12 +137,38 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(result["mode"], "group")
         self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
         self.assertEqual(len(stream_service.calls), 4)
-        # slots 1-2 -> dev_a, slots 3-4 -> dev_b; no groupId broadcasts.
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        # slots 1-2 expect dev_a, slots 3-4 expect dev_b.
         self.assertEqual(
-            [c["device"] for c in stream_service.calls],
-            [dev_a, dev_a, dev_b, dev_b],
+            [c["expected_devices"] for c in stream_service.calls],
+            [[dev_a], [dev_a], [dev_b], [dev_b]],
         )
-        self.assertTrue(all(call["groupId"] is None for call in stream_service.calls))
+
+    def test_send_startblock_control_group_mode_shared_slot_range_broadcasts_once_per_slot(self):
+        # Four devices ALL configured slots=4/first=1 (each shows slots 1-4):
+        # each slot is broadcast ONCE (not unicast 4x), and every covering
+        # device is in that slot's expected-ACK set.
+        devs = [
+            self._sb_device(mac, name, group=7, slots=4, first=1)
+            for mac, name in (
+                ("AABBCCDDEE01", "SB1"), ("AABBCCDDEE02", "SB2"),
+                ("AABBCCDDEE03", "SB3"), ("AABBCCDDEE04", "SB4"),
+            )
+        ]
+        controller = FakeController(devs)
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        # 4 covered slots → 4 broadcasts, NOT 16 unicasts.
+        self.assertEqual(len(stream_service.calls), 4)
+        self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        self.assertTrue(all(call["device"] is None for call in stream_service.calls))
+        for call in stream_service.calls:
+            self.assertEqual(call["expected_devices"], devs)
 
     def test_send_startblock_control_group_mode_no_startblock_device_sends_nothing(self):
         # A device in the group that isn't STARTBLOCK-capable doesn't drive
