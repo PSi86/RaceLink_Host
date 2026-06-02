@@ -738,9 +738,19 @@ class GatewayService:
         device=None,
         retries: int = rf_timing.STREAM_MAX_ATTEMPTS - 1,
         timeout_s: float = rf_timing.STREAM_ATTEMPT_TIMEOUT_S,
+        expected_devices=None,
     ) -> dict[str, int]:
         if device is None and groupId is None:
             raise ValueError("sendStream requires groupId or device")
+        # ``expected_devices`` (group broadcast only): the explicit set of
+        # devices to wait for ACKs from, decoupled from the broadcast target.
+        # The frame still goes to the whole group (recv3=FFFFFF) so every
+        # device receives it, but only these devices count toward the
+        # expected-ACK total. The startblock control uses it to wait on just
+        # the STARTBLOCK-capable members of a group — a plain WLED node in the
+        # group never ACKs an OPC_STREAM and would otherwise burn the retry
+        # budget. When ``None`` the expected set is every online group member
+        # (back-compat).
 
         # Multi-network routing: a stream addresses one device (unicast)
         # or one group (broadcast within the network owning that group).
@@ -784,12 +794,33 @@ class GatewayService:
             # iteration. The list comprehension materialises the result
             # immediately, so the lock can be released before the slower
             # downstream stream-send work begins.
-            with self._state_lock():
-                targets = [
-                    dev
-                    for dev in self.controller.device_repository.list()
-                    if int(getattr(dev, "groupId", 0) or 0) == group_filter
-                ]
+            if expected_devices is not None:
+                # Caller named the exact ACK-expectation set (e.g. the
+                # STARTBLOCK-capable members covering this slot). Non-listed
+                # group members — including plain WLED nodes that never ACK an
+                # OPC_STREAM — are ignored entirely.
+                ack_pool = list(expected_devices)
+            else:
+                with self._state_lock():
+                    ack_pool = [
+                        dev
+                        for dev in self.controller.device_repository.list()
+                        if int(getattr(dev, "groupId", 0) or 0) == group_filter
+                    ]
+            # Only wait for ACKs from currently-online members. An offline
+            # device can't ACK, and chasing it burns the full retry budget on
+            # EVERY frame — a startblock control pushes one OPC_STREAM per slot,
+            # so a single offline/unreachable member turned a ~1 s update into
+            # ~30 s of redundant retransmits. The stream is a broadcast
+            # (recv3=FFFFFF), so it still physically reaches every device; we
+            # just don't retry for the ones known to be offline. If NONE are
+            # online, fall back to the full pool so the broadcast still fires
+            # once (covers a present-but-not-yet-seen device).
+            online_members = [
+                dev for dev in ack_pool
+                if bool(getattr(dev, "link_online", False))
+            ]
+            targets = online_members or ack_pool
         else:
             targets = [device]
 
@@ -1845,16 +1876,48 @@ class GatewayService:
                         if not dev:
                             dev_type = ev.get("caps", 0)
                             dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=default_device_name(mac12))
-                            # Stamp the network for devices discovered over an
-                            # Ethernet transport so status routing + isolation
-                            # work (gateway_id == "ETH:<network_id>"). RF devices
-                            # keep their existing (None -> later-assigned) path.
-                            gid = ev.get("gateway_id")
-                            if isinstance(gid, str) and gid.startswith("ETH:"):
-                                eth_nid = gid[4:]
-                                if eth_nid:
-                                    dev.network_id = eth_nid
                             self.controller.device_repository.append(dev)
+
+                        # Bind the device to the network of the gateway that
+                        # just heard it, but ONLY when it has no binding yet —
+                        # never override an existing network_id (a device heard
+                        # on the "wrong" gateway is a migration / divergence
+                        # case, handled by the cross-net STATUS_REPLY guard, not
+                        # here). Without this an RF-discovered device keeps
+                        # network_id=None, so on a multi-gateway host every
+                        # unicast to it (the auto-restore SET_GROUP below, status
+                        # polls, the group's reconciled network) falls back to
+                        # the primary transport instead of the gateway it
+                        # actually lives on. ETH idents encode the network id;
+                        # RF idents resolve via the receiving transport's bound
+                        # network_id (stamped at attach).
+                        if not getattr(dev, "network_id", None):
+                            inferred_nid = self._network_id_for_gateway_id(
+                                ev.get("gateway_id")
+                            )
+                            if inferred_nid:
+                                dev.network_id = inferred_nid
+                                # Let the device's group adopt the same network
+                                # so GROUP-broadcast routing (transport_for_group)
+                                # resolves to the right gateway too — not just
+                                # the device unicast path. The group was likely
+                                # reconciled to None when this device joined it
+                                # unbound; re-derive it now from the freshly
+                                # bound member. No-op for Unconfigured (0) and
+                                # static groups (reconcile_group_network skips
+                                # them). Best-effort: a reconcile failure must
+                                # not break IDENTIFY handling.
+                                try:
+                                    self.controller.reconcile_group_network(
+                                        getattr(dev, "groupId", 0)
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "RaceLink: reconcile_group_network after "
+                                        "IDENTIFY-stamp raised for %s (group=%s)",
+                                        mac12, getattr(dev, "groupId", "?"),
+                                        exc_info=True,
+                                    )
 
                         dev.update_from_identify(
                             ev.get("version"),
@@ -1884,6 +1947,27 @@ class GatewayService:
             self.pending_try_match(ev)
         except Exception:
             logger.exception("RaceLink: RX hook failed")
+
+    def _network_id_for_gateway_id(self, gateway_id) -> Optional[str]:
+        """Resolve the bound ``network_id`` of the transport an event came in
+        on (``gateway_id`` = the source transport's ``ident_mac``).
+
+        RF gateways and Ethernet transports both carry their bound
+        ``network_id`` (stamped at attach), so a lookup by ``ident_mac``
+        covers both. ``"ETH:<network_id>"`` idents also encode the id inline,
+        used as a fallback if the transport isn't in the list yet. Returns
+        ``None`` when the gateway is unknown or unbound.
+        """
+        if not gateway_id:
+            return None
+        gid = str(gateway_id)
+        for t in (getattr(self.controller, "transports", None) or []):
+            if str(getattr(t, "ident_mac", "") or "") == gid:
+                nid = str(getattr(t, "network_id", "") or "")
+                return nid or None
+        if gid.startswith("ETH:"):
+            return gid[4:] or None
+        return None
 
     def _restore_known_device_group(
         self,

@@ -216,16 +216,55 @@ class StartblockService:
 
         if target_group is not None:
             group_id = int(target_group)
+            # Only stream the slots actually covered by a startblock device in
+            # this group — derive the covered slot set from each device's
+            # "Number of slots" / "First slot" config (specials), exactly like
+            # the unicast path's ``_build_device_slot_mapping`` below. Avoids
+            # blindly streaming all 8 slots when the group's devices cover
+            # fewer (a single offline member used to make every wasted slot
+            # cost a full retry budget). A device with no specials defaults to
+            # all 8 slots, so the historical behaviour is preserved for an
+            # unconfigured startblock; a group with no startblock device sends
+            # nothing.
+            devices = self.iter_startblock_devices(target_group=group_id)
+            _slot_to_dev, dev_ranges = self._build_device_slot_mapping(devices)
+            # Devices covering each slot. Unlike ``slot_to_dev`` (first owner
+            # only), this keeps EVERY startblock device whose configured range
+            # includes the slot — a group broadcast of a slot is acted on by
+            # all of them, so they are exactly the devices we expect to ACK.
+            slot_to_devs: dict[int, list] = {}
+            for dev, first_slot, last_slot in dev_ranges:
+                for slot in range(first_slot, last_slot + 1):
+                    slot_to_devs.setdefault(slot, []).append(dev)
             sent = []
             for slot0, callsign, racechannel in slots_0based:
-                payload = build_startblock_payload_v1(slot0 + 1, racechannel, callsign)
+                slot1 = slot0 + 1
+                covering = slot_to_devs.get(slot1)
+                if not covering:
+                    continue  # no startblock device in this group covers this slot
+                payload = build_startblock_payload_v1(slot1, racechannel, callsign)
+                # Broadcast each slot to the group (ONE packet reaches every
+                # device that covers it — N redundant unicasts would be wrong
+                # when several devices share a slot range). The ACK-expectation
+                # is scoped to just the startblock devices covering this slot,
+                # so a non-startblock node sharing the group is never awaited.
                 sent.append(
                     {
-                        "slot": slot0 + 1,
-                        "result": self.stream_service.send_stream(payload, groupId=group_id),
+                        "slot": slot1,
+                        "result": self.stream_service.send_stream(
+                            payload, groupId=group_id, expected_devices=covering,
+                        ),
                     }
                 )
-            return {"mode": "group", "groupId": group_id, "sent": sent}
+            return {
+                "mode": "group",
+                "groupId": group_id,
+                "devices": [
+                    {"device": getattr(dev, "addr", None), "first": first_slot, "last": last_slot}
+                    for (dev, first_slot, last_slot) in dev_ranges
+                ],
+                "sent": sent,
+            }
 
         if target_device is not None:
             if not self.is_startblock_device(target_device):

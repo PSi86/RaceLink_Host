@@ -9,12 +9,13 @@ class FakeStreamService:
     def __init__(self):
         self.calls = []
 
-    def send_stream(self, payload, groupId=None, device=None):
+    def send_stream(self, payload, groupId=None, device=None, expected_devices=None):
         self.calls.append(
             {
                 "payload": payload,
                 "groupId": groupId,
                 "device": device,
+                "expected_devices": expected_devices,
             }
         )
         return {"expected": 1, "acked": 1}
@@ -87,8 +88,25 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(args, {"manual": True})
         self.assertEqual(set(scopes or set()), {state_scope.DEVICE_SPECIALS})
 
-    def test_send_startblock_control_in_group_mode_sends_all_slots(self):
-        controller = FakeController()
+    def _sb_device(self, addr, name, *, group, slots=None, first=None):
+        dev = RL_Device(
+            addr,
+            RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3,
+            name,
+            caps=RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3,
+        )
+        dev.groupId = group
+        if slots is not None:
+            dev.specials["startblock_slots"] = slots
+        if first is not None:
+            dev.specials["startblock_first_slot"] = first
+        return dev
+
+    def test_send_startblock_control_group_mode_default_specials_sends_all_slots(self):
+        # A startblock device with no slot config defaults to all 8 slots —
+        # historical behaviour preserved.
+        dev = self._sb_device("AABBCCDDEEFF", "SB", group=7)
+        controller = FakeController([dev])
         stream_service = FakeStreamService()
         service = StartblockService(controller, stream_service)
 
@@ -97,9 +115,74 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(result["mode"], "group")
         self.assertEqual(result["groupId"], 7)
         self.assertEqual(len(stream_service.calls), 8)
+        # Each slot is broadcast to the group (groupId set, no unicast device),
+        # with the lone covering device as the expected-ACK set.
         self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        self.assertTrue(all(call["device"] is None for call in stream_service.calls))
+        self.assertTrue(all(call["expected_devices"] == [dev] for call in stream_service.calls))
         self.assertEqual(stream_service.calls[0]["payload"][5:], b"ALPHA")
         self.assertEqual(stream_service.calls[1]["payload"][5:], b"BRAVO")
+
+    def test_send_startblock_control_group_mode_broadcasts_with_per_slot_expected_set(self):
+        # Two devices cover slots 1-2 and 3-4 → those 4 slots broadcast to the
+        # group, each expecting an ACK only from the device(s) covering it.
+        dev_a = self._sb_device("AABBCCDDEEFF", "SB-A", group=7, slots=2, first=1)
+        dev_b = self._sb_device("001122334455", "SB-B", group=7, slots=2, first=3)
+        controller = FakeController([dev_a, dev_b])
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
+        self.assertEqual(len(stream_service.calls), 4)
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        # slots 1-2 expect dev_a, slots 3-4 expect dev_b.
+        self.assertEqual(
+            [c["expected_devices"] for c in stream_service.calls],
+            [[dev_a], [dev_a], [dev_b], [dev_b]],
+        )
+
+    def test_send_startblock_control_group_mode_shared_slot_range_broadcasts_once_per_slot(self):
+        # Four devices ALL configured slots=4/first=1 (each shows slots 1-4):
+        # each slot is broadcast ONCE (not unicast 4x), and every covering
+        # device is in that slot's expected-ACK set.
+        devs = [
+            self._sb_device(mac, name, group=7, slots=4, first=1)
+            for mac, name in (
+                ("AABBCCDDEE01", "SB1"), ("AABBCCDDEE02", "SB2"),
+                ("AABBCCDDEE03", "SB3"), ("AABBCCDDEE04", "SB4"),
+            )
+        ]
+        controller = FakeController(devs)
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        # 4 covered slots → 4 broadcasts, NOT 16 unicasts.
+        self.assertEqual(len(stream_service.calls), 4)
+        self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+        self.assertTrue(all(call["device"] is None for call in stream_service.calls))
+        for call in stream_service.calls:
+            self.assertEqual(call["expected_devices"], devs)
+
+    def test_send_startblock_control_group_mode_no_startblock_device_sends_nothing(self):
+        # A device in the group that isn't STARTBLOCK-capable doesn't drive
+        # any slots → nothing streams (no blind 8-slot fan-out).
+        plain = RL_Device("AABBCCDDEEFF", RL_Dev_Type.NODE_WLED_REV5, "WLED")
+        plain.groupId = 7
+        controller = FakeController([plain])
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        self.assertEqual(stream_service.calls, [])
 
     def test_send_startblock_control_maps_slots_to_matching_devices(self):
         dev_a = RL_Device(

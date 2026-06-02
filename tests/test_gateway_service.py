@@ -77,6 +77,7 @@ class FakeController:
         self._transport_hooks_installed_for: set[int] = set()
         self.applied = []
         self.group_assignments = []
+        self.reconciled_groups = []
         self._device_repository = DeviceRepository([self.dev])
         self._group_repository = GroupRepository([object(), object(), object(), object()])
         self.discovery_active = False
@@ -146,6 +147,12 @@ class FakeController:
         self.applied.append((dev, option, data0))
 
     @property
+    def transports(self):
+        # Mirror the real controller's public accessor (used by the
+        # gateway service's network-id resolution helper).
+        return list(self._transports)
+
+    @property
     def device_repository(self):
         return self._device_repository
 
@@ -156,6 +163,12 @@ class FakeController:
     def setNodeGroupId(self, dev, forceSet: bool = False, wait_for_ack: bool = True) -> bool:
         self.group_assignments.append((dev.addr, dev.groupId, forceSet, wait_for_ack))
         return True  # simulate ACK ok so the async worker exits cleanly
+
+    def reconcile_group_network(self, group_id):
+        # Record the call; the real reconcile's behaviour is covered by
+        # test_network_boundary_enforcement.ReconcileGroupNetworkTests.
+        self.reconciled_groups.append(int(group_id))
+        return False
 
     def is_discovery_active(self):
         return bool(self.discovery_active)
@@ -314,6 +327,112 @@ class GatewayServiceTests(unittest.TestCase):
             [{"recv3": bytes.fromhex("DDEEFF"), "payload": b"\x01\x02\x03"}],
         )
 
+    def test_send_stream_to_group_skips_offline_members(self):
+        # A broadcast stream to a group must only wait for ACKs from ONLINE
+        # members — an offline device can't ACK, and chasing it would burn
+        # the retry budget on every frame (the startblock pushes 8 frames).
+        controller = FakeController()
+        online = controller.dev  # AABBCCDDEEFF -> last3 DDEEFF
+        online.groupId = 7
+        online.link_online = True
+        offline = RL_Device("001122334455", 1, "Offline")  # last3 334455
+        offline.groupId = 7
+        offline.link_online = False
+        controller.device_repository.append(offline)
+        service = GatewayService(controller)
+
+        captured = {}
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            captured["sender_filter"] = set(matcher.sender_filter or [])
+
+            def wrapped_send():
+                send_fn()
+                controller.transport.emit({
+                    "opc": LP.OPC_ACK,
+                    "ack_of": LP.OPC_STREAM,
+                    "ack_status": 0,
+                    "sender3": bytes.fromhex("DDEEFF"),
+                })
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(b"\x01\x02", groupId=7, retries=2)
+
+        # Only the online member is awaited, and it ACKs on the first attempt.
+        self.assertEqual(result, {"expected": 1, "acked": 1})
+        self.assertIn(bytes.fromhex("DDEEFF"), captured["sender_filter"])
+        # The offline member's last3 is never chased.
+        self.assertNotIn(bytes.fromhex("334455"), captured["sender_filter"])
+        # One frame went out (no per-offline retransmits).
+        self.assertEqual(len(controller.transport.sent_stream), 1)
+
+    def test_send_stream_to_all_offline_group_falls_back_to_full_population(self):
+        # When NO member is online, fall back to the full group so the
+        # broadcast still fires once (a present-but-not-yet-seen device).
+        controller = FakeController()
+        controller.dev.groupId = 7
+        controller.dev.link_online = False
+        service = GatewayService(controller)
+
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            def wrapped_send():
+                send_fn()  # no ACK — device is offline
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(b"\x01\x02", groupId=7, retries=0)
+
+        # The lone (offline) member is still targeted so the broadcast fires.
+        self.assertEqual(result["expected"], 1)
+        self.assertEqual(len(controller.transport.sent_stream), 1)
+
+    def test_send_stream_expected_devices_scopes_ack_set(self):
+        # A group broadcast with an explicit expected_devices set waits ONLY
+        # for those devices — other online group members (e.g. a non-startblock
+        # node) are ignored, even though the broadcast physically reaches them.
+        controller = FakeController()
+        startblock = controller.dev  # AABBCCDDEEFF -> DDEEFF
+        startblock.groupId = 7
+        startblock.link_online = True
+        other = RL_Device("001122334455", 1, "Other")  # online group member, last3 334455
+        other.groupId = 7
+        other.link_online = True
+        controller.device_repository.append(other)
+        service = GatewayService(controller)
+
+        captured = {}
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            captured["sender_filter"] = set(matcher.sender_filter or [])
+
+            def wrapped_send():
+                send_fn()
+                controller.transport.emit({
+                    "opc": LP.OPC_ACK,
+                    "ack_of": LP.OPC_STREAM,
+                    "ack_status": 0,
+                    "sender3": bytes.fromhex("DDEEFF"),
+                })
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(
+            b"\x01\x02", groupId=7, retries=2, expected_devices=[startblock],
+        )
+
+        self.assertEqual(result, {"expected": 1, "acked": 1})
+        # Only the listed device is awaited; the other online member is not.
+        self.assertIn(bytes.fromhex("DDEEFF"), captured["sender_filter"])
+        self.assertNotIn(bytes.fromhex("334455"), captured["sender_filter"])
+
     def test_identify_reply_restores_stored_group_for_known_device(self):
         controller = FakeController()
         controller.dev.groupId = 3
@@ -336,6 +455,106 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertEqual(controller.dev.groupId, 3)
         # Plan P2-6: async worker calls setNodeGroupId with wait_for_ack=True
         self.assertEqual(controller.group_assignments, [("AABBCCDDEEFF", 3, True, True)])
+
+    def test_identify_stamps_device_network_from_receiving_gateway_when_missing(self):
+        # Multi-gateway routing fix: an RF device with no network binding
+        # must adopt the network of the gateway that heard it, so the
+        # auto-restore SET_GROUP (and every later unicast) routes via THAT
+        # gateway instead of falling back to the primary transport.
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = None
+        controller.dev.groupId = 3
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+        service._join_auto_restore_workers(timeout=2.0)
+
+        self.assertEqual(controller.dev.network_id, "net-track")
+        # The device's group adopts the same network so GROUP-broadcast
+        # routing resolves to the right gateway too — reconcile is invoked
+        # with the device's stored groupId (3).
+        self.assertEqual(controller.reconciled_groups, [3])
+
+    def test_identify_stamp_skips_group_reconcile_when_already_bound(self):
+        # No stamping → no group reconcile (the device already has a network).
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-track"
+        controller.dev.groupId = 0
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.reconciled_groups, [])
+
+    def test_identify_does_not_override_existing_device_network(self):
+        # A device heard on a gateway bound to a *different* network keeps
+        # its stored binding — that divergence is a migration / cross-net
+        # case, not something the IDENTIFY path silently rewrites.
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-other"
+        controller.dev.groupId = 0  # == reported, so no auto-restore noise
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.dev.network_id, "net-other")
+
+    def test_identify_stamps_new_rf_device_network(self):
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("001122334455"),
+            "groupId": 5,
+            "caps": 2,
+            "version": 4,
+            "gateway_id": "TEST-GW",
+        })
+
+        new_dev = controller.device_repository.get_by_addr("001122334455")
+        self.assertIsNotNone(new_dev)
+        self.assertEqual(new_dev.network_id, "net-track")
+
+    def test_network_id_for_gateway_id_resolution(self):
+        controller = FakeController()
+        controller.transport.network_id = "net-track"  # ident_mac == "TEST-GW"
+        service = GatewayService(controller)
+        self.assertEqual(service._network_id_for_gateway_id("TEST-GW"), "net-track")
+        self.assertIsNone(service._network_id_for_gateway_id("UNKNOWN-GW"))
+        self.assertIsNone(service._network_id_for_gateway_id(None))
+        # ETH ident encodes the network id inline (fallback when no matching
+        # transport is attached).
+        self.assertEqual(service._network_id_for_gateway_id("ETH:net-eth"), "net-eth")
 
     def test_identify_reply_with_reported_nonzero_group_does_not_auto_reassign_known_device(self):
         controller = FakeController()
