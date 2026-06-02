@@ -1866,6 +1866,27 @@ class GatewayService:
                             )
                             if inferred_nid:
                                 dev.network_id = inferred_nid
+                                # Let the device's group adopt the same network
+                                # so GROUP-broadcast routing (transport_for_group)
+                                # resolves to the right gateway too — not just
+                                # the device unicast path. The group was likely
+                                # reconciled to None when this device joined it
+                                # unbound; re-derive it now from the freshly
+                                # bound member. No-op for Unconfigured (0) and
+                                # static groups (reconcile_group_network skips
+                                # them). Best-effort: a reconcile failure must
+                                # not break IDENTIFY handling.
+                                try:
+                                    self.controller.reconcile_group_network(
+                                        getattr(dev, "groupId", 0)
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "RaceLink: reconcile_group_network after "
+                                        "IDENTIFY-stamp raised for %s (group=%s)",
+                                        mac12, getattr(dev, "groupId", "?"),
+                                        exc_info=True,
+                                    )
 
                         dev.update_from_identify(
                             ev.get("version"),

@@ -77,6 +77,7 @@ class FakeController:
         self._transport_hooks_installed_for: set[int] = set()
         self.applied = []
         self.group_assignments = []
+        self.reconciled_groups = []
         self._device_repository = DeviceRepository([self.dev])
         self._group_repository = GroupRepository([object(), object(), object(), object()])
         self.discovery_active = False
@@ -162,6 +163,12 @@ class FakeController:
     def setNodeGroupId(self, dev, forceSet: bool = False, wait_for_ack: bool = True) -> bool:
         self.group_assignments.append((dev.addr, dev.groupId, forceSet, wait_for_ack))
         return True  # simulate ACK ok so the async worker exits cleanly
+
+    def reconcile_group_network(self, group_id):
+        # Record the call; the real reconcile's behaviour is covered by
+        # test_network_boundary_enforcement.ReconcileGroupNetworkTests.
+        self.reconciled_groups.append(int(group_id))
+        return False
 
     def is_discovery_active(self):
         return bool(self.discovery_active)
@@ -366,6 +373,30 @@ class GatewayServiceTests(unittest.TestCase):
         service._join_auto_restore_workers(timeout=2.0)
 
         self.assertEqual(controller.dev.network_id, "net-track")
+        # The device's group adopts the same network so GROUP-broadcast
+        # routing resolves to the right gateway too — reconcile is invoked
+        # with the device's stored groupId (3).
+        self.assertEqual(controller.reconciled_groups, [3])
+
+    def test_identify_stamp_skips_group_reconcile_when_already_bound(self):
+        # No stamping → no group reconcile (the device already has a network).
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-track"
+        controller.dev.groupId = 0
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 0,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.reconciled_groups, [])
 
     def test_identify_does_not_override_existing_device_network(self):
         # A device heard on a gateway bound to a *different* network keeps
