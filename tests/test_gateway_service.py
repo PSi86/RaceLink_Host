@@ -327,6 +327,71 @@ class GatewayServiceTests(unittest.TestCase):
             [{"recv3": bytes.fromhex("DDEEFF"), "payload": b"\x01\x02\x03"}],
         )
 
+    def test_send_stream_to_group_skips_offline_members(self):
+        # A broadcast stream to a group must only wait for ACKs from ONLINE
+        # members — an offline device can't ACK, and chasing it would burn
+        # the retry budget on every frame (the startblock pushes 8 frames).
+        controller = FakeController()
+        online = controller.dev  # AABBCCDDEEFF -> last3 DDEEFF
+        online.groupId = 7
+        online.link_online = True
+        offline = RL_Device("001122334455", 1, "Offline")  # last3 334455
+        offline.groupId = 7
+        offline.link_online = False
+        controller.device_repository.append(offline)
+        service = GatewayService(controller)
+
+        captured = {}
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            captured["sender_filter"] = set(matcher.sender_filter or [])
+
+            def wrapped_send():
+                send_fn()
+                controller.transport.emit({
+                    "opc": LP.OPC_ACK,
+                    "ack_of": LP.OPC_STREAM,
+                    "ack_status": 0,
+                    "sender3": bytes.fromhex("DDEEFF"),
+                })
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(b"\x01\x02", groupId=7, retries=2)
+
+        # Only the online member is awaited, and it ACKs on the first attempt.
+        self.assertEqual(result, {"expected": 1, "acked": 1})
+        self.assertIn(bytes.fromhex("DDEEFF"), captured["sender_filter"])
+        # The offline member's last3 is never chased.
+        self.assertNotIn(bytes.fromhex("334455"), captured["sender_filter"])
+        # One frame went out (no per-offline retransmits).
+        self.assertEqual(len(controller.transport.sent_stream), 1)
+
+    def test_send_stream_to_all_offline_group_falls_back_to_full_population(self):
+        # When NO member is online, fall back to the full group so the
+        # broadcast still fires once (a present-but-not-yet-seen device).
+        controller = FakeController()
+        controller.dev.groupId = 7
+        controller.dev.link_online = False
+        service = GatewayService(controller)
+
+        original_match = service.send_and_match
+
+        def wrapped_match(send_fn, matcher, **kwargs):
+            def wrapped_send():
+                send_fn()  # no ACK — device is offline
+            return original_match(wrapped_send, matcher, **kwargs)
+
+        service.send_and_match = wrapped_match
+
+        result = service.send_stream(b"\x01\x02", groupId=7, retries=0)
+
+        # The lone (offline) member is still targeted so the broadcast fires.
+        self.assertEqual(result["expected"], 1)
+        self.assertEqual(len(controller.transport.sent_stream), 1)
+
     def test_identify_reply_restores_stored_group_for_known_device(self):
         controller = FakeController()
         controller.dev.groupId = 3

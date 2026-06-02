@@ -785,11 +785,25 @@ class GatewayService:
             # immediately, so the lock can be released before the slower
             # downstream stream-send work begins.
             with self._state_lock():
-                targets = [
+                group_members = [
                     dev
                     for dev in self.controller.device_repository.list()
                     if int(getattr(dev, "groupId", 0) or 0) == group_filter
                 ]
+            # Only wait for ACKs from currently-online members. An offline
+            # device can't ACK, and chasing it burns the full retry budget on
+            # EVERY frame — a startblock control pushes one OPC_STREAM per slot
+            # (8 frames), so a single offline group member turned a ~1 s update
+            # into ~30 s of redundant retransmits. The stream is a broadcast
+            # (recv3=FFFFFF), so it still physically reaches every device; we
+            # just don't retry for the ones known to be offline. If NONE are
+            # online, fall back to the full population so the broadcast still
+            # fires once (covers a present-but-not-yet-seen device).
+            online_members = [
+                dev for dev in group_members
+                if bool(getattr(dev, "link_online", False))
+            ]
+            targets = online_members or group_members
         else:
             targets = [device]
 
