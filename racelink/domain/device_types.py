@@ -22,6 +22,7 @@ class RL_Dev_Type:
     NODE_WLED_REV4 = 12
     NODE_WLED_REV5 = 13
     NODE_WLED_STARTBLOCK_REV3 = 50
+    NODE_WLED_STARTBLOCK_HWP = 51  # Heltec Wireless Paper Startblock
 
 
 RL_DEV_TYPE_CAPS = ["STARTBLOCK", "LEDMATRIX", "WLED"]
@@ -33,6 +34,7 @@ RL_DEV_TYPE_INFO = {
     RL_Dev_Type.NODE_WLED_REV4: {"name": "WLED_Rev4", "caps": ["WLED"]},
     RL_Dev_Type.NODE_WLED_REV5: {"name": "WLED_Rev5", "caps": ["WLED"]},
     RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3: {"name": "WLED_Startblock_Rev3", "caps": ["STARTBLOCK", "WLED"]},
+    RL_Dev_Type.NODE_WLED_STARTBLOCK_HWP: {"name": "WLED_Startblock_HWP", "caps": ["STARTBLOCK", "WLED"]},
 }
 
 
