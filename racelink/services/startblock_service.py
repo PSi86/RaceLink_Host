@@ -216,16 +216,39 @@ class StartblockService:
 
         if target_group is not None:
             group_id = int(target_group)
+            # Only stream the slots actually covered by a startblock device in
+            # this group — derive the covered slot set from each device's
+            # "Number of slots" / "First slot" config (specials), exactly like
+            # the unicast path's ``_build_device_slot_mapping`` below. Avoids
+            # blindly streaming all 8 slots when the group's devices cover
+            # fewer (a single offline member used to make every wasted slot
+            # cost a full retry budget). A device with no specials defaults to
+            # all 8 slots, so the historical behaviour is preserved for an
+            # unconfigured startblock; a group with no startblock device sends
+            # nothing.
+            devices = self.iter_startblock_devices(target_group=group_id)
+            slot_to_dev, dev_ranges = self._build_device_slot_mapping(devices)
             sent = []
             for slot0, callsign, racechannel in slots_0based:
-                payload = build_startblock_payload_v1(slot0 + 1, racechannel, callsign)
+                slot1 = slot0 + 1
+                if slot_to_dev.get(slot1) is None:
+                    continue  # no startblock device in this group covers this slot
+                payload = build_startblock_payload_v1(slot1, racechannel, callsign)
                 sent.append(
                     {
-                        "slot": slot0 + 1,
+                        "slot": slot1,
                         "result": self.stream_service.send_stream(payload, groupId=group_id),
                     }
                 )
-            return {"mode": "group", "groupId": group_id, "sent": sent}
+            return {
+                "mode": "group",
+                "groupId": group_id,
+                "devices": [
+                    {"device": getattr(dev, "addr", None), "first": first_slot, "last": last_slot}
+                    for (dev, first_slot, last_slot) in dev_ranges
+                ],
+                "sent": sent,
+            }
 
         if target_device is not None:
             if not self.is_startblock_device(target_device):

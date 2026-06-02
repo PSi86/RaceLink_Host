@@ -87,8 +87,25 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertEqual(args, {"manual": True})
         self.assertEqual(set(scopes or set()), {state_scope.DEVICE_SPECIALS})
 
-    def test_send_startblock_control_in_group_mode_sends_all_slots(self):
-        controller = FakeController()
+    def _sb_device(self, addr, name, *, group, slots=None, first=None):
+        dev = RL_Device(
+            addr,
+            RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3,
+            name,
+            caps=RL_Dev_Type.NODE_WLED_STARTBLOCK_REV3,
+        )
+        dev.groupId = group
+        if slots is not None:
+            dev.specials["startblock_slots"] = slots
+        if first is not None:
+            dev.specials["startblock_first_slot"] = first
+        return dev
+
+    def test_send_startblock_control_group_mode_default_specials_sends_all_slots(self):
+        # A startblock device with no slot config defaults to all 8 slots —
+        # historical behaviour preserved.
+        dev = self._sb_device("AABBCCDDEEFF", "SB", group=7)
+        controller = FakeController([dev])
         stream_service = FakeStreamService()
         service = StartblockService(controller, stream_service)
 
@@ -100,6 +117,36 @@ class StartblockServiceTests(unittest.TestCase):
         self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
         self.assertEqual(stream_service.calls[0]["payload"][5:], b"ALPHA")
         self.assertEqual(stream_service.calls[1]["payload"][5:], b"BRAVO")
+
+    def test_send_startblock_control_group_mode_sends_only_covered_slots(self):
+        # Two devices cover slots 1-2 and 3-4 → only those 4 slots stream,
+        # not all 8. Derived from the devices' Number-of-slots / First-slot.
+        dev_a = self._sb_device("AABBCCDDEEFF", "SB-A", group=7, slots=2, first=1)
+        dev_b = self._sb_device("001122334455", "SB-B", group=7, slots=2, first=3)
+        controller = FakeController([dev_a, dev_b])
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        self.assertEqual([c["payload"][1] for c in stream_service.calls], [1, 2, 3, 4])
+        self.assertEqual(len(stream_service.calls), 4)
+        self.assertTrue(all(call["groupId"] == 7 for call in stream_service.calls))
+
+    def test_send_startblock_control_group_mode_no_startblock_device_sends_nothing(self):
+        # A device in the group that isn't STARTBLOCK-capable doesn't drive
+        # any slots → nothing streams (no blind 8-slot fan-out).
+        plain = RL_Device("AABBCCDDEEFF", RL_Dev_Type.NODE_WLED_REV5, "WLED")
+        plain.groupId = 7
+        controller = FakeController([plain])
+        stream_service = FakeStreamService()
+        service = StartblockService(controller, stream_service)
+
+        result = service.send_startblock_control(target_group=7)
+
+        self.assertEqual(result["mode"], "group")
+        self.assertEqual(stream_service.calls, [])
 
     def test_send_startblock_control_maps_slots_to_matching_devices(self):
         dev_a = RL_Device(
