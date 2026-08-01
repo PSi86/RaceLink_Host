@@ -176,6 +176,11 @@ export interface Device {
   // Network Manager and the migration engine's pre-check.
   network_id?: string | null
   last_known_rf_config?: RfConfig | null
+  /** Present when the device announced itself on a gateway belonging to
+   *  another network and the host followed the hardware. Carries what it
+   *  cost — groups are network-scoped, so the move can drop the device
+   *  out of its group. Cleared when the device is re-grouped. */
+  network_change_note?: NetworkChangeNote | null
   // Special-key flat fields appended by ``serialize_device``
   [key: string]: unknown
 }
@@ -303,6 +308,18 @@ export interface NetworkDeviceImpact {
   /** True when at least one pinned device has never reported a status, so
    *  its `configByte` is a stored guess rather than a live reading. */
   stale: boolean
+}
+
+export interface NetworkChangeNote {
+  from_network_id: string
+  from_network_name: string
+  to_network_id: string
+  to_network_name: string
+  /** `null` when the device's group was network-agnostic and travelled
+   *  with it; otherwise the group it had to leave. */
+  left_group_id: number | null
+  left_group_name: string | null
+  ts: number
 }
 
 export interface NetworksResponse {

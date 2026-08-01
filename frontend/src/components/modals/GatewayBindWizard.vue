@@ -293,6 +293,14 @@ function rfEqual(
  *  they are tuned. */
 const adoptWouldStrand = computed(() => targetNetwork.value?.device_impact?.total ?? 0)
 
+/** Devices left behind on the network this gateway is leaving. They stay
+ *  recorded there and stop being routable until it gets a gateway again. */
+const sourceLoses = computed(() => {
+  const nid = active.value?.network_id
+  if (!nid) return 0
+  return networks.byId[nid]?.device_impact?.total ?? 0
+})
+
 // Picking a different target invalidates a leftover answer to the
 // second question — accept_host in particular is not offered there.
 watch(targetNetworkId, () => {
@@ -853,6 +861,21 @@ async function submitUnbound() {
                 </template>
               </div>
             </label>
+          </div>
+
+          <!-- Moving the gateway away leaves the source network without
+               one. Its devices stay recorded on it and become unroutable
+               until it gets a gateway again — worth stating before the
+               click, not after. -->
+          <div
+            v-if="!targetIsCurrent && sourceLoses > 0"
+            class="mt-2 rounded-md border border-amber-700/40 bg-amber-900/20 p-2 text-xs text-amber-200"
+          >
+            "{{ active.network_name }}" then has no gateway, and its
+            {{ sourceLoses }} device{{ sourceLoses === 1 ? '' : 's' }} cannot be
+            reached until you assign one. Devices that report in on this
+            gateway afterwards are followed over to the new network
+            automatically — and leave their old group when they do.
           </div>
 
           <!-- Second question, and only when it actually needs asking.

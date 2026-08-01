@@ -153,6 +153,9 @@ def _apply_device_meta_updates(
             except (TypeError, ValueError):
                 old_gid = 0
             dev.groupId = int(new_group)
+            # Re-grouping is the operator acknowledging the relocation, so
+            # the "it left its old group" note has served its purpose.
+            dev.network_change_note = None
             affected_gids.add(old_gid)
             affected_gids.add(int(new_group))
             was_online = bool(getattr(dev, "link_online", False))

@@ -18,7 +18,7 @@ import { useRlPresetsStore } from '@/stores/rl_presets'
 import SpecialsLinkButton from '@/components/SpecialsLinkButton.vue'
 import { apiPost } from '@/api/client'
 import { useToast } from '@/composables/useToast'
-import type { Device } from '@/api/types'
+import type { Device, NetworkChangeNote } from '@/api/types'
 
 const { CONFIG_BITS, isVisible, bitOn } = useConfigDisplay()
 
@@ -157,6 +157,22 @@ const effectNameById = computed<Map<number, string>>(() => {
   }
   return out
 })
+
+/** Tooltip for the "moved" badge: what the host followed, and what it
+ *  cost. Spelled out rather than abbreviated — this is the one place the
+ *  operator learns why a group membership disappeared. */
+function networkChangeTitle(note: NetworkChangeNote): string {
+  const base =
+    `This device answered on "${note.to_network_name}" `
+    + `(it was recorded on "${note.from_network_name}"), so the host moved it there.`
+  if (!note.left_group_name) {
+    return `${base} Assign it to a group to clear this note.`
+  }
+  return (
+    `${base} It was removed from group "${note.left_group_name}", which `
+    + `belongs to the old network. Assign it to a group to clear this note.`
+  )
+}
 
 function effectLabel(effectId: number | null | undefined): string {
   if (effectId === null || effectId === undefined) return '—'
@@ -363,6 +379,16 @@ function onRowSelect(addr: string, ev: Event) {
             >
               <Pencil class="h-3.5 w-3.5" />
             </button>
+            <!-- The device answered on a different network's gateway and
+                 the host followed it. Shown here because the move can drop
+                 the device out of its group, and a membership that vanishes
+                 on its own is otherwise only visible in the log. Clears as
+                 soon as the operator re-groups the device. -->
+            <span
+              v-if="row.original.network_change_note"
+              class="flex-none cursor-help rounded bg-amber-900/40 px-1 py-0.5 text-[10px] leading-none text-amber-200"
+              :title="networkChangeTitle(row.original.network_change_note)"
+            >moved</span>
           </div>
         </td>
         <td class="mono">{{ row.original.addr }}</td>
