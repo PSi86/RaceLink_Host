@@ -5,6 +5,7 @@ import { useRoute } from 'vue-router'
 import AppHeader from '@/components/AppHeader.vue'
 import TransientBanner from '@/components/TransientBanner.vue'
 import GatewayBanner from '@/components/GatewayBanner.vue'
+import UnexpectedGatewayBar from '@/components/UnexpectedGatewayBar.vue'
 import BatteryWarningBanner from '@/components/BatteryWarningBanner.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import ConfirmHost from '@/components/ConfirmHost.vue'
@@ -19,6 +20,7 @@ import GatewayBindWizard from '@/components/modals/GatewayBindWizard.vue'
 import ChannelScanDialog from '@/components/modals/ChannelScanDialog.vue'
 import NetworkManagerDialog from '@/components/modals/NetworkManagerDialog.vue'
 import SetupChangeAssistant from '@/components/modals/SetupChangeAssistant.vue'
+import GatewayAssignDialog from '@/components/modals/GatewayAssignDialog.vue'
 // Manage-groups dialog imports ``vuedraggable`` (~100 kB through
 // Sortable.js). Lazy-load so we only pay that cost when the operator
 // actually opens the dialog — otherwise it would land in the main
@@ -118,6 +120,14 @@ watch(ui.networkManagerRequest, () => {
 // inside the component; we just keep a ref for v-model binding.
 const setupAssistantOpen = ref(false)
 
+// Gateway-handling rework: assignment dialog for unexpected (unbound)
+// gateways. Opened from the UnexpectedGatewayBar's "Assign…" button
+// (and the SetupChangeAssistant's unbound action) via the ui-bus.
+const gatewayAssignOpen = ref(false)
+watch(ui.gatewayAssignRequest, () => {
+  gatewayAssignOpen.value = true
+})
+
 // Initialise SSE once for the whole app. ``useRaceLinkEvents`` registers
 // onScopeDispose, so when this component unmounts (full-page navigation
 // away) the EventSource is closed synchronously — the structural fix for
@@ -176,6 +186,7 @@ onMounted(async () => {
     <AppHeader :route="route" />
     <TransientBanner :visible="transientBannerVisible" :message="transientBannerMessage" />
     <GatewayBanner />
+    <UnexpectedGatewayBar />
     <BatteryWarningBanner />
     <div class="min-h-0 flex-1 overflow-hidden">
       <router-view />
@@ -195,4 +206,5 @@ onMounted(async () => {
   <ChannelScanDialog v-model:open="channelScanOpen" />
   <NetworkManagerDialog v-model:open="networkManagerOpen" />
   <SetupChangeAssistant v-model:open="setupAssistantOpen" />
+  <GatewayAssignDialog v-model:open="gatewayAssignOpen" />
 </template>

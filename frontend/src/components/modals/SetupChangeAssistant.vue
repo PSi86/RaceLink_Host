@@ -212,11 +212,18 @@ watch(
 )
 
 function openBindWizard() {
-  // The bind wizard auto-opens from the gateways store's
-  // attentionRecord. Just close ourselves; the operator's next
-  // interaction with the conflict/unbound list will re-render the
-  // wizard at the top of the z-order.
+  // RF-mismatch (conflict) → the bind wizard. It still auto-opens from
+  // the gateways store's attentionRecord for conflicts, but fire the
+  // explicit signal too so dismissing it here always re-surfaces it.
   emit('update:open', false)
+  ui.requestBindWizard()
+}
+
+function openAssign() {
+  // Gateway-handling rework: unexpected (unbound) gateways are assigned
+  // through the GatewayAssignDialog, not the auto-popping bind wizard.
+  emit('update:open', false)
+  ui.requestGatewayAssign()
 }
 
 function openChannelScan() {
@@ -303,8 +310,9 @@ function remainingFor(nextRetryInS: number | null | undefined): number | null {
 function actionFor(diff: SetupDiff): { label: string; click: () => void } | null {
   switch (diff.kind) {
     case 'gateway_conflict':
-    case 'gateway_unbound':
       return { label: 'Open bind wizard', click: openBindWizard }
+    case 'gateway_unbound':
+      return { label: 'Assign gateway', click: openAssign }
     case 'device_rf_stale':
       return { label: 'Run channel scan', click: openChannelScan }
     case 'gateway_missing':

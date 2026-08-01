@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { RouteLocationNormalizedLoaded } from 'vue-router'
 
 import MasterBar from '@/components/MasterBar.vue'
@@ -18,14 +18,13 @@ const devices = useDevicesStore()
 const toast = useToast()
 const ui = useUiBus()
 
-// Bug 3a re-open path: if any attached gateway is currently in a
-// state that requires operator action (conflict or unbound) AND the
-// operator dismissed the auto-popping wizard with "Later", they have
-// no other way to reach the wizard. The ⚠ Pair button below is
-// rendered while ``needsPairing`` is true; clicking it fires the
-// ui-bus signal that the wizard's extra watcher picks up.
+// The ⚠ Pair button is the manual re-open path for the RF-mismatch
+// (conflict) wizard after the operator dismissed the auto-pop with
+// "Later". Gateway-handling rework: it is scoped to *conflicts* only —
+// unexpected (unbound) gateways are surfaced by the amber
+// UnexpectedGatewayBar + GatewayAssignDialog, not this button.
 const needsPairing = computed(() =>
-  gateways.list.some((r) => r.state === 'conflict' || r.state === 'unbound'),
+  gateways.list.some((r) => r.state === 'conflict'),
 )
 
 // Surface the per-device retry stats from the StatusService when a
@@ -99,6 +98,32 @@ function onOpenBindWizard() {
   ui.requestBindWizard()
 }
 
+// Gateway-handling rework: explicit "look for newly-attached gateways"
+// trigger so a gateway swap no longer needs a host restart. Runs the
+// existing soft re-discover (attaches any gateway on a free USB port,
+// including unexpected ones); freshly-attached unbound gateways then
+// surface in the amber UnexpectedGatewayBar.
+const scanning = ref(false)
+async function onScanGateways() {
+  if (scanning.value) return
+  scanning.value = true
+  try {
+    const res = await gateways.rediscover()
+    if (!res.ok) {
+      toast.error(`Scan failed: ${res.error || 'unknown'}`)
+      return
+    }
+    const n = res.attached ?? 0
+    toast.show(
+      n > 0
+        ? `Scan: ${n} gateway${n === 1 ? '' : 's'} attached.`
+        : 'Scan: no new gateways found.',
+    )
+  } finally {
+    scanning.value = false
+  }
+}
+
 async function onStatusSelection() {
   const macs = Array.from(devices.selected)
   if (macs.length === 0) {
@@ -146,6 +171,17 @@ async function onStatusAll() {
         @click="onOpenBindWizard"
       >
         ⚠ Pair…
+      </button>
+      <!-- Always-available gateway re-discover. Lets the operator pick
+           up a newly-plugged (or swapped) gateway without restarting the
+           host; results land in the UnexpectedGatewayBar. -->
+      <button
+        title="Scan USB ports for newly-attached or swapped gateways (no restart needed)."
+        aria-label="Scan for gateways"
+        :disabled="scanning"
+        @click="onScanGateways"
+      >
+        {{ scanning ? 'Scanning…' : 'Scan Gateways' }}
       </button>
       <!-- Page navigation runs through ``<router-link>`` so the SPA never
            unmounts on Devices ↔ Scenes transitions. A full-page reload

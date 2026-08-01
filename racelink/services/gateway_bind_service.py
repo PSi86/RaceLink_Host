@@ -641,6 +641,22 @@ class GatewayBindService:
         if not target_id:
             raise _BindActionError("rebind requires a 'network_id'")
         network = self._lookup_network(target_id)
+        # Compatibility guard: an RF gateway may only take over an RF
+        # network. Ethernet networks carry no gateway_mac and run over
+        # the host NIC, so binding a LoRa gateway to one would produce
+        # an unreachable, mixed-transport network — the "no Ethernet
+        # binding for RF gateways" invariant. The WebUI filters the
+        # rebind dropdown to RF networks too, but the server is the
+        # authority.
+        from ..domain.models import NETWORK_KIND_RF
+        net_kind = str(
+            getattr(network, "kind", NETWORK_KIND_RF) or NETWORK_KIND_RF
+        ).strip().lower()
+        if net_kind != NETWORK_KIND_RF:
+            raise _BindActionError(
+                f"cannot bind an RF gateway to a '{net_kind}' network — "
+                "RF and Ethernet networks cannot share hardware"
+            )
         # Drop the previous gateway_mac from any sibling network that
         # used to carry it — there's only one transport per MAC at any
         # time so overlap would always be a stale record.

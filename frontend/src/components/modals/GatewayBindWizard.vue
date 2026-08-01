@@ -104,11 +104,13 @@ const regionOptions = computed(() => {
 })
 
 const rebindOptions = computed(() => {
-  // Only networks that don't already carry an ident_mac (or carry
-  // an ident_mac that no longer matches any attached gateway) are
-  // safe rebind targets. The server enforces this too, but
-  // filtering here keeps the dropdown's options accurate.
+  // Only RF networks are valid rebind targets for an RF gateway:
+  // Ethernet networks run over the host NIC and carry no gateway_mac,
+  // so binding a LoRa gateway to one is physically impossible. The
+  // server rejects such a bind (``_action_rebind`` kind-guard); the
+  // filter here keeps the dropdown from offering an impossible choice.
   return networks.networks
+    .filter((n) => n.kind !== 'ethernet')
     .map((n) => ({ id: n.id, name: n.name, gateway_mac: n.gateway_mac }))
     .sort((a, b) => a.name.localeCompare(b.name))
 })
@@ -159,6 +161,11 @@ watch(
       }
       return
     }
+    // Gateway-handling rework: only RF-config CONFLICTs auto-pop this
+    // modal. Unexpected (unbound) gateways are surfaced by the amber
+    // UnexpectedGatewayBar and assigned through the GatewayAssignDialog,
+    // so a freshly-detected gateway never steals the screen.
+    if (next.state !== 'conflict') return
     // Open / refresh when:
     //   * the wizard isn't currently showing, OR
     //   * the ident_mac changed (some other gateway now needs help).

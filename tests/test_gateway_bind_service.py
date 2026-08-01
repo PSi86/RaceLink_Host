@@ -447,6 +447,42 @@ class CaseCUnknownGatewayTests(unittest.TestCase):
         self.assertEqual(broadcasts, broadcasts_before)
         self.assertEqual(persists, persists_before)
 
+    def test_resolve_rebind_refuses_ethernet_network(self):
+        # Compatibility guard: an RF gateway must never be bound to an
+        # Ethernet network (no gateway_mac, host-NIC transport). The
+        # resolve call is rejected and the Ethernet network is left
+        # untouched.
+        ctrl, _gw, svc, broadcasts, persists = _make_service(
+            gw=_FakeGatewayService(configs={"GW-X": _GATEWAY_CFG_MATCH}),
+        )
+        eth = RL_Network(name="Pit LAN", kind="ethernet")
+        ctrl.network_repository.append(eth)
+        t = _FakeTransport("GW-X")
+        ctrl._transports.append(t)
+        rec_initial = svc.evaluate(t)
+        assert rec_initial is not None
+        broadcasts_before = list(broadcasts)
+        persists_before = list(persists)
+
+        out = svc.resolve("GW-X", "rebind", {
+            "token": rec_initial.token,
+            "network_id": eth.id,
+        })
+
+        self.assertFalse(out["ok"])
+        self.assertIn("ethernet", out["error"].lower())
+        # The gateway stays UNBOUND; the Ethernet network never gains a
+        # gateway_mac and the transport is not stamped.
+        self.assertEqual(out["state"], "unbound")
+        self.assertIsNone(eth.gateway_mac)
+        self.assertIsNone(t.network_id)
+        rec = svc.get("GW-X")
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.UNBOUND)
+        # No side effects beyond the initial evaluate.
+        self.assertEqual(broadcasts, broadcasts_before)
+        self.assertEqual(persists, persists_before)
+
     def test_resolve_rebind_to_existing_network_first_contact_adopt(self):
         ctrl, _gw, svc, _broadcasts, _persists = _make_service(
             gw=_FakeGatewayService(configs={"GW-X": _GATEWAY_CFG_MATCH}),
