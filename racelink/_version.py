@@ -1,6 +1,6 @@
 """Canonical RaceLink Host version helpers."""
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 __version__ = VERSION
 
 
