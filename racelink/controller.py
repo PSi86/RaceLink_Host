@@ -243,6 +243,10 @@ class RaceLink_Host:
             controller=self,
             bind_service=self.gateway_bind_service,
         )
+        # Versioned snapshots of the combined state blob, so "start a
+        # fresh configuration" stops being a one-way door.
+        from racelink.services.config_backup_service import ConfigBackupService
+        self.config_backup_service = ConfigBackupService(self)
         # Stage 3 Part F: channel-scan service. Recovers devices that
         # got stranded on a previous migration by sweeping the
         # region's channel table on a chosen gateway and reporting
@@ -398,6 +402,29 @@ class RaceLink_Host:
             if ident and ident == target_mac:
                 return t
         return None
+
+    def _no_route_hint(self, network_id) -> str:
+        """Operator-facing reason why a network currently has no transport.
+
+        The distinction matters: "gateway unplugged" is a cable problem,
+        "network has no gateway assigned" is a configuration one, and the
+        two need different actions.
+        """
+        if not network_id:
+            return "the device is not assigned to any network"
+        net = self.network_repository.get_by_id(network_id)
+        if net is None:
+            return "its network no longer exists"
+        name = str(getattr(net, "name", "") or network_id)
+        if not getattr(net, "gateway_mac", None):
+            return (
+                f"network {name!r} has no gateway assigned — attach one and "
+                f"assign it in the gateway wizard"
+            )
+        return (
+            f"the gateway {net.gateway_mac} of network {name!r} is not "
+            f"attached"
+        )
 
     def transport_for_device(self, addr):
         """Resolve the transport for a device by MAC.
@@ -1748,9 +1775,21 @@ class RaceLink_Host:
         # identical to the pre-multi-network path. With multiple
         # transports the SET_GROUP for an A-network device goes via
         # the A-network gateway, never via B.
-        transport = self.transport_for_device(targetDevice.addr) or getattr(self, "transport", None)
+        transport = self.transport_for_device(targetDevice.addr)
         if transport is None:
-            logger.warning("setNodeGroupId: communicator not ready")
+            # Deliberately NOT falling back to the primary slot. "No route"
+            # here means the device's network has no attached gateway (it
+            # was unplugged, or moved to another network) — sending down
+            # whatever transport happens to be first is worse than not
+            # sending: on a mixed RF/Ethernet host it puts a LoRa unicast
+            # on the NIC, and the operator sees a timeout and a false
+            # "offline" instead of the actual cause.
+            logger.warning(
+                "setNodeGroupId: no transport for %s (network %s) — %s",
+                targetDevice.addr,
+                getattr(targetDevice, "network_id", None) or "unassigned",
+                self._no_route_hint(getattr(targetDevice, "network_id", None)),
+            )
             return False
 
         self._install_transport_hooks()

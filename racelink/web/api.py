@@ -33,6 +33,7 @@ from ..domain.network_boundary import (
     validate_scene_scope_consistency,
 )
 from ..domain.node_config import serialize_node_config_schema
+from ..services.config_backup_service import ConfigBackupError
 from ..services import OTAWorkflowService, SpecialsService
 from ..services.scene_cost_estimator import estimate_scene, lora_parameters
 from ..services.scenes_service import (
@@ -152,6 +153,9 @@ def _apply_device_meta_updates(
             except (TypeError, ValueError):
                 old_gid = 0
             dev.groupId = int(new_group)
+            # Re-grouping is the operator acknowledging the relocation, so
+            # the "it left its old group" note has served its purpose.
+            dev.network_change_note = None
             affected_gids.add(old_gid)
             affected_gids.add(int(new_group))
             was_online = bool(getattr(dev, "link_online", False))
@@ -507,6 +511,7 @@ def register_api_routes(bp, ctx):
         """
         rl = ctx.rl_instance
         net_repo = getattr(rl, "network_repository", None)
+        bind_service = getattr(rl, "gateway_bind_service", None)
         masters_snap = ctx.sse.masters.snapshot() if ctx.sse else {"networks": [], "default_network_id": None}
         live_by_id = {
             row.get("network_id"): row
@@ -522,6 +527,20 @@ def register_api_routes(bp, ctx):
                 items = []
             for net in items:
                 nid = str(getattr(net, "id", "") or "")
+                # ``device_impact`` tells the WebUI whether re-assigning
+                # this network's gateway would strand devices that pinned
+                # the old master's MAC. Surfaced on the listing (not only
+                # in the conflict wizard) so a gateway-locked network is a
+                # visible standing property rather than a surprise at the
+                # moment of the swap, when the fix is out of radio range.
+                impact = None
+                if bind_service is not None and nid:
+                    try:
+                        impact = bind_service.network_device_impact(nid)
+                    except Exception:
+                        logger.exception(
+                            "/api/networks: device_impact raised for %s", nid,
+                        )
                 rows.append({
                     "id": nid,
                     "name": str(getattr(net, "name", "") or ""),
@@ -533,6 +552,7 @@ def register_api_routes(bp, ctx):
                     "eth_config": getattr(net, "eth_config", None),
                     "created_ts": getattr(net, "created_ts", None),
                     "live": live_by_id.get(nid),
+                    "device_impact": impact,
                 })
         return jsonify({
             "ok": True,
@@ -831,18 +851,39 @@ def register_api_routes(bp, ctx):
         Network Manager channel dropdown + the Channel Scan
         wizard's channel-selection checkbox list. The table is a
         compile-time constant on the server (see
-        :mod:`racelink.domain.rf_channels`); it doesn't need
-        per-request server work and the WebUI can cache the response
-        for the session.
+        :mod:`racelink.domain.rf_channels`).
+
+        Each channel additionally carries ``occupied_by`` — the
+        networks already sitting on it under the separation policy.
+        A picker can therefore show what is free *before* the operator
+        commits, using the same rule the create/update paths enforce,
+        so a channel offered as free can never be rejected on save.
+        This part is per-request: it depends on live network state.
         """
-        from ..domain.rf_channels import REGION_CHANNELS
-        return jsonify({
-            "ok": True,
-            "regions": {
-                region: [dict(ch) for ch in channels]
-                for region, channels in REGION_CHANNELS.items()
-            },
-        })
+        from ..domain.rf_channels import REGION_CHANNELS, channel_rf_config
+        from ..domain.rf_policy import occupants_of
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        try:
+            nets = list(net_repo.list()) if net_repo is not None else []
+        except Exception:
+            logger.exception("/api/channels: repo iteration raised")
+            nets = []
+
+        out: dict[str, list[dict]] = {}
+        for region, channels in REGION_CHANNELS.items():
+            rows = []
+            for ch in channels:
+                row = dict(ch)
+                cfg = channel_rf_config(region, int(row.get("id", -1)))
+                row["occupied_by"] = [
+                    {"id": o["id"], "name": o["name"]}
+                    for o in occupants_of(nets, cfg)
+                ]
+                rows.append(row)
+            out[region] = rows
+        return jsonify({"ok": True, "regions": out})
 
     @bp.route("/api/gateways", methods=["GET"])
     def api_gateways_list():
@@ -945,6 +986,119 @@ def register_api_routes(bp, ctx):
                 "stage": "INIT",
                 "network_id": network_id,
                 "force_offline": force_offline,
+            },
+        )
+        if not task:
+            return ctx.tasks.busy_response()
+        return jsonify({"ok": True, "task": task})
+
+    @bp.route("/api/networks/<network_id>/clear-master-persist", methods=["POST"])
+    def api_network_clear_master_persist(network_id: str):
+        """Release every device on a network from its pinned master MAC,
+        so the network can be handed to a different gateway.
+
+        A node with ``configByte`` bit 1 set has persisted the MAC of the
+        gateway that paired it and will ignore any other master —
+        rebooting does not clear it. The only over-the-air cure is
+        ``OPC_CONFIG`` option 0x03 (data0=0), and that has to travel over
+        the *current* gateway while it can still reach the nodes. Hence
+        this is a "prepare for the swap" action, not a recovery one:
+        after the gateway is gone, the nodes need a physical reset.
+
+        ``forget_master`` (default false) additionally sends option 0x80,
+        which drops the already-learned MAC instead of only disabling the
+        persistence. Devices that are offline are reported as skipped —
+        they keep their pin and will need the manual route.
+        """
+        from ..domain.node_config import (
+            OPT_FORGET_MASTER, OPT_MAC_FILTER_PERSIST,
+        )
+        from ..transport import mac_last3_from_hex
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        if net_repo is None:
+            return jsonify({"ok": False, "error": "network repository unavailable"}), 503
+        net = net_repo.get_by_id(network_id)
+        if net is None:
+            return jsonify({"ok": False, "error": f"unknown network_id {network_id!r}"}), 404
+
+        cfg_service = getattr(rl, "config_service", None)
+        if cfg_service is None or not callable(getattr(cfg_service, "send_config", None)):
+            return jsonify({"ok": False, "error": "config_service unavailable"}), 503
+
+        body = request.get_json(silent=True) or {}
+        forget_master = bool(body.get("forget_master", False))
+
+        dev_repo = getattr(rl, "device_repository", None)
+        members = [
+            d for d in (list(dev_repo.list()) if dev_repo is not None else [])
+            if str(getattr(d, "network_id", "") or "").strip() == str(network_id)
+        ]
+        if not members:
+            return jsonify({
+                "ok": True, "cleared": [], "skipped": [], "failed": [],
+                "message": "network has no devices",
+            })
+
+        def _progress(**fields):
+            try:
+                ctx.tasks.update(meta=dict(fields))
+            except Exception:
+                logger.debug("clear-master-persist progress raised", exc_info=True)
+
+        def _runner():
+            cleared, skipped, failed = [], [], []
+            for idx, dev in enumerate(members):
+                mac = str(getattr(dev, "addr", "") or "")
+                _progress(
+                    stage="clearing", index=idx, total=len(members), mac=mac,
+                )
+                recv3 = mac_last3_from_hex(mac)
+                if not recv3 or recv3 == b"\xFF\xFF\xFF":
+                    failed.append({"mac": mac, "error": "invalid address"})
+                    continue
+                try:
+                    res = cfg_service.send_config(
+                        OPT_MAC_FILTER_PERSIST, data0=0,
+                        recv3=recv3, wait_for_ack=True,
+                    )
+                    acked = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
+                    if not acked:
+                        # No ACK means the node never heard us; its pin is
+                        # still in place. Reporting this as "skipped" (not
+                        # "cleared") is the whole point — the operator has
+                        # to know which nodes still need a manual reset.
+                        skipped.append({"mac": mac, "reason": "no ack (offline?)"})
+                        continue
+                    if forget_master:
+                        cfg_service.send_config(
+                            OPT_FORGET_MASTER, data0=1,
+                            recv3=recv3, wait_for_ack=True,
+                        )
+                    cleared.append(mac)
+                except Exception as ex:
+                    logger.exception("clear-master-persist failed for %s", mac)
+                    failed.append({"mac": mac, "error": f"{type(ex).__name__}: {ex}"})
+            _sse_refresh(ctx, {state_scope.DEVICES})
+            return {
+                "ok": not failed,
+                "cleared": cleared,
+                "skipped": skipped,
+                "failed": failed,
+                "forget_master": forget_master,
+            }
+
+        task = ctx.tasks.start(
+            "clear_master_persist", _runner,
+            meta={
+                "stage": "INIT",
+                "network_id": network_id,
+                "total": len(members),
+                "message": (
+                    f"Releasing {len(members)} device"
+                    f"{'s' if len(members) != 1 else ''} from their pinned master…"
+                ),
             },
         )
         if not task:
@@ -1204,19 +1358,105 @@ def register_api_routes(bp, ctx):
             return ctx.tasks.busy_response()
         return jsonify({"ok": True, "task": task})
 
+    def _backup_service():
+        svc = getattr(ctx.rl_instance, "config_backup_service", None)
+        if svc is None:
+            return None, (
+                jsonify({"ok": False, "error": "config_backup_service unavailable"}),
+                503,
+            )
+        return svc, None
+
+    @bp.route("/api/state/backups", methods=["GET"])
+    def api_state_backups_list():
+        """Snapshots of the combined device/group/network configuration,
+        newest first. Each row carries the schema + host version it was
+        written with and a ``compatible`` flag (false only when the backup
+        is *newer* than this build)."""
+        svc, err = _backup_service()
+        if err:
+            return err
+        return jsonify({"ok": True, "backups": svc.list()})
+
+    @bp.route("/api/state/backups", methods=["POST"])
+    def api_state_backup_create():
+        """Snapshot the live configuration. Body: ``{"label"?: str}``."""
+        svc, err = _backup_service()
+        if err:
+            return err
+        body = request.get_json(silent=True) or {}
+        try:
+            meta = svc.create(label=body.get("label"))
+        except ConfigBackupError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        return jsonify({"ok": True, "backup": meta})
+
+    @bp.route("/api/state/backups/<backup_id>/restore", methods=["POST"])
+    def api_state_backup_restore(backup_id: str):
+        """Replace the live configuration with a snapshot.
+
+        Always writes a ``pre-restore`` backup first. Refuses a snapshot
+        written by a newer host unless ``{"force": true}`` — see
+        :mod:`racelink.services.config_backup_service` for why.
+        """
+        svc, err = _backup_service()
+        if err:
+            return err
+        body = request.get_json(silent=True) or {}
+        try:
+            result = svc.restore(backup_id, force=bool(body.get("force", False)))
+        except ConfigBackupError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify(result)
+
+    @bp.route("/api/state/backups/<backup_id>", methods=["DELETE"])
+    def api_state_backup_delete(backup_id: str):
+        svc, err = _backup_service()
+        if err:
+            return err
+        try:
+            return jsonify(svc.delete(backup_id))
+        except ConfigBackupError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+
+    @bp.route("/api/state/clear", methods=["POST"])
+    def api_state_clear():
+        """Back up the current configuration, then start an empty one.
+
+        The result is the state a fresh install boots with: no devices,
+        no groups, one default network. Every attached gateway therefore
+        comes back UNBOUND and can be assigned from the wizard.
+        Body: ``{"label"?: str}`` names the automatic backup.
+        """
+        svc, err = _backup_service()
+        if err:
+            return err
+        body = request.get_json(silent=True) or {}
+        try:
+            result = svc.clear(label=body.get("label"))
+        except ConfigBackupError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        _sse_refresh(ctx, {state_scope.FULL})
+        return jsonify(result)
+
     @bp.route("/api/gateways/<ident_mac>/resolve", methods=["POST"])
     def api_gateway_resolve(ident_mac: str):
         """Stage 3 Part D: operator response to a ``gateway_conflict``
         / ``gateway_unbound`` wizard. Body shape:
 
             {
-                "action": "accept_gateway" | "accept_host"
-                          | "create_network" | "rebind",
+                "action": "retune_gateway" | "accept_gateway"
+                          | "accept_host" | "create_network" | "rebind",
                 "params": {...action-specific...},
             }
 
         ``params`` carries the ``token`` from the inbound SSE event
         so a stale wizard cannot override a re-evaluated record.
+
+        See :mod:`racelink.services.gateway_bind_service` for which
+        action is legal in which bind state, and which of them touch
+        devices (only ``accept_host`` does).
         """
         bind_service = getattr(ctx.rl_instance, "gateway_bind_service", None)
         if bind_service is None:

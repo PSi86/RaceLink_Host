@@ -33,23 +33,46 @@ State machine, per transport (keyed by ``ident_mac``):
 
 Resolve actions (operator → ``POST /api/gateways/{ident_mac}/resolve``):
 
+  * ``retune_gateway`` — CONFLICT only. Push the *network's*
+    persisted RF config onto the gateway and leave every device
+    alone. This is the right answer to the common conflict —
+    the gateway was reflashed or swapped while the devices never
+    moved — and it is cheap: one ``GW_CMD_SET_RF_CONFIG``, a
+    reboot, no device traffic and therefore no stranding risk.
+    Contrast ``accept_host``, which re-tunes every device too.
   * ``accept_gateway`` — adopt the gateway's reported RF config
     into the bound ``RL_Network``. Used when the operator
     accepts what's already on the hardware (CONFLICT only).
+    Destructive in one specific way: the network's ``rf_config``
+    is the host's only record of what its *devices* are tuned to,
+    so overwriting it because the *gateway* disagrees strands
+    every device on the network. Callers should surface
+    :meth:`network_device_impact` first.
   * ``accept_host`` — keep the network's persisted RF config;
     schedule a migration to push it to gateway + devices.
     Part E ships the migration; Part D records the intent and
     leaves the bind state at CONFLICT until the migration
     completes.
-  * ``create_network`` — UNBOUND only. Create a fresh
+  * ``create_network`` — UNBOUND or CONFLICT. Create a fresh
     ``RL_Network`` named by the operator, seeded with the
     gateway's reported RF config, and bind this transport
-    to it.
-  * ``rebind`` — UNBOUND only. Bind this transport to an
-    existing ``RL_Network`` by id. If the existing network
-    carries an ``rf_config`` and it differs from the
-    gateway's, the resulting state is CONFLICT (the operator
-    has to pick accept-host or accept-gateway from there).
+    to it. From CONFLICT this is how an operator parks a
+    re-tuned gateway on a new network without disturbing the
+    one it used to drive.
+  * ``rebind`` — UNBOUND or CONFLICT. Bind this transport to an
+    existing ``RL_Network`` by id. When the network's
+    ``rf_config`` differs from the gateway's, ``on_mismatch``
+    settles it in the same call: ``retune_gateway`` moves the
+    gateway onto the network's channel, ``accept_gateway``
+    rewrites the network's channel to the gateway's, and
+    ``ask`` (the default) parks in CONFLICT for a separate
+    answer. Settling in-call is what makes "rebind to the
+    network I am already on" meaningful — under ``ask`` it
+    merely re-raises the conflict the operator was answering.
+
+Both ``create_network`` and ``rebind`` release the ident from any
+sibling network that still lists it as ``gateway_mac``, so a gateway
+is never claimed by two networks at once.
 
 Stage-3 deferments:
 
@@ -382,14 +405,59 @@ class GatewayBindService:
         currently attached for that ident.
         """
         ident = str(ident_mac).upper()
-        transports = list(getattr(self.controller, "transports", None) or [])
-        for t in transports:
-            if str(getattr(t, "ident_mac", "") or "").upper() == ident:
-                return self.evaluate(t)
+        transport = self._transport_for(ident)
+        if transport is not None:
+            return self.evaluate(transport)
         # Transport disconnected since the migration started — drop the
         # stale record so the next attach starts clean.
         self.forget(ident)
         return None
+
+    def _transport_for(self, ident_mac: str):
+        """Return the attached transport carrying ``ident_mac``, or None."""
+        ident = str(ident_mac or "").upper()
+        for t in list(getattr(self.controller, "transports", None) or []):
+            if str(getattr(t, "ident_mac", "") or "").upper() == ident:
+                return t
+        return None
+
+    def _push_rf_to_gateway(self, rec: BindRecord, target: dict) -> None:
+        """Write ``target`` to the gateway's NVS and let it reboot.
+
+        Raises :class:`_BindActionError` on any refusal, so callers can
+        abort before recording state that the hardware never accepted.
+        """
+        transport = self._transport_for(rec.ident_mac)
+        if transport is None:
+            raise _BindActionError(
+                f"gateway {rec.ident_mac} is not attached — reconnect it and retry"
+            )
+        gw = self.gateway_service
+        setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            raise _BindActionError("gateway_service unavailable")
+        result = setter(dict(target), persist=True, transport=transport)
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = None
+            if isinstance(result, dict):
+                reason = result.get("reason_name") or result.get("error")
+            raise _BindActionError(
+                f"gateway rejected the RF config: {reason or 'no response'}"
+            )
+
+    def _release_ident_from_networks(self, ident_mac: str, keep=None) -> None:
+        """Clear ``gateway_mac`` from every network carrying ``ident_mac``.
+
+        There is only ever one transport per MAC, so a second network
+        listing the same ident is always a stale record. ``keep`` is the
+        network that is about to take ownership and is skipped.
+        """
+        ident = str(ident_mac or "").upper()
+        for net in list(self.controller.network_repository.list()):
+            if keep is not None and net is keep:
+                continue
+            if str(getattr(net, "gateway_mac", "") or "").upper() == ident:
+                net.gateway_mac = None
 
     def resolve(self, ident_mac: str, action: str, params: Optional[dict] = None) -> dict:
         """Apply an operator decision to a bind record.
@@ -412,6 +480,8 @@ class GatewayBindService:
                 }
 
             try:
+                if action == "retune_gateway":
+                    return self._action_retune_gateway(rec)
                 if action == "accept_gateway":
                     return self._action_accept_gateway(rec)
                 if action == "accept_host":
@@ -427,6 +497,60 @@ class GatewayBindService:
                 "error": f"unknown action {action!r}",
                 "state": rec.state.value,
             }
+
+    def network_device_impact(self, network_id: Optional[str]) -> dict:
+        """What happens to a network's devices if its gateway changes.
+
+        Two facts the operator needs *before* re-assigning a gateway,
+        neither of which the bind record itself carries:
+
+        ``master_persist`` — devices whose ``configByte`` bit 1
+        ("MAC filter persist", see :mod:`racelink.domain.node_config`)
+        is set have pinned the MAC of the gateway that paired them. A
+        different gateway is ignored no matter how the RF settings
+        line up, and a reboot does not clear it — the node has to be
+        re-flashed or told to forget its master while the *old* gateway
+        can still reach it. That is why this is worth surfacing early:
+        once the swap has happened, the fix is out of radio range.
+
+        ``stale`` — ``configByte`` is only as fresh as the last STATUS
+        reply. For a device that is already offline this is a last-known
+        value, not a guarantee, so the UI must say so rather than
+        implying a live read.
+
+        Returns ``{"network_id", "total", "master_persist": [...],
+        "stale": bool}`` where each entry is
+        ``{"mac", "name", "last_seen_ts"}``.
+        """
+        from ..domain.node_config import MAC_FILTER_PERSIST_BIT
+
+        target = str(network_id or "").strip()
+        repo = getattr(self.controller, "device_repository", None)
+        devices = list(repo.list()) if repo is not None else []
+        members = [
+            d for d in devices
+            if str(getattr(d, "network_id", "") or "").strip() == target
+        ]
+        pinned = []
+        stale = False
+        for dev in members:
+            cfg_byte = int(getattr(dev, "configByte", 0) or 0)
+            if not cfg_byte & MAC_FILTER_PERSIST_BIT:
+                continue
+            last_seen = float(getattr(dev, "last_seen_ts", 0) or 0)
+            if last_seen <= 0:
+                stale = True
+            pinned.append({
+                "mac": str(getattr(dev, "addr", "") or ""),
+                "name": str(getattr(dev, "name", "") or ""),
+                "last_seen_ts": last_seen,
+            })
+        return {
+            "network_id": target,
+            "total": len(members),
+            "master_persist": pinned,
+            "stale": stale,
+        }
 
     # ---- internals ----------------------------------------------------
 
@@ -495,6 +619,49 @@ class GatewayBindService:
 
     # ---- resolve actions ----------------------------------------------
 
+    def _action_retune_gateway(self, rec: BindRecord) -> dict:
+        """Bring the *gateway* onto the network's persisted RF config and
+        leave every device untouched.
+
+        This is the cheap, safe resolution for the overwhelmingly common
+        conflict: the gateway was reflashed or swapped, the devices never
+        moved. One ``GW_CMD_SET_RF_CONFIG`` with persist, no device
+        traffic, so nothing can strand. ``accept_host`` remains the
+        answer for the rarer case where the *devices* also have to move.
+
+        The gateway ACKs (via ``EV_RF_CHANGED``) and only then reboots, so
+        by the time ``set_gateway_rf_config`` returns the write is
+        committed. We flip the record to BOUND on that ACK rather than
+        waiting out the reboot — the controller re-attaches the transport
+        a few seconds later and :meth:`evaluate` re-confirms from the
+        hardware's own read-back.
+        """
+        if rec.state != BindState.CONFLICT:
+            raise _BindActionError(
+                f"retune_gateway requires state=conflict (current: {rec.state.value})"
+            )
+        target = rec.rf_config_expected
+        if not isinstance(target, dict) or not target:
+            raise _BindActionError(
+                "network has no rf_config to push — assign a channel to the "
+                "network first, or use accept_gateway"
+            )
+        self._push_rf_to_gateway(rec, target)
+
+        rec.rf_config_actual = dict(target)
+        rec.state = BindState.BOUND
+        rec.conflict_fields = []
+        rec.migration_pending = False
+        rec.token = uuid.uuid4().hex
+        self._broadcast_event(self.EVENT_BOUND, rec)
+        return {
+            "ok": True,
+            "state": rec.state.value,
+            "token": rec.token,
+            "rebooting": True,
+            "rf_config": dict(target),
+        }
+
     def _action_accept_gateway(self, rec: BindRecord) -> dict:
         """Adopt the gateway's reported RF config into the bound
         ``RL_Network``. CONFLICT-only — the action is meaningless when
@@ -507,15 +674,43 @@ class GatewayBindService:
         if rec.rf_config_actual is None:
             raise _BindActionError("gateway did not report an rf_config")
         network = self._lookup_network(rec.network_id)
+        self._adopt_gateway_config(rec, network)
+        rec.token = uuid.uuid4().hex
+        self._persist_quietly(f"accept_gateway on {rec.ident_mac}")
+        self._broadcast_event(self.EVENT_BOUND, rec)
+        return {"ok": True, "state": rec.state.value, "token": rec.token}
+
+    def _adopt_gateway_config(self, rec: BindRecord, network) -> None:
+        """Move ``network``'s recorded channel onto what the gateway
+        reports, and mark the record BOUND.
+
+        Refuses when that frequency belongs to another network: the
+        adopting network would become indistinguishable from it on air.
+        Without this check "accept the gateway's settings" could quietly
+        park two networks on one channel — the same hole
+        ``create_network`` had.
+        """
+        from ..domain.rf_policy import format_occupants, occupants_of
+
+        if not isinstance(rec.rf_config_actual, dict):
+            raise _BindActionError("gateway did not report an rf_config")
+        clash = occupants_of(
+            self.controller.network_repository.list(),
+            rec.rf_config_actual,
+            exclude_network_id=str(getattr(network, "id", "") or ""),
+        )
+        if clash:
+            raise _BindActionError(
+                f"the gateway's channel already belongs to "
+                f"{format_occupants(clash)} — adopting it would put two "
+                f"networks on one frequency. Move the gateway to a free "
+                f"channel instead."
+            )
         network.rf_config = dict(rec.rf_config_actual)
         rec.rf_config_expected = dict(rec.rf_config_actual)
         rec.state = BindState.BOUND
         rec.conflict_fields = []
         rec.migration_pending = False
-        rec.token = uuid.uuid4().hex
-        self._persist_quietly(f"accept_gateway on {rec.ident_mac}")
-        self._broadcast_event(self.EVENT_BOUND, rec)
-        return {"ok": True, "state": rec.state.value, "token": rec.token}
 
     def _action_accept_host(self, rec: BindRecord) -> dict:
         """Operator wants the host's persisted RF config to win — the
@@ -587,18 +782,31 @@ class GatewayBindService:
         }
 
     def _action_create_network(self, rec: BindRecord, params: dict) -> dict:
-        """UNBOUND only: create a fresh ``RL_Network`` named by the
-        operator, seeded with the gateway's reported RF config, and
-        bind this transport to it."""
-        if rec.state != BindState.UNBOUND:
+        """Create a fresh ``RL_Network`` and bind this transport to it.
+
+        The channel is the host's decision, not the gateway's. Pass
+        ``channel_id`` (with ``region``) and the gateway is moved onto
+        that channel; omit it and the gateway's current settings are
+        adopted, which is only meaningful for the first network on a
+        fresh install — ``region`` is then descriptive, since a node
+        tuned to an EU868 channel does not become US915 by relabelling.
+
+        Either way the resulting config is checked against every
+        existing network: two networks sharing a frequency and SyncWord
+        are indistinguishable on air, so that is refused outright.
+        """
+        if rec.state not in (BindState.UNBOUND, BindState.CONFLICT):
             raise _BindActionError(
-                f"create_network requires state=unbound (current: {rec.state.value})"
+                "create_network requires state=unbound or conflict "
+                f"(current: {rec.state.value})"
             )
         name = str(params.get("name") or "").strip()
         if not name:
             raise _BindActionError("create_network requires a non-empty 'name'")
         region = str(params.get("region") or "EU868")
         from ..domain.models import RL_Network
+        from ..domain.rf_channels import channel_rf_config
+        from ..domain.rf_policy import format_occupants, occupants_of
 
         if not isinstance(rec.rf_config_actual, dict):
             # Without a real readback we cannot seed the network and
@@ -610,45 +818,136 @@ class GatewayBindService:
                 "gateway did not respond to GET_RF_CONFIG — cannot create "
                 "network, please check hardware / firmware and retry"
             )
-        seeded_cfg = dict(rec.rf_config_actual)
+
+        # What the host is already configured for outranks what the
+        # gateway happens to be tuned to. An explicit ``channel_id``
+        # therefore wins, and the gateway is moved onto it below;
+        # seeding from the gateway is only the fallback for the first
+        # network on a fresh install.
+        channel_id = params.get("channel_id")
+        if channel_id not in (None, ""):
+            try:
+                ch_id_int = int(channel_id)
+            except (TypeError, ValueError):
+                raise _BindActionError("channel_id must be an integer")
+            resolved = channel_rf_config(region, ch_id_int)
+            if resolved is None:
+                raise _BindActionError(
+                    f"unknown channel_id {ch_id_int} in region {region!r}"
+                )
+            seeded_cfg = dict(resolved)
+        else:
+            # No channel picked: adopt the hardware's current settings.
+            # Region is then not a free choice — a node tuned to an
+            # EU868 channel does not become US915 by relabelling it —
+            # so the caller must not combine this path with a region
+            # the config does not belong to. The occupancy check below
+            # is what actually protects the airwaves either way.
+            seeded_cfg = dict(rec.rf_config_actual)
+
+        # The airwave is a shared resource: two networks on the same
+        # frequency with the same SyncWord cannot be told apart by any
+        # gateway's RX path. Refusing here is the whole point — the old
+        # code created the network regardless, so "new network for this
+        # gateway" could silently land on top of an existing one.
+        clash = occupants_of(
+            self.controller.network_repository.list(), seeded_cfg,
+        )
+        if clash:
+            raise _BindActionError(
+                f"that channel is already used by {format_occupants(clash)} — "
+                f"two networks cannot share a frequency and SyncWord. Pick a "
+                f"free channel for the new network."
+            )
+        # If the operator picked a channel the gateway isn't on, the
+        # gateway has to move — otherwise the network would be born in
+        # CONFLICT with itself. Do this BEFORE the network is recorded so
+        # a rejected write leaves no half-made network behind.
+        retuned = False
+        if _rf_diff(rec.rf_config_actual, seeded_cfg):
+            self._push_rf_to_gateway(rec, seeded_cfg)
+            retuned = True
+
         net = RL_Network(
             name=name,
             gateway_mac=rec.ident_mac,
             region=region,
             rf_config=seeded_cfg,
         )
+        # Coming from CONFLICT the ident is still claimed by the network
+        # this gateway used to drive. Release it before the new network
+        # takes over, otherwise two networks list the same gateway_mac
+        # and the next evaluate() picks whichever the repo yields first.
+        self._release_ident_from_networks(rec.ident_mac)
         self.controller.network_repository.append(net)
         self._bind_transport_to_network(rec.ident_mac, net.id)
         rec.network_id = str(net.id)
         rec.network_name = name
-        rec.rf_config_expected = dict(seeded_cfg) if seeded_cfg else None
+        rec.rf_config_expected = dict(seeded_cfg)
+        rec.rf_config_actual = dict(seeded_cfg)
         rec.state = BindState.BOUND
         rec.conflict_fields = []
         rec.token = uuid.uuid4().hex
         self._persist_quietly(f"create_network({name}) on {rec.ident_mac}")
         self._broadcast_event(self.EVENT_BOUND, rec)
-        return {"ok": True, "state": rec.state.value, "network_id": net.id, "token": rec.token}
+        return {
+            "ok": True,
+            "state": rec.state.value,
+            "network_id": net.id,
+            "token": rec.token,
+            "rebooting": retuned,
+            "rf_config": dict(seeded_cfg),
+        }
 
     def _action_rebind(self, rec: BindRecord, params: dict) -> dict:
-        """UNBOUND only: bind this transport's MAC to an existing
-        network. Updates the network's ``gateway_mac`` and re-runs the
-        conflict check on its persisted ``rf_config``."""
-        if rec.state != BindState.UNBOUND:
+        """Bind this transport's MAC to an existing network.
+
+        Updates the network's ``gateway_mac`` and re-checks its
+        persisted ``rf_config`` against the gateway. ``on_mismatch``
+        decides what happens when they disagree:
+
+        * ``"ask"`` (default) — land in CONFLICT and let the operator
+          answer separately. The historical behaviour.
+        * ``"retune_gateway"`` — move the gateway onto the target's
+          channel. The sane answer when taking over a network whose
+          devices are already running on it.
+        * ``"accept_gateway"`` — rewrite the target's channel to what
+          the gateway reports. Strands that network's devices unless
+          they are on the gateway's channel too, so callers should show
+          :meth:`network_device_impact` first.
+        """
+        if rec.state not in (BindState.UNBOUND, BindState.CONFLICT):
             raise _BindActionError(
-                f"rebind requires state=unbound (current: {rec.state.value})"
+                "rebind requires state=unbound or conflict "
+                f"(current: {rec.state.value})"
             )
         target_id = str(params.get("network_id") or "").strip()
         if not target_id:
             raise _BindActionError("rebind requires a 'network_id'")
+        on_mismatch = str(params.get("on_mismatch") or "ask").strip()
+        if on_mismatch not in ("ask", "retune_gateway", "accept_gateway"):
+            raise _BindActionError(
+                f"unknown on_mismatch {on_mismatch!r} — expected ask, "
+                f"retune_gateway or accept_gateway"
+            )
         network = self._lookup_network(target_id)
-        # Drop the previous gateway_mac from any sibling network that
-        # used to carry it — there's only one transport per MAC at any
-        # time so overlap would always be a stale record.
-        for sibling in list(self.controller.network_repository.list()):
-            if sibling is network:
-                continue
-            if str(getattr(sibling, "gateway_mac", "") or "").upper() == rec.ident_mac:
-                sibling.gateway_mac = None
+        # Compatibility guard: an RF gateway may only take over an RF
+        # network. Ethernet networks carry no gateway_mac and run over
+        # the host NIC, so binding a LoRa gateway to one would produce
+        # an unreachable, mixed-transport network — the "no Ethernet
+        # binding for RF gateways" invariant. The WebUI filters the
+        # rebind dropdown to RF networks too, but the server is the
+        # authority.
+        from ..domain.models import NETWORK_KIND_RF
+        net_kind = str(
+            getattr(network, "kind", NETWORK_KIND_RF) or NETWORK_KIND_RF
+        ).strip().lower()
+        if net_kind != NETWORK_KIND_RF:
+            raise _BindActionError(
+                f"cannot bind an RF gateway to a '{net_kind}' network — "
+                "RF and Ethernet networks cannot share hardware"
+            )
+        self._release_ident_from_networks(rec.ident_mac, keep=network)
         network.gateway_mac = rec.ident_mac
         self._bind_transport_to_network(rec.ident_mac, network.id)
         rec.network_id = str(network.id)
@@ -657,7 +956,23 @@ class GatewayBindService:
         rec.rf_config_expected = dict(expected) if isinstance(expected, dict) else None
 
         if rec.rf_config_expected is None and rec.rf_config_actual is not None:
-            # Same "first-contact adopt" as in :meth:`evaluate`.
+            # Same "first-contact adopt" as in :meth:`evaluate` — but a
+            # channel-less network adopting whatever this gateway happens
+            # to run can land straight on top of a network that already
+            # owns that frequency. Check before adopting.
+            from ..domain.rf_policy import format_occupants, occupants_of
+            clash = occupants_of(
+                self.controller.network_repository.list(),
+                rec.rf_config_actual,
+                exclude_network_id=str(network.id),
+            )
+            if clash:
+                raise _BindActionError(
+                    f"the gateway is on a channel already used by "
+                    f"{format_occupants(clash)} — assign a free channel to "
+                    f"\"{rec.network_name or network.name}\" first, or move "
+                    f"the gateway to one."
+                )
             network.rf_config = dict(rec.rf_config_actual)
             rec.rf_config_expected = dict(rec.rf_config_actual)
             rec.state = BindState.BOUND
@@ -672,6 +987,34 @@ class GatewayBindService:
             rec.state = BindState.BOUND
             rec.conflict_fields = []
             self._persist_quietly(f"rebind({network.id}) match")
+            rec.token = uuid.uuid4().hex
+            self._broadcast_event(self.EVENT_BOUND, rec)
+            return {"ok": True, "state": rec.state.value, "token": rec.token}
+
+        # The settings disagree. ``on_mismatch`` lets the caller settle
+        # that in the same call instead of bouncing back through a second
+        # conflict round — which is what made "rebind to the network I am
+        # already on" a silent no-op: it re-raised the very conflict the
+        # operator was answering.
+        if on_mismatch == "retune_gateway":
+            self._push_rf_to_gateway(rec, rec.rf_config_expected)
+            rec.rf_config_actual = dict(rec.rf_config_expected)
+            rec.state = BindState.BOUND
+            rec.conflict_fields = []
+            self._persist_quietly(f"rebind({network.id}) + retune")
+            rec.token = uuid.uuid4().hex
+            self._broadcast_event(self.EVENT_BOUND, rec)
+            return {
+                "ok": True,
+                "state": rec.state.value,
+                "token": rec.token,
+                "rebooting": True,
+                "rf_config": dict(rec.rf_config_expected),
+            }
+
+        if on_mismatch == "accept_gateway":
+            self._adopt_gateway_config(rec, network)
+            self._persist_quietly(f"rebind({network.id}) + adopt")
             rec.token = uuid.uuid4().hex
             self._broadcast_event(self.EVENT_BOUND, rec)
             return {"ok": True, "state": rec.state.value, "token": rec.token}

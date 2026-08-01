@@ -59,6 +59,16 @@ class RL_Device:
         self.last_known_rf_config: Optional[dict] = (
             dict(last_known_rf_config) if isinstance(last_known_rf_config, dict) else None
         )
+        # Set when a device announces itself on a gateway belonging to a
+        # different network than the one it was recorded on. The host
+        # follows the hardware — where the device actually transmits is
+        # the truth — but that silently drops it out of its old group,
+        # which is network-scoped. The note carries what changed so the
+        # device list can say so instead of the group membership just
+        # evaporating. Cleared when the operator re-groups the device.
+        # Shape: ``{from_network_id, from_network_name, to_network_id,
+        # to_network_name, left_group_id, left_group_name, ts}``.
+        self.network_change_note: Optional[dict] = None
 
         # presetId: last preset we asked the device to load (set by send paths).
         # effectId: device's currently active segment mode (set by STATUS_REPLY;

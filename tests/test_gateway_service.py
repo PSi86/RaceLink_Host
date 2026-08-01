@@ -65,6 +65,17 @@ class FakeTransport:
         return []
 
 
+class _FakeGroup:
+    """Minimal group record — only the fields the network-relocation path
+    reads (``name`` for the operator-facing note, ``network_id`` to decide
+    whether the group belongs to the network being left)."""
+
+    def __init__(self, group_id: int, name: str, network_id=None):
+        self.groupId = group_id
+        self.name = name
+        self.network_id = network_id
+
+
 class FakeController:
     def __init__(self):
         self.dev = RL_Device("AABBCCDDEEFF", 1, "Node")
@@ -504,10 +515,13 @@ class GatewayServiceTests(unittest.TestCase):
 
         self.assertEqual(controller.reconciled_groups, [])
 
-    def test_identify_does_not_override_existing_device_network(self):
-        # A device heard on a gateway bound to a *different* network keeps
-        # its stored binding — that divergence is a migration / cross-net
-        # case, not something the IDENTIFY path silently rewrites.
+    def test_identify_follows_the_device_to_the_answering_network(self):
+        # A device announcing itself on a gateway bound to a *different*
+        # network is moved there. The hardware is the authority: it is
+        # provably transmitting on that radio right now, whatever the
+        # record says. Keeping the stale binding (the previous behaviour)
+        # left every unicast routed at a network that cannot reach the
+        # device, so it stayed "offline" while answering every discovery.
         controller = FakeController()
         controller.transport.network_id = "net-track"
         controller.dev.network_id = "net-other"
@@ -524,7 +538,75 @@ class GatewayServiceTests(unittest.TestCase):
             "gateway_id": "TEST-GW",
         })
 
-        self.assertEqual(controller.dev.network_id, "net-other")
+        self.assertEqual(controller.dev.network_id, "net-track")
+        note = controller.dev.network_change_note
+        assert note is not None
+        self.assertEqual(note["from_network_id"], "net-other")
+        self.assertEqual(note["to_network_id"], "net-track")
+        # Group 0 is the Unconfigured bucket — nothing to leave.
+        self.assertIsNone(note["left_group_id"])
+
+    def test_identify_move_drops_a_group_that_belongs_to_the_old_network(self):
+        """Groups are network-scoped. A device that changes network cannot
+        stay in a group of the old one without making that group span two
+        networks and breaking group-broadcast routing."""
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-other"
+        controller.dev.groupId = 2
+        controller._group_repository = GroupRepository([
+            _FakeGroup(group_id=0, name="Unconfigured", network_id=None),
+            _FakeGroup(group_id=1, name="PitLane", network_id="net-eth"),
+            _FakeGroup(group_id=2, name="Startblocks", network_id="net-other"),
+        ])
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 2,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.dev.network_id, "net-track")
+        self.assertEqual(controller.dev.groupId, 0)
+        note = controller.dev.network_change_note
+        assert note is not None
+        self.assertEqual(note["left_group_id"], 2)
+        self.assertEqual(note["left_group_name"], "Startblocks")
+        # The vacated group is re-derived from its remaining members.
+        self.assertIn(2, controller.reconciled_groups)
+
+    def test_identify_keeps_a_network_agnostic_group(self):
+        """A group with no network of its own travels with the device."""
+        controller = FakeController()
+        controller.transport.network_id = "net-track"
+        controller.dev.network_id = "net-other"
+        controller.dev.groupId = 3
+        controller._group_repository = GroupRepository([
+            _FakeGroup(group_id=0, name="Unconfigured", network_id=None),
+            _FakeGroup(group_id=1, name="a", network_id=None),
+            _FakeGroup(group_id=2, name="b", network_id=None),
+            _FakeGroup(group_id=3, name="Fresh", network_id=None),
+        ])
+        service = GatewayService(controller)
+
+        service.on_transport_event({
+            "opc": LP.OPC_DEVICES,
+            "reply": "IDENTIFY_REPLY",
+            "mac6": bytes.fromhex("AABBCCDDEEFF"),
+            "groupId": 3,
+            "caps": 1,
+            "version": 7,
+            "gateway_id": "TEST-GW",
+        })
+
+        self.assertEqual(controller.dev.network_id, "net-track")
+        self.assertEqual(controller.dev.groupId, 3)
+        self.assertIsNone(controller.dev.network_change_note["left_group_id"])
 
     def test_identify_stamps_new_rf_device_network(self):
         controller = FakeController()

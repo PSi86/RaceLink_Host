@@ -21,6 +21,7 @@ import type {
   MasterMapSnapshot,
   MasterSnapshot,
   MissingTransport,
+  RfConfig,
 } from '@/api/types'
 
 interface ResolveBody {
@@ -42,6 +43,12 @@ interface ResolveResult {
    *  dialog open and subscribe to ``task`` SSE events. */
   task_id?: number
   task?: Record<string, unknown>
+  /** ``retune_gateway`` and any ``create_network`` that moves the
+   *  gateway onto a different channel: the write is committed and the
+   *  gateway is rebooting onto it. The transport drops for a few
+   *  seconds and re-attaches on its own. */
+  rebooting?: boolean
+  rf_config?: RfConfig
 }
 
 export const useGatewaysStore = defineStore('gateways', () => {

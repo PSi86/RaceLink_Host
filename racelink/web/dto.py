@@ -62,6 +62,16 @@ def serialize_device(dev, *, battery_helper=None):
             if isinstance(getattr(dev, "last_known_rf_config", None), dict)
             else None
         ),
+        # Set when the device turned up on another network's gateway and
+        # the host followed it. Surfaced per row because the move can
+        # silently drop the device out of a group, and "my device left its
+        # group by itself" is not something an operator should have to
+        # reverse-engineer from the log.
+        "network_change_note": (
+            dict(getattr(dev, "network_change_note", {}) or {})
+            if isinstance(getattr(dev, "network_change_note", None), dict)
+            else None
+        ),
     }
     if battery_helper is not None:
         try:

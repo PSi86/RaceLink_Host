@@ -145,6 +145,67 @@ def validate_networks_separation(
     return conflicts
 
 
+def occupants_of(
+    networks: Iterable,
+    rf_config: Optional[dict],
+    *,
+    exclude_network_id: Optional[str] = None,
+    min_separation_hz: int = MIN_SEPARATION_HZ,
+) -> list[dict]:
+    """Which existing networks would collide with ``rf_config``.
+
+    The forward-looking counterpart to
+    :func:`validate_networks_separation`: instead of auditing a set
+    that already exists, it answers "is this channel free?" *before*
+    something is created on it. Both run the same rule, so a channel
+    the picker shows as free can never be rejected on save.
+
+    Returns ``[{"id", "name", "freq_hz", "sync_word", "gap_hz"}, ...]``
+    — empty means free. ``exclude_network_id`` skips the network being
+    edited, so re-saving a network on its own channel is not a
+    self-collision.
+    """
+    if not isinstance(rf_config, dict):
+        return []
+    if "freq_hz" not in rf_config or "sync_word" not in rf_config:
+        return []
+    freq = int(rf_config["freq_hz"])
+    sync = int(rf_config["sync_word"]) & 0xFF
+    skip = str(exclude_network_id or "")
+    out: list[dict] = []
+    for net in networks:
+        cfg = _network_rf_config(net)
+        if cfg is None:
+            continue
+        nid = _network_id(net)
+        if skip and nid == skip:
+            continue
+        other_sync = int(cfg["sync_word"]) & 0xFF
+        if other_sync != sync:
+            continue
+        gap = abs(int(cfg["freq_hz"]) - freq)
+        if gap >= int(min_separation_hz):
+            continue
+        out.append({
+            "id": nid,
+            "name": _network_name(net),
+            "freq_hz": int(cfg["freq_hz"]),
+            "sync_word": other_sync,
+            "gap_hz": int(gap),
+        })
+    return out
+
+
+def format_occupants(occupants: Iterable[dict]) -> str:
+    """Operator-visible summary of :func:`occupants_of` output."""
+    names = [str(o.get("name") or o.get("id") or "?") for o in occupants]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return f'"{names[0]}"'
+    return ", ".join(f'"{n}"' for n in names[:-1]) + f' and "{names[-1]}"'
+
+
 def format_conflict(conflict: dict) -> str:
     """Operator-visible one-line summary of a conflict dict.
 

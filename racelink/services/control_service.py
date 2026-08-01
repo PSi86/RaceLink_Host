@@ -98,6 +98,29 @@ class ControlService:
                 # actual send so a misroute can't silently succeed.
                 routed = None
         if routed is None:
+            # Same rule as ``setNodeGroupId``: only fall back to the single
+            # slot when there is genuinely nothing to route by. With several
+            # transports attached, "unresolved" means the device's network
+            # has no gateway right now, and guessing a transport turns a
+            # clear configuration problem into a mystery timeout.
+            transports = list(getattr(controller, "transports", None) or []) \
+                if controller is not None else []
+            if len(transports) > 1:
+                hint = ""
+                try:
+                    hint = controller._no_route_hint(
+                        getattr(target_device, "network_id", None)
+                    )
+                except Exception:
+                    # swallow-ok: the hint is cosmetic detail on a message
+                    # we are already emitting; an older controller / test
+                    # fake without the helper still gets the warning.
+                    hint = "its network has no attached gateway"
+                logger.warning(
+                    "%s: no transport for %s — %s", context,
+                    getattr(target_device, "addr", "?"), hint,
+                )
+                return None
             routed = self.transport
         if routed is None:
             logger.warning("%s: communicator not ready", context)

@@ -1878,25 +1878,47 @@ class GatewayService:
                             dev = create_device(addr=mac12, dev_type=int(dev_type or 0), name=default_device_name(mac12))
                             self.controller.device_repository.append(dev)
 
+                        dev.update_from_identify(
+                            ev.get("version"),
+                            ev.get("caps"),
+                            ev.get("groupId"),
+                            mac6,
+                            ev.get("host_rssi"),
+                            ev.get("host_snr"),
+                        )
                         # Bind the device to the network of the gateway that
-                        # just heard it, but ONLY when it has no binding yet —
-                        # never override an existing network_id (a device heard
-                        # on the "wrong" gateway is a migration / divergence
-                        # case, handled by the cross-net STATUS_REPLY guard, not
-                        # here). Without this an RF-discovered device keeps
-                        # network_id=None, so on a multi-gateway host every
-                        # unicast to it (the auto-restore SET_GROUP below, status
-                        # polls, the group's reconciled network) falls back to
-                        # the primary transport instead of the gateway it
-                        # actually lives on. ETH idents encode the network id;
-                        # RF idents resolve via the receiving transport's bound
-                        # network_id (stamped at attach).
-                        if not getattr(dev, "network_id", None):
-                            inferred_nid = self._network_id_for_gateway_id(
-                                ev.get("gateway_id")
-                            )
-                            if inferred_nid:
-                                dev.network_id = inferred_nid
+                        # just heard it. Without a binding an RF-discovered
+                        # device keeps network_id=None, so on a multi-gateway
+                        # host every unicast to it (the auto-restore SET_GROUP
+                        # below, status polls, the group's reconciled network)
+                        # falls back to an arbitrary transport instead of the
+                        # gateway it actually lives on. ETH idents encode the
+                        # network id; RF idents resolve via the receiving
+                        # transport's bound network_id (stamped at attach).
+                        #
+                        # Runs AFTER update_from_identify on purpose: that call
+                        # writes the group the device reports on the wire, which
+                        # would otherwise undo the group-drop a relocation has
+                        # to perform.
+                        inferred_nid = self._network_id_for_gateway_id(
+                            ev.get("gateway_id")
+                        )
+                        current_nid = str(getattr(dev, "network_id", "") or "")
+                        if inferred_nid and str(inferred_nid) != current_nid:
+                            if current_nid:
+                                # The device is transmitting on a gateway that
+                                # belongs to a different network than we had
+                                # recorded. The hardware is the authority: it
+                                # is provably on this radio right now, whatever
+                                # the record says. Following it here is what
+                                # keeps unicasts routable — the alternative is
+                                # a record pointing at a network that cannot
+                                # reach the device, which is exactly how a
+                                # device ends up permanently "offline" while
+                                # answering every discovery.
+                                self._relocate_device_network(dev, str(inferred_nid))
+                            else:
+                                dev.network_id = str(inferred_nid)
                                 # Let the device's group adopt the same network
                                 # so GROUP-broadcast routing (transport_for_group)
                                 # resolves to the right gateway too — not just
@@ -1919,14 +1941,6 @@ class GatewayService:
                                         exc_info=True,
                                     )
 
-                        dev.update_from_identify(
-                            ev.get("version"),
-                            ev.get("caps"),
-                            ev.get("groupId"),
-                            mac6,
-                            ev.get("host_rssi"),
-                            ev.get("host_snr"),
-                        )
                     # Signal any ``wait_for_identify`` waiter for this MAC.
                     # Set before ``_restore_known_device_group`` so OTA can
                     # immediately move on to waiting for the auto-restore
@@ -1947,6 +1961,102 @@ class GatewayService:
             self.pending_try_match(ev)
         except Exception:
             logger.exception("RaceLink: RX hook failed")
+
+    def _network_name(self, network_id) -> str:
+        try:
+            net = self.controller.network_repository.get_by_id(network_id)
+        except Exception:
+            # swallow-ok: the name is only for the operator-facing note and
+            # log line; a controller without a network repository (older
+            # build / test fake) still gets the relocation itself.
+            return ""
+        return str(getattr(net, "name", "") or "") if net is not None else ""
+
+    def _relocate_device_network(self, dev, new_nid: str) -> None:
+        """Follow a device that turned up on another network's gateway.
+
+        Groups are network-scoped, so a device that changes network cannot
+        stay in a group belonging to the old one — it would make that
+        group span two networks and break group-broadcast routing. We drop
+        it to Unconfigured rather than silently leaving a cross-network
+        member behind.
+
+        That drop is invisible to the operator unless we say so, hence the
+        note on the device and the WARNING in the log: from the outside it
+        looks like a device spontaneously left its group.
+        """
+        old_nid = str(getattr(dev, "network_id", "") or "")
+        mac = str(getattr(dev, "addr", "") or "")
+        old_group_id = int(getattr(dev, "groupId", 0) or 0)
+        old_group_name = ""
+        left_group = False
+
+        # Only leave the group when it actually belongs to the network the
+        # device is leaving. A network-agnostic group (no members yet, or
+        # the Unconfigured bucket) travels with the device just fine.
+        try:
+            groups = list(self.controller.group_repository.list())
+        except Exception:
+            # swallow-ok: no readable group list means we cannot prove the
+            # device's group belongs to the old network, and dropping it on
+            # a guess would be worse than leaving membership untouched.
+            groups = []
+        if 0 < old_group_id < len(groups):
+            grp = groups[old_group_id]
+            grp_nid = str(getattr(grp, "network_id", "") or "")
+            if grp_nid and grp_nid != new_nid:
+                old_group_name = str(getattr(grp, "name", "") or "")
+                dev.groupId = 0
+                left_group = True
+
+        dev.network_id = new_nid
+        # The device is demonstrably running on this network's channel, so
+        # the stored "where is it tuned" snapshot is stale by definition.
+        new_cfg = None
+        try:
+            net = self.controller.network_repository.get_by_id(new_nid)
+            raw = getattr(net, "rf_config", None) if net is not None else None
+            new_cfg = dict(raw) if isinstance(raw, dict) else None
+        except Exception:
+            # swallow-ok: refreshing last_known_rf_config is opportunistic.
+            # Keeping the previous snapshot is safe — the migration paths
+            # re-read it from the device before acting on it.
+            new_cfg = None
+        if new_cfg:
+            dev.last_known_rf_config = new_cfg
+
+        from_name = self._network_name(old_nid) or old_nid
+        to_name = self._network_name(new_nid) or new_nid
+        dev.network_change_note = {
+            "from_network_id": old_nid,
+            "from_network_name": from_name,
+            "to_network_id": new_nid,
+            "to_network_name": to_name,
+            "left_group_id": old_group_id if left_group else None,
+            "left_group_name": old_group_name if left_group else None,
+            "ts": time.time(),
+        }
+        if left_group:
+            logger.warning(
+                "RaceLink: %s answered on network %r (was %r) — moved it there "
+                "and removed it from group %r, which belongs to the old network",
+                mac, to_name, from_name, old_group_name,
+            )
+        else:
+            logger.warning(
+                "RaceLink: %s answered on network %r (was %r) — moved it there",
+                mac, to_name, from_name,
+            )
+        # The group it left may now be empty (and therefore network-agnostic
+        # again); the one it joins is reconciled by the caller.
+        if left_group:
+            try:
+                self.controller.reconcile_group_network(old_group_id)
+            except Exception:
+                logger.debug(
+                    "RaceLink: reconcile_group_network(%s) raised after relocate",
+                    old_group_id, exc_info=True,
+                )
 
     def _network_id_for_gateway_id(self, gateway_id) -> Optional[str]:
         """Resolve the bound ``network_id`` of the transport an event came in

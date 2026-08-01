@@ -176,6 +176,11 @@ export interface Device {
   // Network Manager and the migration engine's pre-check.
   network_id?: string | null
   last_known_rf_config?: RfConfig | null
+  /** Present when the device announced itself on a gateway belonging to
+   *  another network and the host followed the hardware. Carries what it
+   *  cost — groups are network-scoped, so the move can drop the device
+   *  out of its group. Cleared when the device is re-grouped. */
+  network_change_note?: NetworkChangeNote | null
   // Special-key flat fields appended by ``serialize_device``
   [key: string]: unknown
 }
@@ -210,6 +215,11 @@ export interface Group {
 export interface Channel extends RfConfig {
   id: number
   name: string
+  /** Networks already sitting on this channel under the separation
+   *  policy (same SyncWord, closer than the minimum spacing). Non-empty
+   *  means the channel is taken: two networks there are
+   *  indistinguishable on air, and the server refuses it on save. */
+  occupied_by?: Array<{ id: string; name: string }>
 }
 
 /** Stage 4 Block 2: gateway-bind state machine snapshot (one entry
@@ -279,6 +289,37 @@ export interface NetworkSummary {
   eth_config?: Record<string, unknown> | null
   created_ts: number | null
   live?: MasterSnapshot | null
+  /** What would happen to this network's devices if its gateway were
+   *  swapped. Surfaced on the listing (not only inside the conflict
+   *  wizard) so a gateway-locked network is a visible standing property
+   *  rather than a surprise at the moment of the swap — by then the fix
+   *  is out of radio range. `null` when the host could not compute it. */
+  device_impact?: NetworkDeviceImpact | null
+}
+
+/** Devices that pinned their master's MAC (`configByte` bit 1). Such a
+ *  node ignores any other gateway and a reboot does not clear it, so the
+ *  only over-the-air cure has to travel over the *current* gateway. */
+export interface NetworkDeviceImpact {
+  network_id: string
+  /** Devices assigned to the network, pinned or not. */
+  total: number
+  master_persist: Array<{ mac: string; name: string; last_seen_ts: number }>
+  /** True when at least one pinned device has never reported a status, so
+   *  its `configByte` is a stored guess rather than a live reading. */
+  stale: boolean
+}
+
+export interface NetworkChangeNote {
+  from_network_id: string
+  from_network_name: string
+  to_network_id: string
+  to_network_name: string
+  /** `null` when the device's group was network-agnostic and travelled
+   *  with it; otherwise the group it had to leave. */
+  left_group_id: number | null
+  left_group_name: string | null
+  ts: number
 }
 
 export interface NetworksResponse {

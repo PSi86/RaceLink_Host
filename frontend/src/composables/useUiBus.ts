@@ -40,6 +40,12 @@ const bindWizardRequest = ref(0)
 // diff changes; the GatewayBanner's "Open Pair Assistant" button
 // fires this signal to open it manually.
 const setupAssistantRequest = ref(0)
+// Gateway-handling rework: unexpected (unbound) gateways are no
+// longer auto-popped through the bind wizard. The amber
+// UnexpectedGatewayBar surfaces them and fires this signal to open
+// the GatewayAssignDialog, which maps one or more newly-detected
+// gateways onto networks (create / rebind / replace orphaned).
+const gatewayAssignRequest = ref(0)
 
 export function useUiBus() {
   return {
@@ -57,6 +63,7 @@ export function useUiBus() {
     networkManagerRequest,
     bindWizardRequest,
     setupAssistantRequest,
+    gatewayAssignRequest,
     requestDiscover() {
       discoverRequest.value += 1
     },
@@ -98,6 +105,9 @@ export function useUiBus() {
     },
     requestSetupAssistant() {
       setupAssistantRequest.value += 1
+    },
+    requestGatewayAssign() {
+      gatewayAssignRequest.value += 1
     },
   }
 }

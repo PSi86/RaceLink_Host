@@ -74,6 +74,22 @@ NODE_CONFIG_COMMANDS: List[NodeConfigCommand] = [
 ]
 
 
+# Named masks for the two ``configByte`` bits host code reasons about.
+# ``MAC_FILTER_PERSIST_BIT`` in particular gates a hazard: a node with
+# it set has pinned its master's MAC, so re-assigning the network to a
+# different gateway leaves that node deaf until it is told to forget
+# the old master — which only the *old* gateway can still do.
+MAC_FILTER_BIT = 0x01
+MAC_FILTER_PERSIST_BIT = 0x02
+
+# The ``(option, data0)`` pair that clears master persistence, and the
+# one that makes a node forget the master MAC it already learned.
+# Kept next to the bit masks so the read side and the write side of the
+# same setting cannot drift apart.
+OPT_MAC_FILTER_PERSIST = 0x03
+OPT_FORGET_MASTER = 0x80
+
+
 # Per-bit semantics for the device-table ``configByte`` column. Bits 3..7
 # are reserved placeholders — firmware owns the eventual semantics.
 CONFIG_BITS: List[ConfigBit] = [
