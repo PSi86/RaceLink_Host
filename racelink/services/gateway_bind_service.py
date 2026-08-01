@@ -417,6 +417,30 @@ class GatewayBindService:
                 return t
         return None
 
+    def _push_rf_to_gateway(self, rec: BindRecord, target: dict) -> None:
+        """Write ``target`` to the gateway's NVS and let it reboot.
+
+        Raises :class:`_BindActionError` on any refusal, so callers can
+        abort before recording state that the hardware never accepted.
+        """
+        transport = self._transport_for(rec.ident_mac)
+        if transport is None:
+            raise _BindActionError(
+                f"gateway {rec.ident_mac} is not attached — reconnect it and retry"
+            )
+        gw = self.gateway_service
+        setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
+        if not callable(setter):
+            raise _BindActionError("gateway_service unavailable")
+        result = setter(dict(target), persist=True, transport=transport)
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = None
+            if isinstance(result, dict):
+                reason = result.get("reason_name") or result.get("error")
+            raise _BindActionError(
+                f"gateway rejected the RF config: {reason or 'no response'}"
+            )
+
     def _release_ident_from_networks(self, ident_mac: str, keep=None) -> None:
         """Clear ``gateway_mac`` from every network carrying ``ident_mac``.
 
@@ -618,24 +642,7 @@ class GatewayBindService:
                 "network has no rf_config to push — assign a channel to the "
                 "network first, or use accept_gateway"
             )
-        transport = self._transport_for(rec.ident_mac)
-        if transport is None:
-            raise _BindActionError(
-                f"gateway {rec.ident_mac} is not attached — reconnect it and retry"
-            )
-        gw = self.gateway_service
-        setter = getattr(gw, "set_gateway_rf_config", None) if gw is not None else None
-        if not callable(setter):
-            raise _BindActionError("gateway_service unavailable")
-
-        result = setter(dict(target), persist=True, transport=transport)
-        if not isinstance(result, dict) or not result.get("ok"):
-            reason = None
-            if isinstance(result, dict):
-                reason = result.get("reason_name") or result.get("error")
-            raise _BindActionError(
-                f"gateway rejected the RF config: {reason or 'no response'}"
-            )
+        self._push_rf_to_gateway(rec, target)
 
         rec.rf_config_actual = dict(target)
         rec.state = BindState.BOUND
@@ -743,9 +750,19 @@ class GatewayBindService:
         }
 
     def _action_create_network(self, rec: BindRecord, params: dict) -> dict:
-        """UNBOUND only: create a fresh ``RL_Network`` named by the
-        operator, seeded with the gateway's reported RF config, and
-        bind this transport to it."""
+        """Create a fresh ``RL_Network`` and bind this transport to it.
+
+        The channel is the host's decision, not the gateway's. Pass
+        ``channel_id`` (with ``region``) and the gateway is moved onto
+        that channel; omit it and the gateway's current settings are
+        adopted, which is only meaningful for the first network on a
+        fresh install — ``region`` is then descriptive, since a node
+        tuned to an EU868 channel does not become US915 by relabelling.
+
+        Either way the resulting config is checked against every
+        existing network: two networks sharing a frequency and SyncWord
+        are indistinguishable on air, so that is refused outright.
+        """
         if rec.state not in (BindState.UNBOUND, BindState.CONFLICT):
             raise _BindActionError(
                 "create_network requires state=unbound or conflict "
@@ -756,6 +773,8 @@ class GatewayBindService:
             raise _BindActionError("create_network requires a non-empty 'name'")
         region = str(params.get("region") or "EU868")
         from ..domain.models import RL_Network
+        from ..domain.rf_channels import channel_rf_config
+        from ..domain.rf_policy import format_occupants, occupants_of
 
         if not isinstance(rec.rf_config_actual, dict):
             # Without a real readback we cannot seed the network and
@@ -767,7 +786,56 @@ class GatewayBindService:
                 "gateway did not respond to GET_RF_CONFIG — cannot create "
                 "network, please check hardware / firmware and retry"
             )
-        seeded_cfg = dict(rec.rf_config_actual)
+
+        # What the host is already configured for outranks what the
+        # gateway happens to be tuned to. An explicit ``channel_id``
+        # therefore wins, and the gateway is moved onto it below;
+        # seeding from the gateway is only the fallback for the first
+        # network on a fresh install.
+        channel_id = params.get("channel_id")
+        if channel_id not in (None, ""):
+            try:
+                ch_id_int = int(channel_id)
+            except (TypeError, ValueError):
+                raise _BindActionError("channel_id must be an integer")
+            resolved = channel_rf_config(region, ch_id_int)
+            if resolved is None:
+                raise _BindActionError(
+                    f"unknown channel_id {ch_id_int} in region {region!r}"
+                )
+            seeded_cfg = dict(resolved)
+        else:
+            # No channel picked: adopt the hardware's current settings.
+            # Region is then not a free choice — a node tuned to an
+            # EU868 channel does not become US915 by relabelling it —
+            # so the caller must not combine this path with a region
+            # the config does not belong to. The occupancy check below
+            # is what actually protects the airwaves either way.
+            seeded_cfg = dict(rec.rf_config_actual)
+
+        # The airwave is a shared resource: two networks on the same
+        # frequency with the same SyncWord cannot be told apart by any
+        # gateway's RX path. Refusing here is the whole point — the old
+        # code created the network regardless, so "new network for this
+        # gateway" could silently land on top of an existing one.
+        clash = occupants_of(
+            self.controller.network_repository.list(), seeded_cfg,
+        )
+        if clash:
+            raise _BindActionError(
+                f"that channel is already used by {format_occupants(clash)} — "
+                f"two networks cannot share a frequency and SyncWord. Pick a "
+                f"free channel for the new network."
+            )
+        # If the operator picked a channel the gateway isn't on, the
+        # gateway has to move — otherwise the network would be born in
+        # CONFLICT with itself. Do this BEFORE the network is recorded so
+        # a rejected write leaves no half-made network behind.
+        retuned = False
+        if _rf_diff(rec.rf_config_actual, seeded_cfg):
+            self._push_rf_to_gateway(rec, seeded_cfg)
+            retuned = True
+
         net = RL_Network(
             name=name,
             gateway_mac=rec.ident_mac,
@@ -783,13 +851,21 @@ class GatewayBindService:
         self._bind_transport_to_network(rec.ident_mac, net.id)
         rec.network_id = str(net.id)
         rec.network_name = name
-        rec.rf_config_expected = dict(seeded_cfg) if seeded_cfg else None
+        rec.rf_config_expected = dict(seeded_cfg)
+        rec.rf_config_actual = dict(seeded_cfg)
         rec.state = BindState.BOUND
         rec.conflict_fields = []
         rec.token = uuid.uuid4().hex
         self._persist_quietly(f"create_network({name}) on {rec.ident_mac}")
         self._broadcast_event(self.EVENT_BOUND, rec)
-        return {"ok": True, "state": rec.state.value, "network_id": net.id, "token": rec.token}
+        return {
+            "ok": True,
+            "state": rec.state.value,
+            "network_id": net.id,
+            "token": rec.token,
+            "rebooting": retuned,
+            "rf_config": dict(seeded_cfg),
+        }
 
     def _action_rebind(self, rec: BindRecord, params: dict) -> dict:
         """UNBOUND only: bind this transport's MAC to an existing
@@ -829,7 +905,23 @@ class GatewayBindService:
         rec.rf_config_expected = dict(expected) if isinstance(expected, dict) else None
 
         if rec.rf_config_expected is None and rec.rf_config_actual is not None:
-            # Same "first-contact adopt" as in :meth:`evaluate`.
+            # Same "first-contact adopt" as in :meth:`evaluate` — but a
+            # channel-less network adopting whatever this gateway happens
+            # to run can land straight on top of a network that already
+            # owns that frequency. Check before adopting.
+            from ..domain.rf_policy import format_occupants, occupants_of
+            clash = occupants_of(
+                self.controller.network_repository.list(),
+                rec.rf_config_actual,
+                exclude_network_id=str(network.id),
+            )
+            if clash:
+                raise _BindActionError(
+                    f"the gateway is on a channel already used by "
+                    f"{format_occupants(clash)} — assign a free channel to "
+                    f"\"{rec.network_name or network.name}\" first, or move "
+                    f"the gateway to one."
+                )
             network.rf_config = dict(rec.rf_config_actual)
             rec.rf_config_expected = dict(rec.rf_config_actual)
             rec.state = BindState.BOUND

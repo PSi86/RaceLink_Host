@@ -848,18 +848,39 @@ def register_api_routes(bp, ctx):
         Network Manager channel dropdown + the Channel Scan
         wizard's channel-selection checkbox list. The table is a
         compile-time constant on the server (see
-        :mod:`racelink.domain.rf_channels`); it doesn't need
-        per-request server work and the WebUI can cache the response
-        for the session.
+        :mod:`racelink.domain.rf_channels`).
+
+        Each channel additionally carries ``occupied_by`` — the
+        networks already sitting on it under the separation policy.
+        A picker can therefore show what is free *before* the operator
+        commits, using the same rule the create/update paths enforce,
+        so a channel offered as free can never be rejected on save.
+        This part is per-request: it depends on live network state.
         """
-        from ..domain.rf_channels import REGION_CHANNELS
-        return jsonify({
-            "ok": True,
-            "regions": {
-                region: [dict(ch) for ch in channels]
-                for region, channels in REGION_CHANNELS.items()
-            },
-        })
+        from ..domain.rf_channels import REGION_CHANNELS, channel_rf_config
+        from ..domain.rf_policy import occupants_of
+
+        rl = ctx.rl_instance
+        net_repo = getattr(rl, "network_repository", None)
+        try:
+            nets = list(net_repo.list()) if net_repo is not None else []
+        except Exception:
+            logger.exception("/api/channels: repo iteration raised")
+            nets = []
+
+        out: dict[str, list[dict]] = {}
+        for region, channels in REGION_CHANNELS.items():
+            rows = []
+            for ch in channels:
+                row = dict(ch)
+                cfg = channel_rf_config(region, int(row.get("id", -1)))
+                row["occupied_by"] = [
+                    {"id": o["id"], "name": o["name"]}
+                    for o in occupants_of(nets, cfg)
+                ]
+                rows.append(row)
+            out[region] = rows
+        return jsonify({"ok": True, "regions": out})
 
     @bp.route("/api/gateways", methods=["GET"])
     def api_gateways_list():

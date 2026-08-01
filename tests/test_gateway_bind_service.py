@@ -911,6 +911,125 @@ class ConflictReassignmentTests(unittest.TestCase):
         self.assertEqual(start.rf_config, _HOST_CFG)
 
 
+class ChannelOccupancyTests(unittest.TestCase):
+    """Two networks on one frequency+SyncWord are indistinguishable on
+    air. The host's existing configuration decides what is free; what
+    the gateway happens to be tuned to does not get a veto."""
+
+    def _unbound_on(self, gateway_cfg):
+        gw = _FakeGatewayService(configs={"GW-NEW": gateway_cfg})
+        ctrl, _gw, svc, _b, _p = _make_service(gw=gw)
+        t = _FakeTransport("GW-NEW")
+        ctrl._transports.append(t)
+        return ctrl, gw, svc, t
+
+    def test_create_network_refuses_a_channel_another_network_owns(self):
+        """The bench case: "Track" sits on EU868 ch1 and the freshly
+        flashed gateway is broadcasting on exactly that."""
+        from racelink.domain.rf_channels import channel_rf_config
+        ch1 = channel_rf_config("EU868", 1)
+        ctrl, gw, svc, t = self._unbound_on(ch1)
+        ctrl.network_repository.append(
+            RL_Network(name="Track", gateway_mac="GW-OTHER", rf_config=dict(ch1)),
+        )
+        rec = svc.evaluate(t)
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.UNBOUND)
+
+        out = svc.resolve("GW-NEW", "create_network",
+                          {"token": rec.token, "name": "Test"})
+
+        self.assertFalse(out["ok"])
+        self.assertIn("already used by", out["error"])
+        self.assertIn("Track", out["error"])
+        # Nothing was created and the gateway was left alone.
+        self.assertEqual(len(ctrl.network_repository.list()), 1)
+        self.assertEqual(gw.set_calls, [])
+
+    def test_create_network_on_a_free_channel_retunes_the_gateway(self):
+        from racelink.domain.rf_channels import channel_rf_config
+        ch1 = channel_rf_config("EU868", 1)
+        ch3 = channel_rf_config("EU868", 3)
+        ctrl, gw, svc, t = self._unbound_on(ch1)
+        ctrl.network_repository.append(
+            RL_Network(name="Track", gateway_mac="GW-OTHER", rf_config=dict(ch1)),
+        )
+        rec = svc.evaluate(t)
+        assert rec is not None
+
+        out = svc.resolve("GW-NEW", "create_network", {
+            "token": rec.token, "name": "Test",
+            "region": "EU868", "channel_id": 3,
+        })
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["rebooting"])
+        # The picked channel wins over what the gateway was running.
+        self.assertEqual(len(gw.set_calls), 1)
+        self.assertEqual(gw.set_calls[0]["rf_config"], ch3)
+        created = [n for n in ctrl.network_repository.list() if n.name == "Test"][0]
+        self.assertEqual(created.rf_config, ch3)
+        # Record reflects the post-retune reality, not the stale readback.
+        rec_after = svc.get("GW-NEW")
+        assert rec_after is not None
+        self.assertEqual(rec_after.state, BindState.BOUND)
+        self.assertEqual(rec_after.rf_config_actual, ch3)
+
+    def test_create_network_keeps_gateway_config_when_channel_omitted(self):
+        """Fresh install: no other network, so adopting the hardware's
+        settings needs no retune."""
+        from racelink.domain.rf_channels import channel_rf_config
+        ch1 = channel_rf_config("EU868", 1)
+        ctrl, gw, svc, t = self._unbound_on(ch1)
+        rec = svc.evaluate(t)
+        assert rec is not None
+
+        out = svc.resolve("GW-NEW", "create_network",
+                          {"token": rec.token, "name": "First"})
+
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["rebooting"])
+        self.assertEqual(gw.set_calls, [])
+        created = ctrl.network_repository.list()[0]
+        self.assertEqual(created.rf_config, ch1)
+
+    def test_create_network_rejects_an_unknown_channel(self):
+        from racelink.domain.rf_channels import channel_rf_config
+        ctrl, gw, svc, t = self._unbound_on(channel_rf_config("EU868", 1))
+        rec = svc.evaluate(t)
+        assert rec is not None
+
+        out = svc.resolve("GW-NEW", "create_network", {
+            "token": rec.token, "name": "Test",
+            "region": "EU868", "channel_id": 99,
+        })
+
+        self.assertFalse(out["ok"])
+        self.assertIn("unknown channel_id", out["error"])
+        self.assertEqual(ctrl.network_repository.list(), [])
+
+    def test_rebind_first_contact_adopt_refuses_an_occupied_channel(self):
+        """A channel-less network must not silently inherit a frequency
+        another network already owns."""
+        from racelink.domain.rf_channels import channel_rf_config
+        ch1 = channel_rf_config("EU868", 1)
+        ctrl, gw, svc, t = self._unbound_on(ch1)
+        ctrl.network_repository.append(
+            RL_Network(name="Track", gateway_mac="GW-OTHER", rf_config=dict(ch1)),
+        )
+        blank = RL_Network(name="Blank", gateway_mac=None, rf_config=None)
+        ctrl.network_repository.append(blank)
+        rec = svc.evaluate(t)
+        assert rec is not None
+
+        out = svc.resolve("GW-NEW", "rebind",
+                          {"token": rec.token, "network_id": blank.id})
+
+        self.assertFalse(out["ok"])
+        self.assertIn("already used by", out["error"])
+        self.assertIsNone(blank.rf_config)
+
+
 class NetworkDeviceImpactTests(unittest.TestCase):
     """Master-persistence visibility: which devices would go deaf if this
     network's gateway changed."""

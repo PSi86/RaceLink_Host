@@ -63,7 +63,12 @@ const devices = useDevicesStore()
 const toast = useToast()
 const ui = useUiBus()
 
-type DiffKind = 'gateway_missing' | 'gateway_unbound' | 'gateway_conflict' | 'device_rf_stale'
+type DiffKind =
+  | 'gateway_missing'
+  | 'gateway_unassigned'
+  | 'gateway_unbound'
+  | 'gateway_conflict'
+  | 'device_rf_stale'
 
 interface SetupDiff {
   kind: DiffKind
@@ -100,6 +105,24 @@ const diffs = computed<SetupDiff[]>(() => {
   const attachedByMac = new Map<string, ReturnType<typeof gateways.get>>()
   for (const rec of gateways.list) {
     attachedByMac.set(rec.ident_mac, rec)
+  }
+
+  // gateway_unassigned — an RF network with no gateway at all. Happens
+  // after a gateway is moved to another network; without this row the
+  // orphaned network is silently un-drivable, because the
+  // ``gateway_missing`` check below only fires for a mac that IS set.
+  for (const net of networks.networks) {
+    if (net.kind === 'ethernet') continue
+    if (net.gateway_mac) continue
+    out.push({
+      kind: 'gateway_unassigned',
+      title: `"${net.name}" has no gateway`,
+      detail:
+        'No gateway is assigned to this network, so nothing can drive '
+        + 'its devices. Attach one and use "Scan Gateways" in the header, '
+        + 'then assign it to this network.',
+      network_id: net.id,
+    })
   }
 
   // gateway_missing — persisted network's mac not attached.
@@ -315,6 +338,10 @@ function actionFor(diff: SetupDiff): { label: string; click: () => void } | null
       return { label: 'Assign gateway', click: openAssign }
     case 'device_rf_stale':
       return { label: 'Run channel scan', click: openChannelScan }
+    case 'gateway_unassigned':
+      // Only actionable once a gateway is actually attached; the scan
+      // is the step that makes one available to assign.
+      return { label: 'Scan for gateways', click: onRediscover }
     case 'gateway_missing':
       // No automatic remedy — operator needs to plug the device in.
       return null

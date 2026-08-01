@@ -210,6 +210,11 @@ export interface Group {
 export interface Channel extends RfConfig {
   id: number
   name: string
+  /** Networks already sitting on this channel under the separation
+   *  policy (same SyncWord, closer than the minimum spacing). Non-empty
+   *  means the channel is taken: two networks there are
+   *  indistinguishable on air, and the server refuses it on save. */
+  occupied_by?: Array<{ id: string; name: string }>
 }
 
 /** Stage 4 Block 2: gateway-bind state machine snapshot (one entry

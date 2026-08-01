@@ -50,6 +50,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import NewNetworkFields from '@/components/modals/NewNetworkFields.vue'
 import { useGatewayStore } from '@/stores/gateway'
 import { useGatewaysStore } from '@/stores/gateways'
 import { useNetworksStore } from '@/stores/networks'
@@ -110,6 +111,10 @@ const unboundChoice = ref<'create_network' | 'rebind'>('create_network')
 // Form state for the ``create_network`` sub-flow.
 const newNetworkName = ref('')
 const newNetworkRegion = ref<string>('EU868')
+/** ``null`` = "keep whatever the gateway is already running". Only
+ *  offered while that channel is actually free; otherwise a channel has
+ *  to be picked and the gateway is moved onto it. */
+const newNetworkChannelId = ref<number | null>(null)
 
 // Form state for the ``rebind`` sub-flow.
 const rebindTargetId = ref<string>('')
@@ -133,6 +138,69 @@ const rebindOptions = computed(() => {
     .filter((n) => n.kind !== 'ethernet')
     .map((n) => ({ id: n.id, name: n.name, gateway_mac: n.gateway_mac }))
     .sort((a, b) => a.name.localeCompare(b.name))
+})
+
+/** Channels of the selected region, each tagged with the networks that
+ *  already own it. The picker leads with what the host is configured
+ *  for; the gateway's current tuning is just one candidate among them. */
+const channelOptions = computed(() => {
+  const rows = networks.channelsByRegion[newNetworkRegion.value] ?? []
+  return rows.map((ch) => ({
+    id: ch.id,
+    name: ch.name,
+    freq_hz: ch.freq_hz,
+    occupiedBy: ch.occupied_by ?? [],
+  }))
+})
+
+/** The channel the gateway is currently on, if it maps to one in the
+ *  selected region. */
+const gatewayChannel = computed(() => {
+  const actual = active.value?.rf_config_actual
+  if (!actual) return null
+  return channelOptions.value.find(
+    (ch) => Number(ch.freq_hz) === Number(actual.freq_hz),
+  ) ?? null
+})
+
+/** "Keep the gateway's current settings" is only honest while nothing
+ *  else owns that frequency — otherwise the new network would be born
+ *  on top of an existing one, which the server refuses anyway. */
+const canKeepGatewayChannel = computed(() => {
+  const ch = gatewayChannel.value
+  if (!ch) return false
+  return ch.occupiedBy.length === 0
+})
+
+const selectedChannelOccupants = computed(() => {
+  if (newNetworkChannelId.value == null) return []
+  const ch = channelOptions.value.find((c) => c.id === newNetworkChannelId.value)
+  return ch?.occupiedBy ?? []
+})
+
+/** Pick a sane default whenever the region changes or the form opens:
+ *  the gateway's own channel when it is free (no retune needed), else
+ *  the first free one, else nothing. */
+function resetChannelChoice() {
+  if (canKeepGatewayChannel.value) {
+    newNetworkChannelId.value = null
+    return
+  }
+  const free = channelOptions.value.find((ch) => ch.occupiedBy.length === 0)
+  newNetworkChannelId.value = free ? free.id : null
+}
+
+watch(newNetworkRegion, () => {
+  resetChannelChoice()
+})
+
+/** A network needs a name and a channel that is actually free. With no
+ *  channel picked we fall back to the gateway's own, which is only
+ *  allowed while nothing else sits there. */
+const canCreateNetwork = computed(() => {
+  if (!newNetworkName.value.trim()) return false
+  if (newNetworkChannelId.value === null) return canKeepGatewayChannel.value
+  return selectedChannelOccupants.value.length === 0
 })
 
 const rfConfigDiff = computed(() => {
@@ -226,6 +294,7 @@ watch(
       newNetworkName.value = ''
       newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
       rebindTargetId.value = rebindOptions.value[0]?.id ?? ''
+      resetChannelChoice()
       step.value = 'choose'
       migrationOutcome.value = null
       open.value = true
@@ -253,6 +322,7 @@ watch(
     newNetworkName.value = ''
     newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
     rebindTargetId.value = rebindOptions.value[0]?.id ?? ''
+    resetChannelChoice()
     step.value = 'choose'
     migrationOutcome.value = null
     open.value = true
@@ -281,8 +351,18 @@ async function submitConflict() {
   // branch — the difference is only which question got the operator
   // here, so don't duplicate the request logic.
   if (conflictTarget.value !== 'keep') {
+    // Moving the gateway away leaves its old network without one. Say so
+    // rather than letting the operator discover it later — the network
+    // keeps working as a record but nothing can drive it.
+    const orphaned = active.value.network_name
     unboundChoice.value = conflictTarget.value === 'rebind' ? 'rebind' : 'create_network'
     await submitUnbound()
+    if (orphaned && !open.value) {
+      toast.show(
+        `"${orphaned}" now has no gateway. Attach one and use `
+        + `"Scan Gateways" to assign it.`,
+      )
+    }
     return
   }
   submitting.value = true
@@ -382,10 +462,17 @@ async function submitUnbound() {
           token: active.value.token,
           name,
           region: newNetworkRegion.value,
+          // ``null`` means "keep the gateway's current settings"; the
+          // server only accepts that when the channel is genuinely free.
+          channel_id: newNetworkChannelId.value,
         },
       })
       if (res.ok) {
-        toast.show(`Network "${name}" created and bound to ${active.value.ident_mac}.`)
+        toast.show(
+          res.rebooting
+            ? `Network "${name}" created — the gateway is switching channel and rebooting.`
+            : `Network "${name}" created and bound to ${active.value.ident_mac}.`,
+        )
         await Promise.all([
           networks.load().catch(() => undefined),
           gateways.load().catch(() => undefined),
@@ -685,7 +772,9 @@ async function submitUnbound() {
                     :disabled="submitting"
                   >
                     <option v-for="n in rebindOptions" :key="n.id" :value="n.id">
-                      {{ n.name }}<span v-if="n.gateway_mac"> (was {{ n.gateway_mac }})</span>
+                      {{ n.name }}<span v-if="n.gateway_mac"> (was {{ n.gateway_mac }})</span><span
+                        v-else
+                      > — currently has no gateway</span>
                     </option>
                   </select>
                 </template>
@@ -704,35 +793,22 @@ async function submitUnbound() {
               <div class="flex-auto">
                 <div class="font-medium">Create a new network for it</div>
                 <div class="mt-0.5 text-xs text-muted-foreground">
-                  Seeds the new network from what the gateway is broadcasting
-                  now, and leaves
-                  "{{ active.network_name || 'the current network' }}"
-                  untouched.
+                  Pick a channel no other network uses; the gateway is moved
+                  onto it.
+                  "{{ active.network_name || 'The current network' }}"
+                  keeps its own channel and devices.
                 </div>
                 <template v-if="conflictTarget === 'create_network'">
-                  <div class="mt-2 grid grid-cols-2 gap-2">
-                    <label class="text-xs">
-                      Name
-                      <input
-                        v-model="newNetworkName"
-                        type="text"
-                        maxlength="48"
-                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
-                        :disabled="submitting"
-                        placeholder="e.g. Test"
-                      />
-                    </label>
-                    <label class="text-xs">
-                      Region
-                      <select
-                        v-model="newNetworkRegion"
-                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
-                        :disabled="submitting"
-                      >
-                        <option v-for="r in regionOptions" :key="r" :value="r">{{ r }}</option>
-                      </select>
-                    </label>
-                  </div>
+                  <NewNetworkFields
+                    v-model:name="newNetworkName"
+                    v-model:region="newNetworkRegion"
+                    v-model:channel-id="newNetworkChannelId"
+                    :regions="regionOptions"
+                    :channels="channelOptions"
+                    :gateway-channel="gatewayChannel"
+                    :can-keep-gateway-channel="canKeepGatewayChannel"
+                    :disabled="submitting"
+                  />
                 </template>
               </div>
             </label>
@@ -760,39 +836,20 @@ async function submitUnbound() {
               <div class="flex-auto">
                 <div class="font-medium">Create a new network for this gateway</div>
                 <div class="mt-0.5 text-xs text-muted-foreground">
-                  Names the network and seeds its RF config from what
-                  the gateway is already broadcasting.
+                  Names the network and puts it on a channel no other
+                  network uses.
                 </div>
                 <template v-if="unboundChoice === 'create_network'">
-                  <div class="mt-2 grid grid-cols-2 gap-2">
-                    <label class="text-xs">
-                      Name
-                      <input
-                        v-model="newNetworkName"
-                        type="text"
-                        maxlength="48"
-                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
-                        :disabled="submitting"
-                        placeholder="e.g. Pit-Lane"
-                      />
-                    </label>
-                    <label class="text-xs">
-                      Region
-                      <select
-                        v-model="newNetworkRegion"
-                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
-                        :disabled="submitting"
-                      >
-                        <option
-                          v-for="r in regionOptions"
-                          :key="r"
-                          :value="r"
-                        >
-                          {{ r }}
-                        </option>
-                      </select>
-                    </label>
-                  </div>
+                  <NewNetworkFields
+                    v-model:name="newNetworkName"
+                    v-model:region="newNetworkRegion"
+                    v-model:channel-id="newNetworkChannelId"
+                    :regions="regionOptions"
+                    :channels="channelOptions"
+                    :gateway-channel="gatewayChannel"
+                    :can-keep-gateway-channel="canKeepGatewayChannel"
+                    :disabled="submitting"
+                  />
                 </template>
               </div>
             </label>
@@ -884,7 +941,7 @@ async function submitUnbound() {
           <Button
             v-if="active?.state === 'conflict'"
             type="button"
-            :disabled="submitting || (conflictTarget === 'create_network' && !newNetworkName.trim()) || (conflictTarget === 'rebind' && !rebindTargetId)"
+            :disabled="submitting || (conflictTarget === 'create_network' && !canCreateNetwork) || (conflictTarget === 'rebind' && !rebindTargetId)"
             @click="submitConflict"
           >
             {{ conflictTarget === 'create_network'
@@ -894,7 +951,7 @@ async function submitUnbound() {
           <Button
             v-else
             type="button"
-            :disabled="submitting || (unboundChoice === 'create_network' ? !newNetworkName.trim() : !rebindTargetId)"
+            :disabled="submitting || (unboundChoice === 'create_network' ? !canCreateNetwork : !rebindTargetId)"
             @click="submitUnbound"
           >
             {{ unboundChoice === 'create_network' ? 'Create & bind' : 'Rebind' }}

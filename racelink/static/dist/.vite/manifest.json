@@ -1,13 +1,13 @@
 {
-  "_vuedraggable.umd-5GwqRJRK.js": {
-    "file": "assets/vuedraggable.umd-5GwqRJRK.js",
+  "_vuedraggable.umd-BnBsj6So.js": {
+    "file": "assets/vuedraggable.umd-BnBsj6So.js",
     "name": "vuedraggable.umd",
     "imports": [
       "index.html"
     ]
   },
   "index.html": {
-    "file": "assets/index-D1dqhYO7.js",
+    "file": "assets/index-ijJQ8pqd.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -20,23 +20,23 @@
     ]
   },
   "src/components/modals/ManageGroupsDialog.vue": {
-    "file": "assets/ManageGroupsDialog-BCwTANEM.js",
+    "file": "assets/ManageGroupsDialog-BPooo_U2.js",
     "name": "ManageGroupsDialog",
     "src": "src/components/modals/ManageGroupsDialog.vue",
     "isDynamicEntry": true,
     "imports": [
       "index.html",
-      "_vuedraggable.umd-5GwqRJRK.js"
+      "_vuedraggable.umd-BnBsj6So.js"
     ]
   },
   "src/pages/ScenesPage.vue": {
-    "file": "assets/ScenesPage-CR8DSu0l.js",
+    "file": "assets/ScenesPage-shXn4xVl.js",
     "name": "ScenesPage",
     "src": "src/pages/ScenesPage.vue",
     "isDynamicEntry": true,
     "imports": [
       "index.html",
-      "_vuedraggable.umd-5GwqRJRK.js"
+      "_vuedraggable.umd-BnBsj6So.js"
     ]
   }
 }
