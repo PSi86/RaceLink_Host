@@ -7,13 +7,23 @@
  * ``unbound`` state). Branches:
  *
  *   - CONFLICT: known gateway whose NVS RF config disagrees with
- *     the bound network. Two operator choices:
- *       * Accept gateway (adopt the gateway's reported config into
- *         the network — no migration needed).
+ *     the bound network. Asked as two questions, because "who wins,
+ *     gateway or host?" quietly assumes the gateway belongs to that
+ *     network in the first place — and a gateway that was reflashed
+ *     has often been re-purposed too. So: *which network should this
+ *     drive?* (stay / move to another / create a new one), and only
+ *     for "stay", *how do we settle the difference?*
+ *       * Retune gateway — write the network's config to the gateway
+ *         and reboot it. No device is contacted, so nothing can
+ *         strand. The default, because a conflict nearly always means
+ *         only the gateway moved.
  *       * Accept host & migrate (push the network's persisted
  *         config onto every device + the gateway — schedules the
  *         Stage-3 migration engine; bind state stays at conflict
  *         until the migration completes).
+ *       * Accept gateway (adopt the gateway's reported config into
+ *         the network). Carries a device-count warning: that record
+ *         is the host's only note of where the devices are tuned.
  *
  *   - UNBOUND: gateway whose ident_mac doesn't match any persisted
  *     network. Two operator choices:
@@ -77,10 +87,20 @@ const migrationOutcome = ref<{ ok: boolean; message: string } | null>(null)
 // ``token`` on the snapshot is what gets sent on resolve.
 const active = ref<GatewayBindRecord | null>(null)
 
-/** ``conflict`` branches default to "accept gateway" because that's
- *  the safer no-migration path; the operator has to explicitly opt
- *  into "accept host" to schedule the migration. */
-const conflictChoice = ref<'accept_gateway' | 'accept_host'>('accept_gateway')
+/** A conflict is answered in two steps, because "who wins, gateway or
+ *  host?" presumes the gateway↔network pairing is already right — and a
+ *  reflashed gateway is very often a *re-purposed* one. So we ask what
+ *  the gateway is for first, and only then how to settle the RF
+ *  difference.
+ *
+ *  ``keep`` defaults because staying put is the common case; within it
+ *  ``retune_gateway`` defaults because a conflict almost always means
+ *  only the gateway moved. */
+type ConflictTarget = 'keep' | 'rebind' | 'create_network'
+const conflictTarget = ref<ConflictTarget>('keep')
+const conflictChoice = ref<'retune_gateway' | 'accept_host' | 'accept_gateway'>(
+  'retune_gateway',
+)
 
 /** ``unbound`` branches default to "create" because every Stage-2
  *  default-network-only deployment ends up here on a fresh
@@ -138,6 +158,32 @@ function formatRfValue(field: string, value: unknown): string {
   return String(value)
 }
 
+/** Devices on the network this gateway currently drives. Overwriting
+ *  the network record (``accept_gateway``) strands every one of them,
+ *  because that record is the host's only note of what the *devices*
+ *  are tuned to. */
+const currentNetworkDeviceCount = computed(() => {
+  const nid = active.value?.network_id
+  if (!nid) return 0
+  return networks.byId[nid]?.device_impact?.total ?? 0
+})
+
+/** Master-persistence hazard for the network the operator is about to
+ *  hand this gateway. Those devices pinned the MAC of whichever gateway
+ *  paired them and will ignore this one outright. */
+const rebindTargetImpact = computed(() => {
+  const onRebindPath = active.value?.state === 'conflict'
+    ? conflictTarget.value === 'rebind'
+    : unboundChoice.value === 'rebind'
+  if (!onRebindPath) return null
+  const target = networks.byId[rebindTargetId.value]
+  const impact = target?.device_impact
+  if (!impact || impact.master_persist.length === 0) return null
+  // Only a hazard when a *different* gateway is taking over.
+  if (target.gateway_mac && target.gateway_mac === active.value?.ident_mac) return null
+  return impact
+})
+
 function formatRfConfigSummary(cfg: RfConfig | null | undefined): string {
   if (!cfg) return '—'
   return [
@@ -174,7 +220,8 @@ watch(
       || active.value.ident_mac !== next.ident_mac
     ) {
       active.value = { ...next }
-      conflictChoice.value = 'accept_gateway'
+      conflictTarget.value = 'keep'
+      conflictChoice.value = 'retune_gateway'
       unboundChoice.value = 'create_network'
       newNetworkName.value = ''
       newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
@@ -200,7 +247,8 @@ watch(
     const next = gateways.attentionRecord
     if (!next) return
     active.value = { ...next }
-    conflictChoice.value = 'accept_gateway'
+    conflictTarget.value = 'keep'
+    conflictChoice.value = 'retune_gateway'
     unboundChoice.value = 'create_network'
     newNetworkName.value = ''
     newNetworkRegion.value = regionOptions.value[0] ?? 'EU868'
@@ -229,6 +277,14 @@ function closeDialog() {
 
 async function submitConflict() {
   if (!active.value) return
+  // "Move it elsewhere" reuses the same server actions as the unbound
+  // branch — the difference is only which question got the operator
+  // here, so don't duplicate the request logic.
+  if (conflictTarget.value !== 'keep') {
+    unboundChoice.value = conflictTarget.value === 'rebind' ? 'rebind' : 'create_network'
+    await submitUnbound()
+    return
+  }
   submitting.value = true
   try {
     const res = await gateways.resolve(active.value.ident_mac, {
@@ -236,7 +292,18 @@ async function submitConflict() {
       params: { token: active.value.token },
     })
     if (res.ok) {
-      if (conflictChoice.value === 'accept_host' && res.migration_pending) {
+      if (conflictChoice.value === 'retune_gateway') {
+        toast.show(
+          `Gateway ${active.value.ident_mac} is switching to `
+          + `"${active.value.network_name || 'the network'}" settings and rebooting.`,
+        )
+        await Promise.all([
+          networks.load().catch(() => undefined),
+          gateways.load().catch(() => undefined),
+        ])
+        open.value = false
+        active.value = null
+      } else if (conflictChoice.value === 'accept_host' && res.migration_pending) {
         // Bug 3b fix: keep the dialog open and switch to the
         // migration-progress step. The task-watcher below flips us
         // to ``done`` / ``error`` when the rf_migration task lands.
@@ -399,7 +466,8 @@ async function submitUnbound() {
         </DialogDescription>
         <DialogDescription v-else-if="active?.state === 'conflict'">
           The gateway is on a different channel than this network expects.
-          Decide which one to keep.
+          Decide what this gateway is for — then how to settle the
+          difference.
         </DialogDescription>
         <DialogDescription v-else>
           This gateway doesn't match any of your configured networks.
@@ -493,41 +561,179 @@ async function submitUnbound() {
             </table>
           </div>
 
-          <div class="mt-3 grid gap-2">
+          <div class="mt-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Which network should this gateway drive?
+          </div>
+          <div class="mt-2 grid gap-2">
+            <!-- Stay put + how to settle the RF difference. -->
             <label class="flex cursor-pointer items-start gap-2 rounded-md border border-border p-2.5">
               <input
-                v-model="conflictChoice"
+                v-model="conflictTarget"
                 type="radio"
-                value="accept_gateway"
+                value="keep"
                 class="mt-0.5"
                 :disabled="submitting"
               />
-              <div>
-                <div class="font-medium">Accept the gateway's settings</div>
+              <div class="flex-auto">
+                <div class="font-medium">
+                  Stay on "{{ active.network_name || 'the current network' }}"
+                </div>
                 <div class="mt-0.5 text-xs text-muted-foreground">
-                  Updates the network record to match the gateway. No
-                  migration, no device reboots. Use this when you flashed
-                  / re-tuned the gateway intentionally.
+                  Keep the assignment and settle the RF difference.
+                </div>
+
+                <div v-if="conflictTarget === 'keep'" class="mt-2 grid gap-2">
+                  <label class="flex cursor-pointer items-start gap-2 rounded border border-border/60 bg-background/40 p-2">
+                    <input
+                      v-model="conflictChoice"
+                      type="radio"
+                      value="retune_gateway"
+                      class="mt-0.5"
+                      :disabled="submitting"
+                    />
+                    <div>
+                      <div class="text-xs font-medium">
+                        Only the gateway changed — bring it back
+                        <span class="ml-1 rounded bg-emerald-900/40 px-1 py-0.5 text-[10px] font-normal text-emerald-200">
+                          recommended
+                        </span>
+                      </div>
+                      <div class="mt-0.5 text-xs text-muted-foreground">
+                        Writes the network's settings to the gateway and
+                        reboots it. No device is contacted, so nothing can
+                        strand. This is the answer when you reflashed or
+                        swapped the gateway and left the devices alone.
+                      </div>
+                    </div>
+                  </label>
+
+                  <label class="flex cursor-pointer items-start gap-2 rounded border border-border/60 bg-background/40 p-2">
+                    <input
+                      v-model="conflictChoice"
+                      type="radio"
+                      value="accept_host"
+                      class="mt-0.5"
+                      :disabled="submitting"
+                    />
+                    <div>
+                      <div class="text-xs font-medium">
+                        Devices drifted too — push the network's settings everywhere
+                      </div>
+                      <div class="mt-0.5 text-xs text-muted-foreground">
+                        Four-phase migration:
+                        <span class="font-mono">OPC_RF_CONFIG</span> to every
+                        device, then persist-switch the gateway, then verify.
+                        Devices that don't come back land in "stranded" for
+                        Channel-Scan recovery.
+                      </div>
+                    </div>
+                  </label>
+
+                  <label class="flex cursor-pointer items-start gap-2 rounded border border-border/60 bg-background/40 p-2">
+                    <input
+                      v-model="conflictChoice"
+                      type="radio"
+                      value="accept_gateway"
+                      class="mt-0.5"
+                      :disabled="submitting"
+                    />
+                    <div>
+                      <div class="text-xs font-medium">
+                        The network really moved — update the record to match
+                      </div>
+                      <div class="mt-0.5 text-xs text-muted-foreground">
+                        Rewrites the network's stored RF settings to what the
+                        gateway reports. Nothing is sent to any device.
+                      </div>
+                      <div
+                        v-if="conflictChoice === 'accept_gateway' && currentNetworkDeviceCount > 0"
+                        class="mt-1.5 rounded border border-amber-700/40 bg-amber-900/20 p-1.5 text-xs text-amber-200"
+                      >
+                        This network has {{ currentNetworkDeviceCount }}
+                        device{{ currentNetworkDeviceCount === 1 ? '' : 's' }}.
+                        Their stored channel is the host's only note of where
+                        they actually are — overwriting it leaves them
+                        unreachable and unrecorded. Pick this only if you
+                        re-tuned the devices as well.
+                      </div>
+                    </div>
+                  </label>
                 </div>
               </div>
             </label>
+
+            <!-- Re-purpose onto another network. -->
             <label class="flex cursor-pointer items-start gap-2 rounded-md border border-border p-2.5">
               <input
-                v-model="conflictChoice"
+                v-model="conflictTarget"
                 type="radio"
-                value="accept_host"
+                value="rebind"
+                class="mt-0.5"
+                :disabled="submitting || rebindOptions.length === 0"
+              />
+              <div class="flex-auto">
+                <div class="font-medium">Move it to another network</div>
+                <div class="mt-0.5 text-xs text-muted-foreground">
+                  "{{ active.network_name || 'The current network' }}" keeps its
+                  settings and devices, it just loses this gateway. If the
+                  target's settings differ you'll land back here for it.
+                </div>
+                <template v-if="conflictTarget === 'rebind'">
+                  <select
+                    v-model="rebindTargetId"
+                    class="mt-2 w-full rounded border border-border bg-background px-2 py-1 text-xs"
+                    :disabled="submitting"
+                  >
+                    <option v-for="n in rebindOptions" :key="n.id" :value="n.id">
+                      {{ n.name }}<span v-if="n.gateway_mac"> (was {{ n.gateway_mac }})</span>
+                    </option>
+                  </select>
+                </template>
+              </div>
+            </label>
+
+            <!-- Park it on a fresh network. -->
+            <label class="flex cursor-pointer items-start gap-2 rounded-md border border-border p-2.5">
+              <input
+                v-model="conflictTarget"
+                type="radio"
+                value="create_network"
                 class="mt-0.5"
                 :disabled="submitting"
               />
-              <div>
-                <div class="font-medium">Push the host's settings (migrate)</div>
+              <div class="flex-auto">
+                <div class="font-medium">Create a new network for it</div>
                 <div class="mt-0.5 text-xs text-muted-foreground">
-                  Runs the four-phase migration:
-                  push <span class="font-mono">OPC_RF_CONFIG</span> to every
-                  device, then persist-switch the gateway, then verify.
-                  Devices that don't come back land in "stranded"
-                  for Channel-Scan recovery.
+                  Seeds the new network from what the gateway is broadcasting
+                  now, and leaves
+                  "{{ active.network_name || 'the current network' }}"
+                  untouched.
                 </div>
+                <template v-if="conflictTarget === 'create_network'">
+                  <div class="mt-2 grid grid-cols-2 gap-2">
+                    <label class="text-xs">
+                      Name
+                      <input
+                        v-model="newNetworkName"
+                        type="text"
+                        maxlength="48"
+                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
+                        :disabled="submitting"
+                        placeholder="e.g. Test"
+                      />
+                    </label>
+                    <label class="text-xs">
+                      Region
+                      <select
+                        v-model="newNetworkRegion"
+                        class="mt-1 w-full rounded border border-border bg-background px-2 py-1"
+                        :disabled="submitting"
+                      >
+                        <option v-for="r in regionOptions" :key="r" :value="r">{{ r }}</option>
+                      </select>
+                    </label>
+                  </div>
+                </template>
               </div>
             </label>
           </div>
@@ -631,6 +837,43 @@ async function submitUnbound() {
             </label>
           </div>
         </template>
+
+        <!-- Shared across both branches: handing a network to a different
+             gateway is silently useless if its devices pinned the old
+             master's MAC. Surfaced here because after the swap the cure
+             can no longer be delivered — it has to go over the gateway
+             that is about to be replaced. -->
+        <div
+          v-if="rebindTargetImpact"
+          class="mt-3 rounded-md border border-amber-700/40 bg-amber-900/20 p-3 text-xs text-amber-200"
+        >
+          <div class="font-semibold">
+            {{ rebindTargetImpact.master_persist.length }} device{{ rebindTargetImpact.master_persist.length === 1 ? '' : 's' }}
+            on this network {{ rebindTargetImpact.master_persist.length === 1 ? 'has' : 'have' }}
+            pinned their current gateway
+          </div>
+          <div class="mt-1">
+            Master persistence is on for
+            <span
+              v-for="(d, i) in rebindTargetImpact.master_persist.slice(0, 6)"
+              :key="d.mac"
+              class="font-mono"
+            >{{ i > 0 ? ', ' : '' }}{{ d.name || d.mac }}</span><span
+              v-if="rebindTargetImpact.master_persist.length > 6"
+            > and {{ rebindTargetImpact.master_persist.length - 6 }} more</span>.
+            They will ignore this gateway, and rebooting them does not help —
+            they have to be released while their current gateway can still
+            reach them, or reset by hand afterwards.
+          </div>
+          <div class="mt-1.5">
+            Use <span class="font-medium">Release devices from their gateway</span>
+            in the network manager before you make the swap.
+          </div>
+          <div v-if="rebindTargetImpact.stale" class="mt-1.5 opacity-80">
+            Note: at least one of these has never reported a status, so this
+            is the last stored reading rather than a live one.
+          </div>
+        </div>
       </div>
 
       <DialogFooter>
@@ -641,10 +884,12 @@ async function submitUnbound() {
           <Button
             v-if="active?.state === 'conflict'"
             type="button"
-            :disabled="submitting"
+            :disabled="submitting || (conflictTarget === 'create_network' && !newNetworkName.trim()) || (conflictTarget === 'rebind' && !rebindTargetId)"
             @click="submitConflict"
           >
-            Apply
+            {{ conflictTarget === 'create_network'
+              ? 'Create & move'
+              : conflictTarget === 'rebind' ? 'Move gateway' : 'Apply' }}
           </Button>
           <Button
             v-else

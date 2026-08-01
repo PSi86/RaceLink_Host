@@ -279,6 +279,25 @@ export interface NetworkSummary {
   eth_config?: Record<string, unknown> | null
   created_ts: number | null
   live?: MasterSnapshot | null
+  /** What would happen to this network's devices if its gateway were
+   *  swapped. Surfaced on the listing (not only inside the conflict
+   *  wizard) so a gateway-locked network is a visible standing property
+   *  rather than a surprise at the moment of the swap — by then the fix
+   *  is out of radio range. `null` when the host could not compute it. */
+  device_impact?: NetworkDeviceImpact | null
+}
+
+/** Devices that pinned their master's MAC (`configByte` bit 1). Such a
+ *  node ignores any other gateway and a reboot does not clear it, so the
+ *  only over-the-air cure has to travel over the *current* gateway. */
+export interface NetworkDeviceImpact {
+  network_id: string
+  /** Devices assigned to the network, pinned or not. */
+  total: number
+  master_persist: Array<{ mac: string; name: string; last_seen_ts: number }>
+  /** True when at least one pinned device has never reported a status, so
+   *  its `configByte` is a stored guess rather than a live reading. */
+  stale: boolean
 }
 
 export interface NetworksResponse {

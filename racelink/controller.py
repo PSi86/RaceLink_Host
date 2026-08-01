@@ -243,6 +243,10 @@ class RaceLink_Host:
             controller=self,
             bind_service=self.gateway_bind_service,
         )
+        # Versioned snapshots of the combined state blob, so "start a
+        # fresh configuration" stops being a one-way door.
+        from racelink.services.config_backup_service import ConfigBackupService
+        self.config_backup_service = ConfigBackupService(self)
         # Stage 3 Part F: channel-scan service. Recovers devices that
         # got stranded on a previous migration by sweeping the
         # region's channel table on a chosen gateway and reporting

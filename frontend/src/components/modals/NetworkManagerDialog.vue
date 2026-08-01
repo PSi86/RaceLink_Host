@@ -33,7 +33,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import NetworkKindIcon from '@/components/NetworkKindIcon.vue'
-import { apiDelete, apiPost, apiPut } from '@/api/client'
+import { apiDelete, apiGet, apiPost, apiPut } from '@/api/client'
 import { useConfirm } from '@/composables/useConfirm'
 import { useGatewaysStore } from '@/stores/gateways'
 import { useNetworksStore } from '@/stores/networks'
@@ -385,6 +385,183 @@ async function onCreate() {
   }
 }
 
+/** Devices on the selected network that pinned their master's MAC.
+ *  Such a node ignores every other gateway and a reboot will not clear
+ *  it — the release below has to travel over the gateway that is still
+ *  paired, so this is a "before the swap" affordance, not a recovery. */
+const masterPersistImpact = computed(() => {
+  const impact = selectedNetwork.value?.device_impact
+  if (!impact || impact.master_persist.length === 0) return null
+  return impact
+})
+
+const releasing = ref(false)
+
+async function onReleaseMasterPersist() {
+  const net = selectedNetwork.value
+  const impact = masterPersistImpact.value
+  if (!net || !impact) return
+  const ok = await confirm.confirm(
+    'Each device is told to stop pinning its master MAC, so a different '
+    + 'gateway can take this network over. Devices that are offline right '
+    + 'now cannot be reached and will keep their pin — they come back as '
+    + 'skipped and need a manual reset later.',
+    {
+      title: `Release ${impact.master_persist.length} device(s) on "${net.name}"?`,
+      okLabel: 'Release devices',
+    },
+  )
+  if (!ok) return
+  releasing.value = true
+  try {
+    const res = (await apiPost(
+      `/api/networks/${encodeURIComponent(net.id)}/clear-master-persist`,
+      {},
+    )) as { ok?: boolean; error?: string }
+    if (res.ok) {
+      toast.show('Releasing devices — watch the task bar for the result.')
+    } else {
+      toast.error(`Release failed: ${res.error || 'unknown'}`)
+    }
+  } finally {
+    releasing.value = false
+  }
+}
+
+// ---- configuration snapshots ---------------------------------------
+// Backing up and starting fresh belongs here rather than in a settings
+// page: "park this setup and build a new one" is the same task as
+// managing networks, just one level up.
+
+interface BackupMeta {
+  id: string
+  created_ts: number
+  label?: string
+  reason?: string
+  host_version?: string
+  schema_version?: number
+  compatible?: boolean
+  counts?: { devices: number; groups: number; networks: number }
+  error?: string
+}
+
+const backups = ref<BackupMeta[]>([])
+const backupsOpen = ref(false)
+const backupBusy = ref(false)
+
+async function loadBackups() {
+  const res = (await apiGet('/api/state/backups')) as {
+    ok?: boolean; backups?: BackupMeta[]
+  }
+  backups.value = res?.backups ?? []
+}
+
+watch(backupsOpen, (open) => {
+  if (open) void loadBackups().catch(() => undefined)
+})
+
+function formatBackupTs(ts: number): string {
+  if (!ts) return '—'
+  return new Date(ts * 1000).toLocaleString()
+}
+
+async function onCreateBackup() {
+  backupBusy.value = true
+  try {
+    const res = (await apiPost('/api/state/backups', {})) as {
+      ok?: boolean; error?: string
+    }
+    if (res?.ok) {
+      toast.show('Configuration snapshot saved.')
+      await loadBackups().catch(() => undefined)
+    } else {
+      toast.error(`Snapshot failed: ${res?.error || 'unknown'}`)
+    }
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function onRestoreBackup(meta: BackupMeta) {
+  const ok = await confirm.confirm(
+    `Replaces every device, group and network with the snapshot from `
+    + `${formatBackupTs(meta.created_ts)}. The current configuration is `
+    + `saved as a new snapshot first, so this is reversible.`,
+    { title: 'Restore this configuration?', okLabel: 'Restore' },
+  )
+  if (!ok) return
+  backupBusy.value = true
+  try {
+    const res = (await apiPost(
+      `/api/state/backups/${encodeURIComponent(meta.id)}/restore`, {},
+    )) as { ok?: boolean; error?: string }
+    if (res?.ok) {
+      toast.show('Configuration restored.')
+      await Promise.all([
+        networks.load().catch(() => undefined),
+        loadBackups().catch(() => undefined),
+      ])
+      selectedId.value = networks.networks[0]?.id ?? ''
+    } else {
+      toast.error(`Restore failed: ${res?.error || 'unknown'}`)
+    }
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function onDeleteBackup(meta: BackupMeta) {
+  const ok = await confirm.confirm(
+    'The snapshot file is removed. This cannot be undone.',
+    {
+      title: `Delete snapshot from ${formatBackupTs(meta.created_ts)}?`,
+      okLabel: 'Delete',
+      variant: 'destructive',
+    },
+  )
+  if (!ok) return
+  backupBusy.value = true
+  try {
+    await apiDelete(`/api/state/backups/${encodeURIComponent(meta.id)}`)
+    await loadBackups().catch(() => undefined)
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function onClearConfig() {
+  const ok = await confirm.confirm(
+    'Every device, group and network is removed and you start with a '
+    + 'single default network — the same state a fresh install boots '
+    + 'with. The current configuration is saved as a snapshot first, so '
+    + 'you can come back to it. Attached gateways will need re-assigning.',
+    {
+      title: 'Start a new, empty configuration?',
+      okLabel: 'Back up & clear',
+      variant: 'destructive',
+    },
+  )
+  if (!ok) return
+  backupBusy.value = true
+  try {
+    const res = (await apiPost('/api/state/clear', {})) as {
+      ok?: boolean; error?: string
+    }
+    if (res?.ok) {
+      toast.show('Configuration cleared — the previous one was saved as a snapshot.')
+      await Promise.all([
+        networks.load().catch(() => undefined),
+        loadBackups().catch(() => undefined),
+      ])
+      selectedId.value = networks.networks[0]?.id ?? ''
+    } else {
+      toast.error(`Clear failed: ${res?.error || 'unknown'}`)
+    }
+  } finally {
+    backupBusy.value = false
+  }
+}
+
 function close() {
   emit('update:open', false)
 }
@@ -709,6 +886,41 @@ function close() {
             </div>
           </div>
 
+          <!-- Standing property, not an incident: a network whose devices
+               pinned their master can only change gateway while the
+               current one is still able to reach them. Showing it here
+               means the operator meets it before the swap, not after. -->
+          <div
+            v-if="masterPersistImpact"
+            class="rounded-md border border-amber-700/40 bg-amber-950/40 p-2 text-xs text-amber-200"
+          >
+            <div class="font-semibold">
+              Gateway-locked · {{ masterPersistImpact.master_persist.length }} of
+              {{ masterPersistImpact.total }} device(s)
+            </div>
+            <div class="mt-1">
+              These devices have pinned this network's gateway MAC and will
+              ignore any other gateway — rebooting them does not clear it.
+              Release them before you swap or re-assign the gateway; once it
+              is gone the command can no longer reach them and they need a
+              manual reset.
+            </div>
+            <div v-if="masterPersistImpact.stale" class="mt-1 opacity-80">
+              At least one has never reported a status, so this is the last
+              stored reading rather than a live one.
+            </div>
+            <div class="mt-2">
+              <Button
+                type="button"
+                size="sm"
+                :disabled="releasing || submitting"
+                @click="onReleaseMasterPersist"
+              >
+                {{ releasing ? 'Releasing…' : 'Release devices from their gateway' }}
+              </Button>
+            </div>
+          </div>
+
           <div class="flex items-center justify-between border-t border-border/50 pt-2">
             <Button
               variant="ghost"
@@ -735,6 +947,84 @@ function close() {
         <section v-else class="rounded-md border border-border bg-card/40 p-3 text-xs text-muted-foreground">
           Pick a network from the list to edit it.
         </section>
+      </div>
+
+      <!-- ===== Configuration snapshots ===== -->
+      <div class="rounded-md border border-border bg-card/40 text-xs">
+        <button
+          type="button"
+          class="flex w-full items-center justify-between px-3 py-2 text-left"
+          @click="backupsOpen = !backupsOpen"
+        >
+          <span class="font-semibold uppercase tracking-wider text-muted-foreground">
+            Configuration snapshots
+          </span>
+          <span class="text-muted-foreground">{{ backupsOpen ? '▾' : '▸' }}</span>
+        </button>
+        <div v-if="backupsOpen" class="border-t border-border/50 p-3">
+          <div class="flex items-center gap-2">
+            <Button type="button" size="sm" :disabled="backupBusy" @click="onCreateBackup">
+              Save a snapshot
+            </Button>
+            <Button
+              variant="ghost"
+              class="text-red-300 hover:text-red-200"
+              type="button"
+              size="sm"
+              :disabled="backupBusy"
+              @click="onClearConfig"
+            >
+              Start an empty configuration
+            </Button>
+          </div>
+          <p class="mt-2 text-muted-foreground">
+            A snapshot holds every device, group and network. Restoring and
+            clearing both save the outgoing configuration first, so neither
+            is a one-way door.
+          </p>
+
+          <ul v-if="backups.length" class="m-0 mt-2 grid list-none gap-1 p-0">
+            <li
+              v-for="b in backups"
+              :key="b.id"
+              class="flex items-center gap-2 rounded border border-border/50 bg-background/40 px-2 py-1"
+            >
+              <span class="flex-auto">
+                <span class="font-medium">{{ formatBackupTs(b.created_ts) }}</span>
+                <span v-if="b.label" class="ml-1 text-muted-foreground">· {{ b.label }}</span>
+                <span v-if="b.counts" class="ml-1 text-muted-foreground">
+                  · {{ b.counts.devices }} devices, {{ b.counts.groups }} groups,
+                  {{ b.counts.networks }} networks
+                </span>
+                <span v-if="b.host_version" class="ml-1 font-mono text-muted-foreground">
+                  · v{{ b.host_version }}
+                </span>
+                <span v-if="b.error" class="ml-1 text-red-300">· {{ b.error }}</span>
+                <span v-else-if="b.compatible === false" class="ml-1 text-amber-300">
+                  · newer than this host (schema v{{ b.schema_version }})
+                </span>
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                :disabled="backupBusy || !!b.error || b.compatible === false"
+                @click="onRestoreBackup(b)"
+              >
+                Restore
+              </Button>
+              <Button
+                variant="ghost"
+                type="button"
+                size="sm"
+                :disabled="backupBusy"
+                @click="onDeleteBackup(b)"
+              >
+                Delete
+              </Button>
+            </li>
+          </ul>
+          <div v-else class="mt-2 text-muted-foreground">No snapshots yet.</div>
+        </div>
       </div>
 
       <DialogFooter>
