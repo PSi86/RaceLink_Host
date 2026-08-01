@@ -60,11 +60,15 @@ Resolve actions (operator → ``POST /api/gateways/{ident_mac}/resolve``):
     re-tuned gateway on a new network without disturbing the
     one it used to drive.
   * ``rebind`` — UNBOUND or CONFLICT. Bind this transport to an
-    existing ``RL_Network`` by id. If the existing network
-    carries an ``rf_config`` and it differs from the
-    gateway's, the resulting state is CONFLICT (the operator
-    has to pick retune-gateway, accept-host or accept-gateway
-    from there).
+    existing ``RL_Network`` by id. When the network's
+    ``rf_config`` differs from the gateway's, ``on_mismatch``
+    settles it in the same call: ``retune_gateway`` moves the
+    gateway onto the network's channel, ``accept_gateway``
+    rewrites the network's channel to the gateway's, and
+    ``ask`` (the default) parks in CONFLICT for a separate
+    answer. Settling in-call is what makes "rebind to the
+    network I am already on" meaningful — under ``ask`` it
+    merely re-raises the conflict the operator was answering.
 
 Both ``create_network`` and ``rebind`` release the ident from any
 sibling network that still lists it as ``gateway_mac``, so a gateway
@@ -670,15 +674,43 @@ class GatewayBindService:
         if rec.rf_config_actual is None:
             raise _BindActionError("gateway did not report an rf_config")
         network = self._lookup_network(rec.network_id)
+        self._adopt_gateway_config(rec, network)
+        rec.token = uuid.uuid4().hex
+        self._persist_quietly(f"accept_gateway on {rec.ident_mac}")
+        self._broadcast_event(self.EVENT_BOUND, rec)
+        return {"ok": True, "state": rec.state.value, "token": rec.token}
+
+    def _adopt_gateway_config(self, rec: BindRecord, network) -> None:
+        """Move ``network``'s recorded channel onto what the gateway
+        reports, and mark the record BOUND.
+
+        Refuses when that frequency belongs to another network: the
+        adopting network would become indistinguishable from it on air.
+        Without this check "accept the gateway's settings" could quietly
+        park two networks on one channel — the same hole
+        ``create_network`` had.
+        """
+        from ..domain.rf_policy import format_occupants, occupants_of
+
+        if not isinstance(rec.rf_config_actual, dict):
+            raise _BindActionError("gateway did not report an rf_config")
+        clash = occupants_of(
+            self.controller.network_repository.list(),
+            rec.rf_config_actual,
+            exclude_network_id=str(getattr(network, "id", "") or ""),
+        )
+        if clash:
+            raise _BindActionError(
+                f"the gateway's channel already belongs to "
+                f"{format_occupants(clash)} — adopting it would put two "
+                f"networks on one frequency. Move the gateway to a free "
+                f"channel instead."
+            )
         network.rf_config = dict(rec.rf_config_actual)
         rec.rf_config_expected = dict(rec.rf_config_actual)
         rec.state = BindState.BOUND
         rec.conflict_fields = []
         rec.migration_pending = False
-        rec.token = uuid.uuid4().hex
-        self._persist_quietly(f"accept_gateway on {rec.ident_mac}")
-        self._broadcast_event(self.EVENT_BOUND, rec)
-        return {"ok": True, "state": rec.state.value, "token": rec.token}
 
     def _action_accept_host(self, rec: BindRecord) -> dict:
         """Operator wants the host's persisted RF config to win — the
@@ -868,9 +900,22 @@ class GatewayBindService:
         }
 
     def _action_rebind(self, rec: BindRecord, params: dict) -> dict:
-        """UNBOUND only: bind this transport's MAC to an existing
-        network. Updates the network's ``gateway_mac`` and re-runs the
-        conflict check on its persisted ``rf_config``."""
+        """Bind this transport's MAC to an existing network.
+
+        Updates the network's ``gateway_mac`` and re-checks its
+        persisted ``rf_config`` against the gateway. ``on_mismatch``
+        decides what happens when they disagree:
+
+        * ``"ask"`` (default) — land in CONFLICT and let the operator
+          answer separately. The historical behaviour.
+        * ``"retune_gateway"`` — move the gateway onto the target's
+          channel. The sane answer when taking over a network whose
+          devices are already running on it.
+        * ``"accept_gateway"`` — rewrite the target's channel to what
+          the gateway reports. Strands that network's devices unless
+          they are on the gateway's channel too, so callers should show
+          :meth:`network_device_impact` first.
+        """
         if rec.state not in (BindState.UNBOUND, BindState.CONFLICT):
             raise _BindActionError(
                 "rebind requires state=unbound or conflict "
@@ -879,6 +924,12 @@ class GatewayBindService:
         target_id = str(params.get("network_id") or "").strip()
         if not target_id:
             raise _BindActionError("rebind requires a 'network_id'")
+        on_mismatch = str(params.get("on_mismatch") or "ask").strip()
+        if on_mismatch not in ("ask", "retune_gateway", "accept_gateway"):
+            raise _BindActionError(
+                f"unknown on_mismatch {on_mismatch!r} — expected ask, "
+                f"retune_gateway or accept_gateway"
+            )
         network = self._lookup_network(target_id)
         # Compatibility guard: an RF gateway may only take over an RF
         # network. Ethernet networks carry no gateway_mac and run over
@@ -936,6 +987,34 @@ class GatewayBindService:
             rec.state = BindState.BOUND
             rec.conflict_fields = []
             self._persist_quietly(f"rebind({network.id}) match")
+            rec.token = uuid.uuid4().hex
+            self._broadcast_event(self.EVENT_BOUND, rec)
+            return {"ok": True, "state": rec.state.value, "token": rec.token}
+
+        # The settings disagree. ``on_mismatch`` lets the caller settle
+        # that in the same call instead of bouncing back through a second
+        # conflict round — which is what made "rebind to the network I am
+        # already on" a silent no-op: it re-raised the very conflict the
+        # operator was answering.
+        if on_mismatch == "retune_gateway":
+            self._push_rf_to_gateway(rec, rec.rf_config_expected)
+            rec.rf_config_actual = dict(rec.rf_config_expected)
+            rec.state = BindState.BOUND
+            rec.conflict_fields = []
+            self._persist_quietly(f"rebind({network.id}) + retune")
+            rec.token = uuid.uuid4().hex
+            self._broadcast_event(self.EVENT_BOUND, rec)
+            return {
+                "ok": True,
+                "state": rec.state.value,
+                "token": rec.token,
+                "rebooting": True,
+                "rf_config": dict(rec.rf_config_expected),
+            }
+
+        if on_mismatch == "accept_gateway":
+            self._adopt_gateway_config(rec, network)
+            self._persist_quietly(f"rebind({network.id}) + adopt")
             rec.token = uuid.uuid4().hex
             self._broadcast_event(self.EVENT_BOUND, rec)
             return {"ok": True, "state": rec.state.value, "token": rec.token}

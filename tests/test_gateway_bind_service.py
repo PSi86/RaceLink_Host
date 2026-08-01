@@ -911,6 +911,136 @@ class ConflictReassignmentTests(unittest.TestCase):
         self.assertEqual(start.rf_config, _HOST_CFG)
 
 
+class RebindOnMismatchTests(unittest.TestCase):
+    """Rebinding settles the RF difference in the same call. Without
+    that, "bind to the network I am already on" re-raised the very
+    conflict the operator was answering — a silent no-op."""
+
+    def _conflicted_with_sibling(self):
+        gw = _FakeGatewayService(configs={"GW-A": _GATEWAY_CFG_DIVERGE})
+        ctrl, _gw, svc, broadcasts, _p = _make_service(gw=gw)
+        start = RL_Network(name="Start", gateway_mac="GW-A",
+                           rf_config=dict(_HOST_CFG))
+        ctrl.network_repository.append(start)
+        t = _FakeTransport("GW-A", network_id=start.id)
+        ctrl._transports.append(t)
+        rec = svc.evaluate(t)
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.CONFLICT)
+        return ctrl, gw, svc, start, rec, broadcasts
+
+    def test_ask_keeps_the_historical_conflict_behaviour(self):
+        _ctrl, gw, svc, start, rec, _b = self._conflicted_with_sibling()
+
+        out = svc.resolve("GW-A", "rebind",
+                          {"token": rec.token, "network_id": start.id})
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "conflict")
+        self.assertEqual(gw.set_calls, [])
+        self.assertEqual(start.rf_config, _HOST_CFG)
+
+    def test_retune_on_mismatch_moves_the_gateway_and_binds(self):
+        """Selecting the network the gateway already serves is now a
+        real choice instead of a loop back to the same dialog."""
+        _ctrl, gw, svc, start, rec, _b = self._conflicted_with_sibling()
+
+        out = svc.resolve("GW-A", "rebind", {
+            "token": rec.token, "network_id": start.id,
+            "on_mismatch": "retune_gateway",
+        })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "bound")
+        self.assertTrue(out["rebooting"])
+        self.assertEqual(len(gw.set_calls), 1)
+        self.assertEqual(gw.set_calls[0]["rf_config"], _HOST_CFG)
+        # The network is the authority; it must not have moved.
+        self.assertEqual(start.rf_config, _HOST_CFG)
+
+    def test_retune_onto_a_different_network(self):
+        gw = _FakeGatewayService(configs={"GW-A": _GATEWAY_CFG_DIVERGE})
+        ctrl, _gw, svc, _b, _p = _make_service(gw=gw)
+        start = RL_Network(name="Start", gateway_mac="GW-A",
+                           rf_config=dict(_HOST_CFG))
+        other_cfg = dict(_HOST_CFG, freq_hz=869_200_000)
+        track = RL_Network(name="Track", gateway_mac=None,
+                           rf_config=dict(other_cfg))
+        ctrl.network_repository.append(start)
+        ctrl.network_repository.append(track)
+        t = _FakeTransport("GW-A", network_id=start.id)
+        ctrl._transports.append(t)
+        rec = svc.evaluate(t)
+        assert rec is not None
+
+        out = svc.resolve("GW-A", "rebind", {
+            "token": rec.token, "network_id": track.id,
+            "on_mismatch": "retune_gateway",
+        })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "bound")
+        self.assertEqual(gw.set_calls[0]["rf_config"], other_cfg)
+        self.assertEqual(track.gateway_mac, "GW-A")
+        # The network it left keeps its channel and loses only the gateway.
+        self.assertIsNone(start.gateway_mac)
+        self.assertEqual(start.rf_config, _HOST_CFG)
+
+    def test_accept_gateway_on_mismatch_rewrites_the_target_record(self):
+        _ctrl, gw, svc, start, rec, _b = self._conflicted_with_sibling()
+
+        out = svc.resolve("GW-A", "rebind", {
+            "token": rec.token, "network_id": start.id,
+            "on_mismatch": "accept_gateway",
+        })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "bound")
+        self.assertEqual(gw.set_calls, [])
+        self.assertEqual(start.rf_config, _GATEWAY_CFG_DIVERGE)
+
+    def test_rejects_an_unknown_on_mismatch(self):
+        _ctrl, gw, svc, start, rec, _b = self._conflicted_with_sibling()
+
+        out = svc.resolve("GW-A", "rebind", {
+            "token": rec.token, "network_id": start.id,
+            "on_mismatch": "do_something_clever",
+        })
+
+        self.assertFalse(out["ok"])
+        self.assertIn("unknown on_mismatch", out["error"])
+        self.assertEqual(gw.set_calls, [])
+
+
+class AcceptGatewayCollisionTests(unittest.TestCase):
+    """Adopting the gateway's channel must not park two networks on one
+    frequency — the same hole create_network had."""
+
+    def test_accept_gateway_refuses_a_channel_another_network_owns(self):
+        from racelink.domain.rf_channels import channel_rf_config
+        ch1 = channel_rf_config("EU868", 1)
+        ch2 = channel_rf_config("EU868", 2)
+        gw = _FakeGatewayService(configs={"GW-A": ch1})
+        ctrl, _gw, svc, _b, _p = _make_service(gw=gw)
+        start = RL_Network(name="Start", gateway_mac="GW-A", rf_config=dict(ch2))
+        track = RL_Network(name="Track", gateway_mac="GW-B", rf_config=dict(ch1))
+        ctrl.network_repository.append(start)
+        ctrl.network_repository.append(track)
+        t = _FakeTransport("GW-A", network_id=start.id)
+        ctrl._transports.append(t)
+        rec = svc.evaluate(t)
+        assert rec is not None
+        self.assertEqual(rec.state, BindState.CONFLICT)
+
+        out = svc.resolve("GW-A", "accept_gateway", {"token": rec.token})
+
+        self.assertFalse(out["ok"])
+        self.assertIn("already belongs to", out["error"])
+        self.assertIn("Track", out["error"])
+        # Nothing adopted; the record still describes where its devices are.
+        self.assertEqual(start.rf_config, ch2)
+
+
 class ChannelOccupancyTests(unittest.TestCase):
     """Two networks on one frequency+SyncWord are indistinguishable on
     air. The host's existing configuration decides what is free; what
