@@ -55,6 +55,13 @@ from ..protocol.packets import (
 
 logger = logging.getLogger("racelink_transport")
 
+# Upper bound for any blocking serial write. Without it pyserial waits
+# forever for the peer to drain the buffer, so one unresponsive USB-CDC
+# device is enough to hang the port walk before it ever reaches the real
+# gateway. Generous relative to a 921600-baud probe (a few hundred µs)
+# so it only ever fires on a peer that is genuinely not reading.
+_WRITE_TIMEOUT_S = 2.0
+
 # Synchronous _send_m2n outcome wait. Each host write blocks here for the
 # gateway's matching outcome event (EV_TX_DONE -> SUCCESS, EV_TX_REJECTED ->
 # REJECTED(reason)). The deadlock guard is a single 2-second ceiling — well
@@ -135,6 +142,13 @@ class GatewaySerialTransport:
         # the stop flag. 50 ms is well under typical inter-frame
         # latency on the USB CDC link.
         self.ser.timeout = 0.05
+        # A serial write blocks until the peer drains the buffer, and
+        # ``write_timeout=None`` means "block forever". A USB-CDC device
+        # that enumerates but never reads its endpoint — an ESP32 with
+        # the built-in USB-Serial/JTAG peripheral idle, for instance —
+        # therefore wedges whatever thread touches it, permanently.
+        # Bounded here so a dead peer costs a timeout, not the transport.
+        self.ser.write_timeout = _WRITE_TIMEOUT_S
         self._stop = False
         self._rx_thread = None
         self._q = []
@@ -332,7 +346,13 @@ class GatewaySerialTransport:
 
             except serial.SerialException as e:
                 msg = str(e)
-                if "Could not exclusively lock port" in msg or "Resource temporarily unavailable" in msg:
+                if isinstance(e, serial.SerialTimeoutException):
+                    logger.warning(
+                        "Port %s accepted the connection but never read the "
+                        "probe (write timed out after %.1fs) — skipping.",
+                        p.device, _WRITE_TIMEOUT_S,
+                    )
+                elif "Could not exclusively lock port" in msg or "Resource temporarily unavailable" in msg:
                     logger.debug("Skip busy port %s (exclusive lock failed)", p.device)
                     self.last_discovery_had_busy_port = True
                 else:
@@ -388,7 +408,7 @@ class GatewaySerialTransport:
             except Exception:
                 # swallow-ok: portinfo without description -> skip
                 continue
-            tmp = serial.Serial(timeout=0.5)
+            tmp = serial.Serial(timeout=0.5, write_timeout=_WRITE_TIMEOUT_S)
             tmp.baudrate = 921600
             try:
                 tmp.port = p.device
@@ -412,6 +432,18 @@ class GatewaySerialTransport:
                     # swallow-ok: best-effort MAC extraction; tuple still useful with port only.
                     mac_ascii = ""
                 found.append((p.device, mac_ascii or None))
+            except serial.SerialTimeoutException:
+                # The port opened but the peer never drained the write.
+                # Loud on purpose: from the operator's side this looks
+                # exactly like "my gateway is not detected", and without
+                # the port name there is nothing to act on.
+                logger.warning(
+                    "Port %s accepted the connection but never read the probe "
+                    "(write timed out after %.1fs) — skipping. Not a RaceLink "
+                    "gateway, or its USB serial peer is not listening.",
+                    p.device, _WRITE_TIMEOUT_S,
+                )
+                continue
             except serial.SerialException:
                 # swallow-ok: busy port / not-a-gateway -> skip silently
                 continue
