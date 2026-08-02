@@ -35,7 +35,7 @@ racelink-standalone                 # default UI: http://127.0.0.1:5077/racelink
 
 For the full Windows / Linux setup, including `nmcli` polkit
 configuration on Linux, see
-[Standalone install](https://psi86.github.io/RaceLink_Docs/RaceLink_Host/standalone-install/).
+[Standalone install](https://docs.racelink.dev/RaceLink_Host/standalone-install/).
 
 ## Build / test
 
@@ -49,7 +49,7 @@ py -3 -m pip install --no-deps --no-build-isolation .
 
 For the full smoke-test set (no German strings, exception
 hygiene, proto-header drift) see
-[Contributing](https://psi86.github.io/RaceLink_Docs/contributing/).
+[Contributing](https://docs.racelink.dev/contributing/).
 
 ## Release
 
@@ -58,7 +58,7 @@ Actions UI. Required input: `target_branch`. Optional input:
 `version` (auto-increments otherwise).
 
 For the full release flow and wheel naming convention see
-[Versioning](https://psi86.github.io/RaceLink_Docs/versioning/).
+[Versioning](https://docs.racelink.dev/versioning/).
 
 ## Repository structure
 
@@ -90,7 +90,7 @@ removed at the Vue PoC merge. The shared WebUI now lives in
 `racelink/static/dist/`.
 
 For a full architectural tour see
-[Architecture](https://psi86.github.io/RaceLink_Docs/RaceLink_Host/architecture/).
+[Architecture](https://docs.racelink.dev/RaceLink_Host/architecture/).
 
 ## Licence
 
